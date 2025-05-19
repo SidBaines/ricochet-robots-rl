@@ -9,12 +9,12 @@ class ActorCriticPPO(nn.Module):
     def __init__(self, obs_space: spaces.Dict, action_space: spaces.Discrete):
         super().__init__()
 
-        board_shape = obs_space["board_features"].shape # (num_robots + 1, height, width)
+        board_shape = obs_space["board_features"].shape  # (num_robots + 1 + 4, height, width)
         num_robots = obs_space["target_robot_idx"].n
         
         # CNN for board features
-        # Input channels: num_robots (for their positions) + 1 (for target position)
-        in_channels = board_shape[0] 
+        # Input channels: num_robots (for their positions) + 1 (for target position) + 4 (for walls)
+        in_channels = board_shape[0]
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
@@ -25,13 +25,13 @@ class ActorCriticPPO(nn.Module):
 
         # Calculate CNN output size
         # To do this, we pass a dummy tensor through the CNN
-        dummy_board_features = torch.zeros(1, *board_shape) # Batch size of 1
+        dummy_board_features = torch.zeros(1, *board_shape)  # Batch size of 1
         with torch.no_grad():
             cnn_out_dim = self.cnn(dummy_board_features).shape[1]
 
         # We also need to incorporate the target_robot_idx.
         # An embedding layer is a good way to handle discrete inputs.
-        self.target_robot_embedding_dim = 16 # Hyperparameter
+        self.target_robot_embedding_dim = 16  # Hyperparameter
         self.target_robot_embed = nn.Embedding(num_robots, self.target_robot_embedding_dim)
 
         # Combined feature size
@@ -41,14 +41,14 @@ class ActorCriticPPO(nn.Module):
         self.actor_head = nn.Sequential(
             nn.Linear(combined_features_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, action_space.n) # Outputs logits for each action
+            nn.Linear(128, action_space.n)  # Outputs logits for each action
         )
 
         # Critic head (outputs state value)
         self.critic_head = nn.Sequential(
             nn.Linear(combined_features_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, 1) # Outputs a single value
+            nn.Linear(128, 1)  # Outputs a single value
         )
 
     def _process_obs(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:

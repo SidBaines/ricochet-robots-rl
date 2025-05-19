@@ -26,9 +26,11 @@ class RicochetRobotsEnv(gym.Env):
                  use_standard_walls: bool = True,
                  num_edge_walls_per_quadrant: Optional[int] = None,
                  num_floating_walls_per_quadrant: Optional[int] = None,
+                 display_step: bool = False,
                  render_mode: Optional[str] = None):
         super().__init__()
 
+        self.display_step = display_step
         if isinstance(board_size, int):
             self.height, self.width = board_size, board_size
         else:
@@ -78,14 +80,15 @@ class RicochetRobotsEnv(gym.Env):
         self.action_space = spaces.Discrete(self.num_robots * 4)
 
         # Observation space:
-        # - board_features: (num_robots + 1, height, width) binary tensor
+        # - board_features: (num_robots + 1 + 4, height, width) binary tensor
         #   - Channel 0 to num_robots-1: position of robot i
         #   - Channel num_robots: position of the target
+        #   - Channels num_robots+1 to num_robots+4: wall information (N, E, S, W)
         # - target_robot_idx: Discrete(num_robots) indicating which robot is the active target
         self.observation_space = spaces.Dict({
             "board_features": spaces.Box(
                 low=0, high=1,
-                shape=(self.num_robots + 1, self.height, self.width),
+                shape=(self.num_robots + 1 + 4, self.height, self.width),
                 dtype=np.uint8
             ),
             "target_robot_idx": spaces.Discrete(self.num_robots)
@@ -94,15 +97,31 @@ class RicochetRobotsEnv(gym.Env):
         self.np_random = None # Will be seeded in reset
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
-        board_features = np.zeros((self.num_robots + 1, self.height, self.width), dtype=np.uint8)
+        # Create observation with additional channels for walls
+        # Channels: [robot_0, robot_1, ..., target, wall_N, wall_E, wall_S, wall_W]
+        board_features = np.zeros((self.num_robots + 1 + 4, self.height, self.width), dtype=np.uint8)
+        
+        # Set robot positions (first num_robots channels)
         for i, robot in enumerate(self.robots):
             r, c = robot.pos
             board_features[i, r, c] = 1
         
+        # Set target position (channel num_robots)
         if self.target_pos:
             tr, tc = self.target_pos
             board_features[self.num_robots, tr, tc] = 1
-            
+        
+        # Set wall information (channels num_robots+1 to num_robots+4)
+        # For each direction (N, E, S, W), create a binary mask where 1 indicates a wall
+        wall_channel_offset = self.num_robots + 1
+        
+        # Add walls for each direction
+        for direction in range(4):  # NORTH, EAST, SOUTH, WEST
+            for r in range(self.height):
+                for c in range(self.width):
+                    if self.board.has_wall(r, c, direction):
+                        board_features[wall_channel_offset + direction, r, c] = 1
+        
         return {
             "board_features": board_features,
             "target_robot_idx": self.target_robot_idx if self.target_robot_idx is not None else 0
@@ -123,7 +142,7 @@ class RicochetRobotsEnv(gym.Env):
         self.current_step = 0
         
         # Initialize robots at unique random positions
-        # However, robots cannot be placed inside the middle blocked out 2x2 square. 
+        # However, robots cannot be placed inside the middle blocked out 2x2 square. 
         # Centre square is defined as (self.height // 2 - 1, self.width // 2 - 1) to
         # (self.height // 2, self.width // 2)
         blocked_positions = [
@@ -216,9 +235,10 @@ class RicochetRobotsEnv(gym.Env):
             truncated = True
             if not terminated: # Penalize if max steps reached without solving
                  reward -= 10.0 
-
-        if self.render_mode == "human":
-            self.render()
+        if self.display_step:
+            print(f"Step: {self.current_step}")
+            if self.render_mode == "human":
+                self.render()
             
         return self._get_obs(), reward, terminated, truncated, self._get_info()
 
