@@ -31,6 +31,8 @@ class RicochetRobotsEnv(gym.Env):
         self.render_mode = render_mode
 
         self.board = Board(self.height, self.width)
+        if use_standard_walls and (((self.height%2) == 0) and ((self.width%2) == 0)):
+            self.board.add_middle_blocked_walls() # Add some predefined walls
         if use_standard_walls and self.height == 16 and self.width == 16:
             self.board.add_standard_ricochet_walls() # Add some predefined walls
         if board_walls_config:
@@ -92,7 +94,18 @@ class RicochetRobotsEnv(gym.Env):
         self.current_step = 0
         
         # Initialize robots at unique random positions
+        # However, robots cannot be placed inside the middle blocked out 2x2 square. 
+        # Centre square is defined as (self.height // 2 - 1, self.width // 2 - 1) to
+        # (self.height // 2, self.width // 2)
+        blocked_positions = [
+            (self.height // 2 - 1, self.width // 2 - 1),
+            (self.height // 2 - 1, self.width // 2),
+            (self.height // 2, self.width // 2 - 1),
+            (self.height // 2, self.width // 2)
+        ]
         all_possible_positions = [(r, c) for r in range(self.height) for c in range(self.width)]
+        all_possible_positions = [p for p in all_possible_positions if p not in blocked_positions]
+        
         self.np_random.shuffle(all_possible_positions)
         
         self.robots = []
