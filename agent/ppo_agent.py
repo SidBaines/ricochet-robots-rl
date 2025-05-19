@@ -96,14 +96,14 @@ class PPOAgent:
         return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
 
     @torch.no_grad()
-    def get_value(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
+    def get_value(self, obs_dict: Dict[str, np.ndarray]) -> np.ndarray:
         """Get state value for a single observation (NumPy)."""
         self.network.eval()
-        obs_board_features_np = obs["board_features"]
+        obs_board_features_np = obs_dict["board_features"]
         if obs_board_features_np.ndim == 3: # (C, H, W)
             obs_board_features_np = np.expand_dims(obs_board_features_np, axis=0)
         
-        obs_target_idx_np = obs["target_robot_idx"]
+        obs_target_idx_np = obs_dict["target_robot_idx"]
         if not isinstance(obs_target_idx_np, np.ndarray) or obs_target_idx_np.ndim == 0:
             obs_target_idx_np = np.array([obs_target_idx_np])
 
@@ -114,6 +114,52 @@ class PPOAgent:
         value = self.network.get_value(obs_torch)
         self.network.train()
         return value.cpu().numpy()
+
+    def select_action(self, obs_dict: Dict[str, np.ndarray], deterministic: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Selects an action based on the current policy, also returning the state value.
+        Args:
+            obs_dict: The observation dictionary from the environment.
+            deterministic: If True, take the action with the highest probability. Otherwise, sample.
+        Returns:
+            action: The selected action (np.ndarray).
+            log_prob: The log probability of the selected action (np.ndarray).
+            value: The estimated state value (np.ndarray).
+        """
+        
+        # Add batch dimension if obs is for a single step
+        obs_board_features_np = obs_dict["board_features"]
+        if obs_board_features_np.ndim == 3: # (C, H, W)
+            obs_board_features_np = np.expand_dims(obs_board_features_np, axis=0)
+        
+        obs_target_idx_np = obs_dict["target_robot_idx"]
+        if not isinstance(obs_target_idx_np, np.ndarray) or obs_target_idx_np.ndim == 0:
+            obs_target_idx_np = np.array([obs_target_idx_np])
+        
+
+        obs_tensor_dict = self._obs_to_torch({
+            "board_features": obs_board_features_np,
+            "target_robot_idx": obs_target_idx_np
+        })
+        
+        self.network.eval() # Ensure network is in evaluation mode
+        with torch.no_grad():
+            action_logits, value_tensor = self.network(obs_tensor_dict) # network.forward
+            probs = torch.softmax(action_logits, dim=-1)
+            dist = torch.distributions.Categorical(probs)
+
+            if deterministic:
+                action_tensor = torch.argmax(probs, dim=-1)
+            else:
+                action_tensor = dist.sample()
+            
+            log_prob_tensor = dist.log_prob(action_tensor)
+
+        action_np = action_tensor.cpu().numpy()
+        log_prob_np = log_prob_tensor.cpu().numpy()
+        value_np = value_tensor.squeeze(-1).cpu().numpy()
+
+        return action_np, log_prob_np, value_np
 
     def learn(self,
               obs_batch: List[Dict[str, np.ndarray]],
@@ -126,6 +172,11 @@ class PPOAgent:
         Update the policy using PPO.
         Assumes all inputs are NumPy arrays or lists of dicts for obs.
         The rollout buffer would typically prepare these.
+        Returns:
+            policy_loss: The final policy loss value
+            value_loss: The final value loss value
+            entropy_loss: The final entropy loss value
+            approx_kl: Approximate KL divergence between old and new policy
         """
         # Convert numpy arrays to torch tensors
         actions_tensor = torch.from_numpy(actions_batch).to(self.device)
@@ -141,17 +192,28 @@ class PPOAgent:
         obs_torch_batch = self._batch_obs_to_torch(obs_batch)
 
         batch_size = len(obs_batch)
-        if batch_size == 0: return # Nothing to learn from
+        if batch_size == 0: 
+            return 0.0, 0.0, 0.0, 0.0  # Nothing to learn from, return zeros
 
         minibatch_size = batch_size // self.num_minibatches
         if minibatch_size == 0 and batch_size > 0 : # handle small batch_size < num_minibatches
             minibatch_size = batch_size
             self.num_minibatches = 1
 
+        # Track losses for reporting
+        final_policy_loss = 0.0
+        final_value_loss = 0.0
+        final_entropy_loss = 0.0
+        final_approx_kl = 0.0
 
         for _ in range(self.ppo_epochs):
             # Create a random permutation of indices for shuffling
             indices = np.random.permutation(batch_size)
+            
+            epoch_policy_losses = []
+            epoch_value_losses = []
+            epoch_entropy_losses = []
+            epoch_kls = []
             
             for start_idx in range(0, batch_size, minibatch_size):
                 end_idx = start_idx + minibatch_size
@@ -173,19 +235,27 @@ class PPOAgent:
 
                 # Policy ratio
                 ratio = torch.exp(new_log_probs - mb_log_probs_old)
+                
+                # Calculate approximate KL divergence for logging
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - (new_log_probs - mb_log_probs_old)).mean().item()
+                    epoch_kls.append(approx_kl)
 
                 # Clipped surrogate objective
                 surr1 = ratio * mb_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * mb_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
+                epoch_policy_losses.append(policy_loss.item())
 
                 # Value loss (MSE against returns)
                 # new_values are V_phi(s_t)
                 # mb_returns are GAE_returns (R_t = A_t + V(s_t_old))
                 value_loss = F.mse_loss(new_values, mb_returns)
+                epoch_value_losses.append(value_loss.item())
                 
                 # Entropy loss (to encourage exploration)
                 entropy_loss = -entropy.mean()
+                epoch_entropy_losses.append(entropy_loss.item())
 
                 # Total loss
                 loss = policy_loss + self.value_loss_coef * value_loss + self.entropy_coef * entropy_loss
@@ -195,6 +265,14 @@ class PPOAgent:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+            
+            # Average losses for this epoch
+            final_policy_loss = np.mean(epoch_policy_losses)
+            final_value_loss = np.mean(epoch_value_losses)
+            final_entropy_loss = np.mean(epoch_entropy_losses)
+            final_approx_kl = np.mean(epoch_kls)
+
+        return final_policy_loss, final_value_loss, final_entropy_loss, final_approx_kl
 
     def save_model(self, path: str):
         torch.save({
