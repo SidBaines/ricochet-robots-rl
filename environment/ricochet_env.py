@@ -13,31 +13,60 @@ from .utils import (
 )
 
 class RicochetRobotsEnv(gym.Env):
-    metadata = {"render_modes": ["human", "ansi"], "render_fps": 4}
+    metadata = {
+        "render_modes": ["human", "ansi", "rgb_array"],
+        "render_fps": 10
+    }
 
     def __init__(self,
-                 board_size: int = DEFAULT_BOARD_SIZE,
+                 board_size: Union[int, Tuple[int, int]] = DEFAULT_BOARD_SIZE,
                  num_robots: int = DEFAULT_NUM_ROBOTS,
-                 max_steps: int = 50,
+                 max_steps: int = 200,
                  board_walls_config: Optional[List[Tuple[Tuple[int, int], int]]] = None,
                  use_standard_walls: bool = True,
+                 num_edge_walls_per_quadrant: Optional[int] = None,
+                 num_floating_walls_per_quadrant: Optional[int] = None,
                  render_mode: Optional[str] = None):
         super().__init__()
 
-        self.height = board_size
-        self.width = board_size
-        self.num_robots = min(num_robots, len(ROBOT_COLORS)) # Cap at available colors
+        if isinstance(board_size, int):
+            self.height, self.width = board_size, board_size
+        else:
+            self.height, self.width = board_size
+        
+        self.num_robots = min(num_robots, len(ROBOT_COLORS)) # Max robots based on available colors
         self.max_steps = max_steps
         self.render_mode = render_mode
 
         self.board = Board(self.height, self.width)
-        if use_standard_walls and (((self.height%2) == 0) and ((self.width%2) == 0)):
-            self.board.add_middle_blocked_walls() # Add some predefined walls
-        if use_standard_walls and self.height == 16 and self.width == 16:
-            self.board.add_standard_ricochet_walls() # Add some predefined walls
-        if board_walls_config:
+
+        if board_walls_config is not None:
             for (r, c), direction_idx in board_walls_config:
                 self.board.add_wall(r, c, direction_idx)
+            # If specific walls are given, standard walls might be implicitly overridden or complemented.
+            # We might decide not to call add_standard_ricochet_walls if board_walls_config is present.
+            # For now, let's assume board_walls_config defines the *entire* non-perimeter wall setup.
+            # So, if board_walls_config is given, we might skip use_standard_walls.
+            # However, the current Board.add_standard_ricochet_walls is idempotent for its specific walls.
+            if use_standard_walls: # Allow standard walls to be added alongside config if desired
+                 self.board.add_standard_ricochet_walls()
+        elif use_standard_walls:
+            self.board.add_standard_ricochet_walls()
+            
+        
+        self.board.add_middle_blocked_walls() # Always add the middle blocked walls
+        
+        # Now, apply random wall generation if parameters are provided
+        if num_edge_walls_per_quadrant is not None and num_edge_walls_per_quadrant > 0 or \
+           num_floating_walls_per_quadrant is not None and num_floating_walls_per_quadrant > 0:
+            # Ensure defaults if one is None but the other is set
+            edge_walls_to_gen = num_edge_walls_per_quadrant if num_edge_walls_per_quadrant is not None else 0
+            floating_walls_to_gen = num_floating_walls_per_quadrant if num_floating_walls_per_quadrant is not None else 0
+            
+            self.board.generate_random_walls(
+                num_edge_walls_per_quadrant=edge_walls_to_gen,
+                num_floating_walls_per_quadrant=floating_walls_to_gen
+            )
 
         self.robots: List[Robot] = [] # Will be populated in reset
         self.target_pos: Optional[Tuple[int, int]] = None
@@ -64,7 +93,7 @@ class RicochetRobotsEnv(gym.Env):
         
         self.np_random = None # Will be seeded in reset
 
-    def _get_obs(self) -> Dict[str, Union[np.ndarray, int]]:
+    def _get_obs(self) -> Dict[str, np.ndarray]:
         board_features = np.zeros((self.num_robots + 1, self.height, self.width), dtype=np.uint8)
         for i, robot in enumerate(self.robots):
             r, c = robot.pos
@@ -259,7 +288,14 @@ class RicochetRobotsEnv(gym.Env):
     # Helper to create a board with some specific walls for testing
     @staticmethod
     def get_test_board_env(size=5, num_robots=2, max_steps=20):
-        env = RicochetRobotsEnv(board_size=size, num_robots=num_robots, max_steps=max_steps, use_standard_walls=False)
+        env = RicochetRobotsEnv(
+            board_size=size, 
+            num_robots=num_robots, 
+            max_steps=max_steps, 
+            use_standard_walls=False,
+            # Example of using new params for test env:
+            # num_edge_walls_per_quadrant=1 
+        )
         # Add a simple wall
         # Wall to the East of (1,1) / West of (1,2)
         env.board.add_wall(1, 1, EAST)

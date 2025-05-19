@@ -23,9 +23,11 @@ def main():
     value_loss_coef = 0.5
     max_grad_norm = 0.5
     
-    board_size = 16 # Default Ricochet Robots board size
+    board_size = 10 # Default Ricochet Robots board size
     num_robots = 4  # Default number of robots
     max_episode_steps = 100 # Max steps per episode in env
+    num_edge_walls_per_quadrant = 2
+    num_floating_walls_per_quadrant = 1
 
     # Logging and saving
     log_interval = 1 # Log every N rollouts
@@ -42,7 +44,9 @@ def main():
         board_size=board_size,
         num_robots=num_robots,
         max_steps=max_episode_steps,
-        use_standard_walls=True, # Use the predefined walls
+        use_standard_walls=False, # Use the predefined walls
+        num_edge_walls_per_quadrant=num_edge_walls_per_quadrant,
+        num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
         render_mode=None # "human" for visualization, None for faster training
     )
     env = gym.wrappers.RecordEpisodeStatistics(env) # Tracks episode returns and lengths
