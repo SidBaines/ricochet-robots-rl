@@ -1,1 +1,3 @@
 */__pycache__
+wandb/
+ppo_ricochet_models/

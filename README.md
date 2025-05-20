@@ -5,13 +5,13 @@
 
 - `train.py` contains the training loop
 - `inspect_env.py` contains some code for playing around with/inspecting the environment
-- `environment/` contains the environment classes, including for board, robot, utils, and the main environment class in `ricochet_env.py`
-- `agent/` contains the agent classes
+- `environment/` contains the environment classes, including for board, robot, utils, the main base environment class in `ricochet_env.py`, and simpler environments in eg. `simpler_ricochet_env.py`
+- `agent/` contains the agent classes. Currently only PPO using CNNs, but should add other agents later.
 - `tests/` contains some tests
 
 ## TODO
-- Add logging
-- Make simpler environments & check that the model can learn them (eg. target one step away, target two steps away but single robot, etc). Being able to automate this process seems valuable
+- Fix the bug in the RicochetRobotsEnvOneStepAway environment where the target robot can get stuck if there is no valid move; currently handled by calling reset again, but this could go into an infinite loop if the environment is complicated enough.
+- Make more simple environments & check that the model can learn them (eg. target one step away, target two steps away but single robot, etc). Being able to automate this process seems valuable
 - Looks like boxes are currently possible (eg in the bottom right if we have sufficient edge-walls and floating walls allowed can get a 2x2 box), seems like maybe a bug in the edge wall placement?
 - Make sure that the seed allows a fixed board, robot placement, target placement, etc (currently at least some of it seems to be random)
 

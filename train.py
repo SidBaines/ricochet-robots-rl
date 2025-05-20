@@ -7,6 +7,7 @@ import wandb  # Import wandb
 from collections import deque
 from datetime import datetime
 from environment import RicochetRobotsEnv
+from environment.simpler_ricochet_env import RicochetRobotsEnvOneStepAway
 from agent import PPOAgent, RolloutBuffer
 
 
@@ -24,8 +25,8 @@ def main():
     value_loss_coef = 0.5
     max_grad_norm = 0.5
     
-    board_size = 3 # Default Ricochet Robots board size
-    num_robots = 1  # Default number of robots
+    board_size = 5 # Default Ricochet Robots board size
+    num_robots = 3  # Default number of robots
     max_episode_steps = 10 # Max steps per episode in env
     num_edge_walls_per_quadrant = 0
     num_floating_walls_per_quadrant = 0
@@ -81,7 +82,8 @@ def main():
 
     # --- Environment Setup ---
     # You might want to wrap the env for monitoring, e.g., RecordEpisodeStatistics
-    env = RicochetRobotsEnv(
+    # env = RicochetRobotsEnv(
+    env = RicochetRobotsEnvOneStepAway(
         board_size=board_size,
         num_robots=num_robots,
         max_steps=max_episode_steps,

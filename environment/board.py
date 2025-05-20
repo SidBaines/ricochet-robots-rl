@@ -328,3 +328,8 @@ class Board:
             
             if placed_floating_count < num_floating_walls_per_quadrant:
                  print(f"Warning: Quadrant {quad['name']} ({quad_idx+1}) could only place {placed_floating_count}/{num_floating_walls_per_quadrant} floating L-walls.")
+
+    def is_valid_position(self, r: int, c: int) -> bool:
+        """Checks if a position is valid on the board."""
+        return 0 <= r < self.height and 0 <= c < self.width
+    
