@@ -24,11 +24,11 @@ def main():
     value_loss_coef = 0.5
     max_grad_norm = 0.5
     
-    board_size = 8 # Default Ricochet Robots board size
-    num_robots = 3  # Default number of robots
-    max_episode_steps = 1000 # Max steps per episode in env
-    num_edge_walls_per_quadrant = 2
-    num_floating_walls_per_quadrant = 1
+    board_size = 3 # Default Ricochet Robots board size
+    num_robots = 1  # Default number of robots
+    max_episode_steps = 10 # Max steps per episode in env
+    num_edge_walls_per_quadrant = 0
+    num_floating_walls_per_quadrant = 0
 
     # Logging and saving
     log_interval = 1 # Log every N rollouts
@@ -39,9 +39,11 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     
     # Initialize wandb
-    wandb_project = "ricochet_robots_rl"
-    wandb_entity = None  # Set to your wandb username or team name if needed
-    wandb_name = f"ppo_run_{run_id}"
+    do_wandb = False
+    if do_wandb:
+        wandb_project = "ricochet_robots_rl"
+        wandb_entity = None  # Set to your wandb username or team name if needed
+        wandb_name = f"ppo_run_{run_id}"
     
     # Collect hyperparameters for wandb
     config = {
@@ -63,16 +65,16 @@ def main():
         "num_edge_walls_per_quadrant": num_edge_walls_per_quadrant,
         "num_floating_walls_per_quadrant": num_floating_walls_per_quadrant,
     }
-    
-    wandb.init(
-        project=wandb_project,
-        entity=wandb_entity,
-        name=wandb_name,
-        config=config,
-        sync_tensorboard=False,  # Set to True if also using TensorBoard
-        monitor_gym=False,  # We'll log gym metrics manually
-        save_code=True,  # Save a copy of the code
-    )
+    if do_wandb:
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_name,
+            config=config,
+            sync_tensorboard=False,  # Set to True if also using TensorBoard
+            monitor_gym=False,  # We'll log gym metrics manually
+            save_code=True,  # Save a copy of the code
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -238,33 +240,34 @@ def main():
         mean_ep_length = np.mean(rollout_lengths) if rollout_lengths else float('nan')
         
         # Log to wandb
-        wandb.log({
-            # Progress metrics
-            "timesteps": current_total_steps,
-            "rollouts_completed": num_rollouts_done,
-            "episodes_completed": episodes_completed,
-            
-            # Performance metrics
-            "mean_reward": mean_ep_reward,
-            "mean_episode_length": mean_ep_length,
-            "success_rate": success_rate,
-            "truncation_rate": truncation_rate,
-            "episodes_terminated": episodes_terminated,
-            "episodes_truncated": episodes_truncated,
-            
-            # Rolling averages (last 100 episodes)
-            "mean_reward_100": np.mean(ep_rew_mean_deque) if ep_rew_mean_deque else float('nan'),
-            "mean_episode_length_100": np.mean(ep_len_mean_deque) if ep_len_mean_deque else float('nan'),
-            
-            # Training metrics
-            "policy_loss": policy_loss,
-            "value_loss": value_loss,
-            "entropy_loss": entropy_loss,
-            "approx_kl_divergence": approx_kl,
-            
-            # Training speed
-            "fps": int(num_steps_per_rollout / (time.time() - start_time)),
-        }, step=current_total_steps)
+        if do_wandb:
+            wandb.log({
+                # Progress metrics
+                "timesteps": current_total_steps,
+                "rollouts_completed": num_rollouts_done,
+                "episodes_completed": episodes_completed,
+                
+                # Performance metrics
+                "mean_reward": mean_ep_reward,
+                "mean_episode_length": mean_ep_length,
+                "success_rate": success_rate,
+                "truncation_rate": truncation_rate,
+                "episodes_terminated": episodes_terminated,
+                "episodes_truncated": episodes_truncated,
+                
+                # Rolling averages (last 100 episodes)
+                "mean_reward_100": np.mean(ep_rew_mean_deque) if ep_rew_mean_deque else float('nan'),
+                "mean_episode_length_100": np.mean(ep_len_mean_deque) if ep_len_mean_deque else float('nan'),
+                
+                # Training metrics
+                "policy_loss": policy_loss,
+                "value_loss": value_loss,
+                "entropy_loss": entropy_loss,
+                "approx_kl_divergence": approx_kl,
+                
+                # Training speed
+                "fps": int(num_steps_per_rollout / (time.time() - start_time)),
+            }, step=current_total_steps)
 
         # Logging to console
         if num_rollouts_done % log_interval == 0:
@@ -287,14 +290,16 @@ def main():
             checkpoint_path = os.path.join(save_dir, f"ppo_ricochet_ts{current_total_steps}.pth")
             agent.save_model(checkpoint_path)
             # Log model checkpoint to wandb
-            wandb.save(checkpoint_path)
+            if do_wandb:
+                wandb.save(checkpoint_path)
             print(f"Model saved at timestep {current_total_steps}")
 
     env.close()
     print("Training finished.")
     agent.save_model(latest_model_path) # Final save
-    wandb.save(latest_model_path)
-    wandb.finish()
+    if do_wandb:
+        wandb.save(latest_model_path)
+        wandb.finish()
 
 if __name__ == "__main__":
     main() 

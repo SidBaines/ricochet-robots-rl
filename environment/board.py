@@ -90,26 +90,35 @@ class Board:
         return True
 
     def add_middle_blocked_walls(self):
-        assert self.height % 2 == 0 and self.width % 2 == 0, "Height and width must be even"
-        cr, cc = self.height // 2, self.width // 2
-        # Walls around (cr-2, cc-2) to (cr+1, cc+1) effectively
-        # (7,7) (7,8)
-        # (8,7) (8,8)
-        # Top walls of (7,7) and (7,8)
-        self.add_wall(cr - 1, cc - 1, NORTH) # Wall below (6,6) which is N of (7,6)
-        self.add_wall(cr - 1, cc, NORTH) # Wall below (6,7) which is N of (7,7)
+        # assert self.height % 2 == 0 and self.width % 2 == 0
+        assert self.height == self.width, "Height and width must be equal"
+        if (self.height%2)==0:
+            cr, cc = self.height // 2, self.width // 2
+            # Walls around (cr-2, cc-2) to (cr+1, cc+1) effectively
+            # (7,7) (7,8)
+            # (8,7) (8,8)
+            # Top walls of (7,7) and (7,8)
+            self.add_wall(cr - 1, cc - 1, NORTH) # Wall below (6,6) which is N of (7,6)
+            self.add_wall(cr - 1, cc, NORTH) # Wall below (6,7) which is N of (7,7)
 
-        # Bottom walls of (8,7) and (8,8)
-        self.add_wall(cr, cc - 1, SOUTH) # Wall above (9,6) which is S of (8,6)
-        self.add_wall(cr, cc, SOUTH) # Wall above (9,7) which is S of (8,7)
+            # Bottom walls of (8,7) and (8,8)
+            self.add_wall(cr, cc - 1, SOUTH) # Wall above (9,6) which is S of (8,6)
+            self.add_wall(cr, cc, SOUTH) # Wall above (9,7) which is S of (8,7)
 
-        # Left walls of (7,7) and (8,7)
-        self.add_wall(cr - 1, cc - 1, WEST) # Wall right of (7,5) which is W of (7,6)
-        self.add_wall(cr, cc - 1, WEST) # Wall right of (8,5) which is W of (8,6)
+            # Left walls of (7,7) and (8,7)
+            self.add_wall(cr - 1, cc - 1, WEST) # Wall right of (7,5) which is W of (7,6)
+            self.add_wall(cr, cc - 1, WEST) # Wall right of (8,5) which is W of (8,6)
 
-        # Right walls of (7,8) and (8,8)
-        self.add_wall(cr - 1, cc, EAST) # Wall left of (7,9) which is E of (7,8)
-        self.add_wall(cr, cc, EAST) # Wall left of (8,9) which is E of (8,8)
+            # Right walls of (7,8) and (8,8)
+            self.add_wall(cr - 1, cc, EAST) # Wall left of (7,9) which is E of (7,8)
+            self.add_wall(cr, cc, EAST) # Wall left of (8,9) which is E of (8,8)
+        else:
+            cr, cc = self.height // 2, self.width // 2
+            # Top walls of (2,2) [assuming the height is eg. 5]
+            self.add_wall(cr, cc , NORTH) # Wall below (6,6) which is N of (7,6)
+            self.add_wall(cr, cc , SOUTH) # Wall below (6,6) which is N of (7,6)
+            self.add_wall(cr, cc , EAST) # Wall below (6,6) which is N of (7,6)
+            self.add_wall(cr, cc , WEST) # Wall below (6,6) which is N of (7,6)
     
     def add_standard_ricochet_walls(self):
         """Adds some example walls typical of Ricochet Robots boards.

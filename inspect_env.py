@@ -171,3 +171,148 @@ if 0 < env_step_test.num_robots:
 
 # %% [markdown]
 # This notebook should give you a good starting point for inspecting and tweaking your environment setup!
+
+# %%
+# Test the new automatic wall generation
+
+from environment.board import Board
+# Create a board
+board_size = 5
+my_board = Board(height=board_size, width=board_size) # Perimeter walls are set up
+
+# Optionally, add the standard central walls
+# my_board.add_standard_ricochet_walls()
+my_board.add_middle_blocked_walls()
+
+# Now, generate the random walls
+num_edge_per_quad = 1
+num_floating_per_quad = 0
+my_board.generate_random_walls(
+    num_edge_walls_per_quadrant=num_edge_per_quad,
+    num_floating_walls_per_quadrant=num_floating_per_quad
+)
+
+# To visualize, you'd put this board into an environment instance
+# (or adapt the environment's render method to take a Board object)
+
+# Example: Create an env and assign this board
+from environment import RicochetRobotsEnv # Adjust import as needed
+
+env_with_random_board = RicochetRobotsEnv(
+    board_size=board_size,
+    num_robots=4, # Or as desired
+    use_standard_walls=False, # We are providing our own board
+    render_mode="human"
+)
+env_with_random_board.board = my_board # Replace the env's default board
+
+obs, info = env_with_random_board.reset(seed=42) # Reset to place robots etc.
+# env_with_random_board.render()
+
+
+
+# %%
+# Test the new automatic wall generation
+from environment.board import Board
+board_size = 3
+my_board = Board(height=board_size, width=board_size) # Perimeter walls are set up
+my_board.add_middle_blocked_walls()
+num_edge_per_quad = 0
+num_floating_per_quad = 0
+my_board.generate_random_walls(
+    num_edge_walls_per_quadrant=num_edge_per_quad,
+    num_floating_walls_per_quadrant=num_floating_per_quad
+)
+from environment import RicochetRobotsEnv # Adjust import as needed
+env_with_random_board = RicochetRobotsEnv(
+    board_size=board_size,
+    num_robots=1, # Or as desired
+    use_standard_walls=False, # We are providing our own board
+    render_mode="human",
+    num_edge_walls_per_quadrant=num_edge_per_quad,
+    num_floating_walls_per_quadrant=num_floating_per_quad
+)
+# env_with_random_board.board = my_board # Replace the env's default board
+obs, info = env_with_random_board.reset(seed=None) # Reset to place robots etc.
+env_with_random_board.render()
+
+
+
+
+# %%
+# ## 5. Environment with Procedurally Generated Walls
+
+# %%
+# Parameters for procedural generation
+gen_board_size = 8
+gen_num_robots = 3
+gen_edge_walls_per_quad = 0
+gen_floating_walls_per_quad = 1
+
+env_procedural = RicochetRobotsEnv(
+    board_size=gen_board_size,
+    num_robots=gen_num_robots,
+    use_standard_walls=True,  # Start with standard center, then add random
+    num_edge_walls_per_quadrant=gen_edge_walls_per_quad,
+    num_floating_walls_per_quadrant=gen_floating_walls_per_quad,
+    render_mode="human"
+)
+
+obs_proc, info_proc = env_procedural.reset(seed=101) # Use a seed for reproducibility
+
+# print(f"\n--- Board with Procedurally Generated Walls ({gen_board_size}x{gen_board_size}) ---")
+# print(f"Targeting {gen_edge_walls_per_quad} edge walls and {gen_floating_walls_per_quad} floating walls per quadrant.")
+# env_procedural.render()
+
+# %% [markdown]
+# ### Example: No standard walls, only procedural
+
+# %%
+env_proc_only = RicochetRobotsEnv(
+    board_size=10, # Smaller board
+    num_robots=2,
+    use_standard_walls=False, # No standard center block
+    num_edge_walls_per_quadrant=1,
+    num_floating_walls_per_quadrant=1,
+    render_mode="human"
+)
+obs_proc_only, _ = env_proc_only.reset(seed=102)
+print(f"\n--- Board with Only Procedural Walls (10x10) ---")
+env_proc_only.render()
+
+
+# %%
+# Want to test the stopping logic. Check that if we have a robot in the way 
+# of a moving robot, the moving robot stops.
+# Create a board with a robot in the way
+env_robot_in_the_way = RicochetRobotsEnv(
+    board_size=8, # Small board
+    num_robots=2,
+    use_standard_walls=True,
+    render_mode="human"
+)
+obs_robot_in_the_way, _ = env_robot_in_the_way.reset(seed=103)
+# env_robot_in_the_way.render()
+# Artificially place the robots 
+env_robot_in_the_way.robots[0].pos = (2, 2)
+env_robot_in_the_way.robots[1].pos = (2, 4)
+env_robot_in_the_way.render()
+# Now try to move robot 0 east
+action = 0 * 4 + EAST
+next_obs, reward, terminated, truncated, info = env_robot_in_the_way.step(action)
+env_robot_in_the_way.render()
+
+# %%
+# Same as above but check it stops at the middle wall block
+env = RicochetRobotsEnv(board_size=8, num_robots=2, use_standard_walls=False, render_mode="human")
+obs, info = env.reset(seed=104)
+# env.render()
+# Artificially place the robot
+env.robots[0].pos = (4, 0)
+env.render()
+# Now try to move robot 0 east
+action = 0 * 4 + EAST
+next_obs, reward, terminated, truncated, info = env.step(action)
+# env.render()
+
+
