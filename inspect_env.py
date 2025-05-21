@@ -172,7 +172,7 @@ if 0 < env_step_test.num_robots:
 # %% [markdown]
 # This notebook should give you a good starting point for inspecting and tweaking your environment setup!
 
-# %%
+# %%
 # Test the new automatic wall generation
 
 from environment.board import Board
@@ -211,7 +211,7 @@ obs, info = env_with_random_board.reset(seed=42) # Reset to place robots etc.
 
 
 
-# %%
+# %%
 # Test the new automatic wall generation
 from environment.board import Board
 board_size = 3
@@ -282,7 +282,7 @@ env_proc_only.render()
 
 
 # %%
-# Want to test the stopping logic. Check that if we have a robot in the way 
+# Want to test the stopping logic. Check that if we have a robot in the way 
 # of a moving robot, the moving robot stops.
 # Create a board with a robot in the way
 env_robot_in_the_way = RicochetRobotsEnv(
@@ -317,11 +317,92 @@ next_obs, reward, terminated, truncated, info = env.step(action)
 
 
 # %%
-# 6. Test the new simpler RicochetRobotsEnvOneStepAway logic
+# 6. Test the new simpler RicochetRobotsEnvOneStepAway logic
 from environment.simpler_ricochet_env import RicochetRobotsEnvOneStepAway
 env = RicochetRobotsEnvOneStepAway(board_size=3, num_robots=3, use_standard_walls=False, render_mode="human")
 obs, info = env.reset(seed=None)
 env.render()
 
+
+# %%
+# %% [markdown]
+# ## Testing the Corner Target Environment
+
+# %%
+# Test the new Corner Target Environment
+from environment.simpler_ricochet_env import RicochetRobotsEnvCornerTarget
+
+# Create the environment
+board_size = 8
+num_robots = 3
+env = RicochetRobotsEnvCornerTarget(
+    board_size=board_size,
+    num_robots=num_robots,
+    max_steps=30,
+    render_mode="human"
+)
+
+# Reset the environment to initialize it
+obs, info = env.reset(seed=None)
+
+print(f"Board size: {board_size}x{board_size}")
+print(f"Number of robots: {num_robots}")
+print(f"Target robot index: {env.target_robot_idx}")
+print(f"Target position: {env.target_pos}")
+
+# Render the initial state
+env.render()
+
+# Example of taking a few steps
+# Uncomment and modify these lines to test specific moves
+# action = 0  # Robot 0 moves North
+# obs, reward, terminated, truncated, info = env.step(action)
+# env.render()
+
+# %% [markdown]
+# You can interact with the environment by taking steps. Here's how to interpret actions:
+# - Action = (robot_index * 4) + direction
+# - Directions: 0=North, 1=East, 2=South, 3=West
+# 
+# For example:
+# - Action 1 = Robot 0 moves East
+# - Action 5 = Robot 1 moves North
+# - Action 10 = Robot 2 moves South
+
+# %%
+# Interactive loop to play with the environment
+# Uncomment this section to manually control the robots
+
+"""
+terminated = truncated = False
+step_count = 0
+
+while not (terminated or truncated):
+    # Get user input for action
+    try:
+        robot_idx = int(input("Enter robot index (0 to {}): ".format(num_robots-1)))
+        direction = int(input("Enter direction (0=North, 1=East, 2=South, 3=West): "))
+        
+        if 0 <= robot_idx < num_robots and 0 <= direction < 4:
+            action = robot_idx * 4 + direction
+            obs, reward, terminated, truncated, info = env.step(action)
+            env.render()
+            
+            step_count += 1
+            print(f"Step {step_count}, Reward: {reward}")
+            
+            if terminated:
+                print("Goal reached!")
+            elif truncated:
+                print("Episode truncated (max steps reached).")
+        else:
+            print("Invalid input. Try again.")
+    except ValueError:
+        print("Please enter valid numbers.")
+    
+    # Option to quit
+    if input("Press 'q' to quit, any other key to continue: ").lower() == 'q':
+        break
+"""
 
 # %%

@@ -19,6 +19,7 @@
 - Current plan: get environment working, get model trained on individual boards/targets, see how it goes
 - Later: do interp work (look at models internal representations, use linear probes, etc.)
 - Potential ideas
+    - Change the way that the board is represented; specifically the walls are currentl represented as a [4, height, width] tensor when they could be a [1, height+1, width+1] tensor which would probably speed up computation (and maybe be easier??). Could also represent the robot positions as pairs of (x,y) coordinates, rather than as [height, width] one-hot encoded tensors (again, this would be more memory efficient and possibly mroe computationall efficient)
     - Long term interesting: train a model to play a FULL game (not just one target on one board, but multiple targets on the same board, with the robots starting where they left when the last target was reached, and for example a single known target for each robot known from the beginning of the episode), and see if the model learns to play the game strategiually by planning multiple *targets* ahead (ie, learn to strategically position robots for future targets, if it saves steps later down the line, even if it costs more steps to get to the current target)
     - Could try encoding the inputs not as the [num_robots + 1 + 4, height,  width] size tensor that we currently do, and instead as a [3, 256, 256] picture, with walls and grid squares etc
     - Add a 'thinking' step to the agent, where it can look ahead and see what the best move is
