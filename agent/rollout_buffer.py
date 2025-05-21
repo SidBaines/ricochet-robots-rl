@@ -9,34 +9,51 @@ class RolloutBuffer:
                  action_space_shape: Tuple, # For discrete, usually () or (1,)
                  gamma: float,
                  gae_lambda: float,
-                 device: torch.device):
+                 device: torch.device,
+                 num_envs: int = 1,
+                 num_lstm_layers: int = 3,  # Should match model
+                 lstm_hidden_dims: Tuple[int, ...] = (32, 32, 32),  # Should match model
+                 board_height: int = None,
+                 board_width: int = None,
+                 ):
         self.num_steps = num_steps
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.device = device
+        self.num_envs = num_envs
+        self.num_lstm_layers = num_lstm_layers
+        self.lstm_hidden_dims = lstm_hidden_dims
 
         # Determine shapes for storage based on observation space
-        # Assuming obs_space is a gymnasium.spaces.Dict
         self.obs_board_shape = obs_space["board_features"].shape
-        # target_robot_idx is a scalar, will be stored as such
+        self.board_height = board_height or self.obs_board_shape[1]
+        self.board_width = board_width or self.obs_board_shape[2]
 
         self.observations_board = np.zeros((self.num_steps, *self.obs_board_shape), dtype=obs_space["board_features"].dtype)
-        self.observations_target_idx = np.zeros((self.num_steps, 1), dtype=obs_space["target_robot_idx"].dtype) # Store as [N,1]
+        self.observations_target_idx = np.zeros((self.num_steps, 1), dtype=obs_space["target_robot_idx"].dtype)
 
-        self.actions = np.zeros((self.num_steps, *action_space_shape), dtype=np.int64) # Assuming discrete actions
+        self.actions = np.zeros((self.num_steps, *action_space_shape), dtype=np.int64)
         self.action_log_probs = np.zeros((self.num_steps), dtype=np.float32)
         self.rewards = np.zeros((self.num_steps), dtype=np.float32)
-        self.dones = np.zeros((self.num_steps), dtype=bool) # For terminated or truncated
+        self.dones = np.zeros((self.num_steps), dtype=bool)
         self.values = np.zeros((self.num_steps), dtype=np.float32)
-        
         self.advantages = np.zeros((self.num_steps), dtype=np.float32)
         self.returns = np.zeros((self.num_steps), dtype=np.float32)
 
-        self.ptr = 0 # Current position in the buffer
+        # --- Store LSTM hidden/cell states for each step ---
+        self.h_states = [
+            np.zeros((self.num_steps, self.lstm_hidden_dims[i], self.board_height, self.board_width), dtype=np.float32)
+            for i in range(self.num_lstm_layers)
+        ]
+        self.c_states = [
+            np.zeros((self.num_steps, self.lstm_hidden_dims[i], self.board_height, self.board_width), dtype=np.float32)
+            for i in range(self.num_lstm_layers)
+        ]
+
+        self.ptr = 0
         self.path_start_idx = 0
         self.max_size = self.num_steps
         self.buffer_full = False
-
 
     def add(self,
             obs: Dict[str, np.ndarray],
@@ -44,23 +61,29 @@ class RolloutBuffer:
             reward: float,
             done: bool,
             value: np.ndarray, # V(s_t)
-            log_prob: np.ndarray):
+            log_prob: np.ndarray,
+            h_states: list = None,
+            c_states: list = None):
         """Add one step of experience to the buffer."""
         if self.ptr >= self.max_size:
-            # This indicates an issue if we are trying to add more than num_steps before processing
-            # For on-policy, buffer should be processed once full (num_steps collected)
             print("Warning: RolloutBuffer is full. Overwriting old data. This shouldn't happen in standard PPO rollout.")
-            self.ptr = 0 # Or raise an error
+            self.ptr = 0
 
         self.observations_board[self.ptr] = obs["board_features"]
-        self.observations_target_idx[self.ptr] = obs["target_robot_idx"] # Ensure it's stored as [val]
+        self.observations_target_idx[self.ptr] = obs["target_robot_idx"]
 
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
         self.dones[self.ptr] = done
-        self.values[self.ptr] = value.item() # value is usually a 1-element array
-        self.action_log_probs[self.ptr] = log_prob.item() # log_prob is usually a 1-element array
-        
+        self.values[self.ptr] = value.item()
+        self.action_log_probs[self.ptr] = log_prob.item()
+
+        # --- Store LSTM hidden/cell states ---
+        if h_states is not None and c_states is not None:
+            for i in range(self.num_lstm_layers):
+                self.h_states[i][self.ptr] = h_states[i]
+                self.c_states[i][self.ptr] = c_states[i]
+
         self.ptr += 1
         if self.ptr == self.max_size:
             self.buffer_full = True
@@ -101,8 +124,17 @@ class RolloutBuffer:
         self.returns = self.advantages[:actual_rollout_length] + self.values[:actual_rollout_length]
         # self.returns[:actual_rollout_length] = self.advantages[:actual_rollout_length] + self.values[:actual_rollout_length]
 
+    def get_initial_states_for_batch(self, indices: np.ndarray):
+        """
+        Returns the initial hidden/cell states for a batch of indices.
+        indices: array of shape (batch_size,) with the step indices to start from.
+        Returns: (h_states, c_states) as lists of tensors, each of shape (batch_size, C, H, W)
+        """
+        h_states = [torch.from_numpy(h[i]).to(self.device) for h, i in zip(self.h_states, indices)]
+        c_states = [torch.from_numpy(c[i]).to(self.device) for c, i in zip(self.c_states, indices)]
+        return h_states, c_states
 
-    def get(self) -> Tuple[List[Dict[str, np.ndarray]], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def get(self) -> Tuple[List[Dict[str, np.ndarray]], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Retrieve all data from the buffer.
         Returns data for the agent's learn method.
@@ -135,7 +167,9 @@ class RolloutBuffer:
             self.action_log_probs[:actual_size],
             self.advantages[:actual_size],
             self.returns[:actual_size],
-            self.values[:actual_size] # V(s_t) from rollout
+            self.values[:actual_size], # V(s_t) from rollout
+            self.h_states[:actual_size],
+            self.c_states[:actual_size],
         )
 
     def clear(self):

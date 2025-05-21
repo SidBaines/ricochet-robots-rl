@@ -5,6 +5,170 @@ from gymnasium import spaces
 import numpy as np
 from typing import Dict, Tuple, Optional
 
+class ConvLSTMCell(nn.Module):
+    """A basic ConvLSTM cell."""
+    def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
+        super().__init__()
+        padding = kernel_size // 2
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.conv = nn.Conv2d(
+            in_channels=input_dim + hidden_dim,
+            out_channels=4 * hidden_dim,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=bias
+        )
+
+    def forward(self, x, h, c):
+        # x: (B, input_dim, H, W)
+        # h, c: (B, hidden_dim, H, W)
+        combined = torch.cat([x, h], dim=1)
+        conv_out = self.conv(combined)
+        cc_i, cc_f, cc_o, cc_g = torch.chunk(conv_out, 4, dim=1)
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+        c_next = f * c + i * g
+        h_next = o * torch.tanh(c_next)
+        return h_next, c_next
+
+class DeepRepeatedConvLSTM(nn.Module):
+    def __init__(
+        self,
+        obs_space: spaces.Dict,
+        action_space: spaces.Discrete,
+        num_layers: int = 3,
+        hidden_dims: Tuple[int, ...] = (32, 32, 32),
+        kernel_sizes: Tuple[int, ...] = (3, 3, 3),
+        repeat_K: int = 3,
+        pooling: str = "avg",
+        target_robot_embedding_dim: int = 16,
+    ):
+        super().__init__()
+        board_shape = obs_space["board_features"].shape  # (C, H, W)
+        num_robots = obs_space["target_robot_idx"].n
+        in_channels = board_shape[0]
+        self.height, self.width = board_shape[1], board_shape[2]
+        self.num_layers = num_layers
+        self.hidden_dims = hidden_dims
+        self.kernel_sizes = kernel_sizes
+        self.repeat_K = repeat_K
+        self.pooling = pooling
+
+        # ConvLSTM stack
+        self.convlstm_cells = nn.ModuleList()
+        for i in range(num_layers):
+            input_dim = in_channels if i == 0 else hidden_dims[i-1]
+            self.convlstm_cells.append(
+                ConvLSTMCell(input_dim, hidden_dims[i], kernel_sizes[i])
+            )
+        # 1x1 conv + ReLU after each ConvLSTM layer
+        self.post_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_dims[i], hidden_dims[i], kernel_size=1),
+                nn.ReLU()
+            ) for i in range(num_layers)
+        ])
+
+        # Target robot embedding
+        self.target_robot_embed = nn.Embedding(num_robots, target_robot_embedding_dim)
+
+        # Output size after pooling
+        conv_out_dim = hidden_dims[-1]
+        if pooling == "avg":
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        elif pooling == "max":
+            self.pool = nn.AdaptiveMaxPool2d((1, 1))
+        else:
+            raise ValueError("Unknown pooling type")
+
+        # Final feature size
+        combined_features_dim = conv_out_dim + target_robot_embedding_dim
+
+        # Policy and value heads
+        self.actor_head = nn.Sequential(
+            nn.Linear(combined_features_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_space.n)
+        )
+        self.critic_head = nn.Sequential(
+            nn.Linear(combined_features_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def get_initial_states(self, batch_size: int, device: torch.device = None):
+        """Return a tuple of (h_states, c_states) for all layers, each a list of tensors."""
+        device = device or next(self.parameters()).device
+        H, W = self.height, self.width
+        h_states = [torch.zeros(batch_size, self.hidden_dims[i], H, W, device=device) for i in range(self.num_layers)]
+        c_states = [torch.zeros(batch_size, self.hidden_dims[i], H, W, device=device) for i in range(self.num_layers)]
+        return h_states, c_states
+
+    def _process_obs(self, obs: Dict[str, torch.Tensor], h_states, c_states):
+        board_features = obs["board_features"]
+        target_robot_idx = obs["target_robot_idx"]
+
+        # Ensure correct dtype and shape
+        if board_features.dtype == torch.uint8:
+            board_features = board_features.float()
+        if board_features.ndim == 3:
+            board_features = board_features.unsqueeze(0)  # Ensure batch dimension
+        if target_robot_idx.dtype != torch.long:
+            target_robot_idx = target_robot_idx.long()
+        if target_robot_idx.ndim == 0:
+            target_robot_idx = target_robot_idx.unsqueeze(0)
+        if target_robot_idx.ndim == 2 and target_robot_idx.shape[1] == 1:
+            target_robot_idx = target_robot_idx.squeeze(1)
+
+        # Repeat the ConvLSTM stack K times, carrying hidden/cell state
+        for _ in range(self.repeat_K):
+            x = board_features  # <-- Always start with board_features for each repeat!
+            for i, cell in enumerate(self.convlstm_cells):
+                h, c = h_states[i], c_states[i]
+                h_next, c_next = cell(x, h, c)
+                h_next = self.post_convs[i](h_next)
+                h_states[i], c_states[i] = h_next, c_next
+                x = h_next  # input to next layer is output of this layer
+
+        # After K repeats, x is the output of the last ConvLSTM+1x1+ReLU
+        pooled = self.pool(x).view(x.shape[0], -1)  # (B, hidden_dim)
+        target_embed = self.target_robot_embed(target_robot_idx)
+        combined = torch.cat([pooled, target_embed], dim=1)
+        return combined, h_states, c_states
+
+    def forward(self, obs: Dict[str, torch.Tensor], h_states=None, c_states=None):
+        # Ensure batch dimension
+        if obs["board_features"].ndim == 3:
+            B = 1
+        else:
+            B = obs["board_features"].shape[0]
+        device = obs["board_features"].device
+        if h_states is None or c_states is None:
+            h_states, c_states = self.get_initial_states(B, device)
+        features, next_h_states, next_c_states = self._process_obs(obs, h_states, c_states)
+        action_logits = self.actor_head(features)
+        value = self.critic_head(features)
+        return action_logits, value, next_h_states, next_c_states
+
+    def get_action_and_value(self, obs: Dict[str, torch.Tensor], action: Optional[torch.Tensor] = None, h_states=None, c_states=None):
+        action_logits, value, next_h_states, next_c_states = self.forward(obs, h_states, c_states)
+        probs = F.softmax(action_logits, dim=-1)
+        dist = torch.distributions.Categorical(probs)
+        if action is None:
+            sampled_action = dist.sample()
+        else:
+            sampled_action = action
+        log_prob = dist.log_prob(sampled_action)
+        entropy = dist.entropy()
+        return sampled_action, log_prob, entropy, value.squeeze(-1), next_h_states, next_c_states
+
+    def get_value(self, obs: Dict[str, torch.Tensor], h_states=None, c_states=None) -> torch.Tensor:
+        _, value, _, _ = self.forward(obs, h_states, c_states)
+        return value.squeeze(-1)
+
 class ActorCriticPPO(nn.Module):
     def __init__(self, obs_space: spaces.Dict, action_space: spaces.Discrete):
         super().__init__()
@@ -19,6 +183,8 @@ class ActorCriticPPO(nn.Module):
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.Flatten(),
         )

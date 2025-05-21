@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Optional
 from gymnasium import spaces
 import torch.nn.functional as F
 
-from .models import ActorCriticPPO # Assuming models.py is in the same directory
+from .models import ActorCriticPPO, DeepRepeatedConvLSTM  # Assuming models.py is in the same directory
 
 class PPOAgent:
     def __init__(self,
@@ -20,7 +20,12 @@ class PPOAgent:
                  entropy_coef: float = 0.01,
                  value_loss_coef: float = 0.5,
                  max_grad_norm: float = 0.5,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 model_type: str = "simple",
+                 num_envs: int = 1,  # <--- Add this if using vectorized envs
+                 num_lstm_layers: int = 3,
+                 lstm_hidden_dims: Tuple[int, ...] = (32, 32, 32),
+                 ):
 
         self.obs_space = obs_space
         self.action_space = action_space
@@ -33,14 +38,27 @@ class PPOAgent:
         self.entropy_coef = entropy_coef
         self.value_loss_coef = value_loss_coef
         self.max_grad_norm = max_grad_norm
+        self.num_envs = num_envs
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = device
 
-        self.network = ActorCriticPPO(obs_space, action_space).to(self.device)
+        if model_type == "simple":
+            self.network = ActorCriticPPO(obs_space, action_space).to(self.device)
+            self.is_recurrent = False
+        elif model_type == "convlstm":
+            self.network = DeepRepeatedConvLSTM(obs_space, action_space, num_layers=num_lstm_layers, hidden_dims=lstm_hidden_dims).to(self.device)
+            self.is_recurrent = True
+        else:
+            raise ValueError(f"Invalid model type: {model_type}")
+
         self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
+
+        # --- Recurrent state tracking ---
+        if self.is_recurrent:
+            self.h_states, self.c_states = self.network.get_initial_states(self.num_envs, self.device)
 
     def _obs_to_torch(self, obs: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """Converts a NumPy observation dictionary to a PyTorch tensor dictionary on the correct device."""
@@ -66,54 +84,48 @@ class PPOAgent:
             "target_robot_idx": torch.stack(target_robot_idx_list).to(self.device)
         }
 
+    def reset_states(self, env_indices=None):
+        """Reset hidden/cell states for given env indices (or all if None)."""
+        if not self.is_recurrent:
+            return
+        if env_indices is None:
+            self.h_states, self.c_states = self.network.get_initial_states(self.num_envs, self.device)
+        else:
+            # Reset only selected envs
+            for i in range(len(self.h_states)):
+                self.h_states[i][env_indices] = 0
+                self.c_states[i][env_indices] = 0
 
-    @torch.no_grad()
-    def get_action_and_value(self, obs: Dict[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def act(self, obs: Dict[str, torch.Tensor], dones: Optional[np.ndarray] = None, h_states: Optional[List[torch.Tensor]] = None, c_states: Optional[List[torch.Tensor]] = None):
         """
-        Select an action and get its log probability and the state value.
-        Operates on a single observation (NumPy).
+        Take a step in the environment.
+        Args:
+            obs: Dict of torch tensors for the current batch of envs.
+            dones: np.ndarray of shape (num_envs,) indicating which envs are done.
+        Returns:
+            action, log_prob, entropy, value, (next_h_states, next_c_states)
         """
-        self.network.eval() # Set to evaluation mode
-        
-        # Add batch dimension if obs is for a single step
-        obs_board_features_np = obs["board_features"]
-        if obs_board_features_np.ndim == 3: # (C, H, W)
-            obs_board_features_np = np.expand_dims(obs_board_features_np, axis=0)
-        
-        obs_target_idx_np = obs["target_robot_idx"]
-        if not isinstance(obs_target_idx_np, np.ndarray) or obs_target_idx_np.ndim == 0:
-            obs_target_idx_np = np.array([obs_target_idx_np])
+        if self.is_recurrent:
+            # Reset hidden states for envs where done=True
+            if dones is not None and np.any(dones):
+                done_indices = np.where(dones)[0]
+                self.reset_states(done_indices)
+            action, log_prob, entropy, value, next_h, next_c = self.network.get_action_and_value(
+                obs, h_states, c_states
+            )
+            return action, log_prob, entropy, value, next_h, next_c
+        else:
+            action, log_prob, entropy, value = self.network.get_action_and_value(obs)
+            return action, log_prob, entropy, value, None, None
 
-
-        obs_torch = {
-            "board_features": torch.from_numpy(obs_board_features_np).float().to(self.device),
-            "target_robot_idx": torch.from_numpy(obs_target_idx_np).long().to(self.device)
-        }
-        
-        action, log_prob, _, value = self.network.get_action_and_value(obs_torch)
-        self.network.train() # Set back to training mode
-        
-        return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
-
-    @torch.no_grad()
-    def get_value(self, obs_dict: Dict[str, np.ndarray]) -> np.ndarray:
-        """Get state value for a single observation (NumPy)."""
-        self.network.eval()
-        obs_board_features_np = obs_dict["board_features"]
-        if obs_board_features_np.ndim == 3: # (C, H, W)
-            obs_board_features_np = np.expand_dims(obs_board_features_np, axis=0)
-        
-        obs_target_idx_np = obs_dict["target_robot_idx"]
-        if not isinstance(obs_target_idx_np, np.ndarray) or obs_target_idx_np.ndim == 0:
-            obs_target_idx_np = np.array([obs_target_idx_np])
-
-        obs_torch = {
-            "board_features": torch.from_numpy(obs_board_features_np).float().to(self.device),
-            "target_robot_idx": torch.from_numpy(obs_target_idx_np).long().to(self.device)
-        }
-        value = self.network.get_value(obs_torch)
-        self.network.train()
-        return value.cpu().numpy()
+    def get_value(self, obs: Dict[str, torch.Tensor]):
+        if self.is_recurrent:
+            obs_tensor_dict = self._obs_to_torch(obs)
+            value = self.network.get_value(obs_tensor_dict, [torch.tensor(state) for state in self.h_states], [torch.tensor(state) for state in self.c_states])
+            return value
+        else:
+            obs_tensor_dict = self._obs_to_torch(obs)
+            return self.network.get_value(obs_tensor_dict)
 
     def select_action(self, obs_dict: Dict[str, np.ndarray], deterministic: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -144,7 +156,12 @@ class PPOAgent:
         
         self.network.eval() # Ensure network is in evaluation mode
         with torch.no_grad():
-            action_logits, value_tensor = self.network(obs_tensor_dict) # network.forward
+            if self.is_recurrent:
+                action_logits, value_tensor, next_h_states, next_c_states = self.network(obs_tensor_dict, self.h_states, self.c_states) # network.forward
+                self.h_states = [h.detach() for h in next_h_states]
+                self.c_states = [c.detach() for c in next_c_states]
+            else:
+                action_logits, value_tensor = self.network(obs_tensor_dict) # network.forward
             probs = torch.softmax(action_logits, dim=-1)
             dist = torch.distributions.Categorical(probs)
 
@@ -167,7 +184,9 @@ class PPOAgent:
               log_probs_old_batch: np.ndarray,
               advantages_batch: np.ndarray,
               returns_batch: np.ndarray,
-              values_batch: np.ndarray): # values_batch are V(s_t) from rollout
+              values_batch: np.ndarray,
+              h_states_batch: Optional[np.ndarray] = None,
+              c_states_batch: Optional[np.ndarray] = None): # values_batch are V(s_t) from rollout
         """
         Update the policy using PPO.
         Assumes all inputs are NumPy arrays or lists of dicts for obs.
@@ -184,6 +203,13 @@ class PPOAgent:
         advantages_tensor = torch.from_numpy(advantages_batch).to(self.device)
         returns_tensor = torch.from_numpy(returns_batch).to(self.device)
         # values_tensor = torch.from_numpy(values_batch).to(self.device) # V(s_t)
+        if self.is_recurrent:
+            assert h_states_batch is not None and c_states_batch is not None, "h_states_batch and c_states_batch must be provided if using recurrent model"
+            h_states_tensor = [torch.from_numpy(h).to(self.device) for h in h_states_batch]
+            c_states_tensor = [torch.from_numpy(c).to(self.device) for c in c_states_batch]
+        else:
+            h_states_tensor = None
+            c_states_tensor = None
 
         # Normalize advantages (optional but often helpful)
         advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
@@ -229,9 +255,14 @@ class PPOAgent:
                 mb_advantages = advantages_tensor[mb_indices]
                 mb_returns = returns_tensor[mb_indices]
                 # mb_values_old = values_tensor[mb_indices] # V(s_t) from rollout
+                mb_h_states = [h_states_tensor[i][mb_indices] for i in range(len(h_states_tensor))]
+                mb_c_states = [c_states_tensor[i][mb_indices] for i in range(len(c_states_tensor))]
 
                 # Get new log_probs, values, and entropy from the current policy
-                _, new_log_probs, entropy, new_values = self.network.get_action_and_value(mb_obs, mb_actions)
+                if self.is_recurrent:
+                    _, new_log_probs, entropy, new_values, _, _ = self.network.get_action_and_value(mb_obs, mb_actions, mb_h_states, mb_c_states)
+                else:
+                    _, new_log_probs, entropy, new_values = self.network.get_action_and_value(mb_obs, mb_actions)
 
                 # Policy ratio
                 ratio = torch.exp(new_log_probs - mb_log_probs_old)

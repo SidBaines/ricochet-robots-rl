@@ -7,7 +7,7 @@ import wandb  # Import wandb
 from collections import deque
 from datetime import datetime
 from environment import RicochetRobotsEnv
-from environment.simpler_ricochet_env import RicochetRobotsEnvOneStepAway
+from environment.simpler_ricochet_env import RicochetRobotsEnvOneStepAway, RicochetRobotsEnvCornerTarget
 from agent import PPOAgent, RolloutBuffer
 
 
@@ -19,11 +19,13 @@ def main():
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.2
-    ppo_epochs = 10
+    ppo_epochs = 30
     num_minibatches = 32 # SB3 default is 4 for num_steps=2048 -> minibatch_size=64. Let's try 32 -> 64.
     entropy_coef = 0.02
     value_loss_coef = 0.5
     max_grad_norm = 0.5
+    num_lstm_layers = 3
+    lstm_hidden_dims = (32, 32, 32)
     
     board_size = 5 # Default Ricochet Robots board size
     num_robots = 3  # Default number of robots
@@ -40,7 +42,7 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     
     # Initialize wandb
-    do_wandb = False
+    do_wandb = True
     if do_wandb:
         wandb_project = "ricochet_robots_rl"
         wandb_entity = None  # Set to your wandb username or team name if needed
@@ -65,6 +67,8 @@ def main():
         "max_episode_steps": max_episode_steps,
         "num_edge_walls_per_quadrant": num_edge_walls_per_quadrant,
         "num_floating_walls_per_quadrant": num_floating_walls_per_quadrant,
+        "num_lstm_layers": num_lstm_layers,
+        "lstm_hidden_dims": lstm_hidden_dims,
     }
     if do_wandb:
         wandb.init(
@@ -82,16 +86,37 @@ def main():
 
     # --- Environment Setup ---
     # You might want to wrap the env for monitoring, e.g., RecordEpisodeStatistics
-    # env = RicochetRobotsEnv(
-    env = RicochetRobotsEnvOneStepAway(
-        board_size=board_size,
-        num_robots=num_robots,
-        max_steps=max_episode_steps,
-        use_standard_walls=False, # Use the predefined walls
-        num_edge_walls_per_quadrant=num_edge_walls_per_quadrant,
-        num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
-        render_mode=None # "human" for visualization, None for faster training
-    )
+    if 0:
+        env = RicochetRobotsEnv(
+            board_size=board_size,
+            num_robots=num_robots,
+            max_steps=max_episode_steps,
+            use_standard_walls=False, # Use the predefined walls
+            num_edge_walls_per_quadrant=num_edge_walls_per_quadrant,
+            num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
+            render_mode=None # "human" for visualization, None for faster training
+        )
+    elif 0:
+        env = RicochetRobotsEnvOneStepAway(
+            board_size=board_size,
+            num_robots=num_robots,
+            max_steps=max_episode_steps,
+            use_standard_walls=False, # Use the predefined walls
+            num_edge_walls_per_quadrant=num_edge_walls_per_quadrant,
+            num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
+            render_mode=None # "human" for visualization, None for faster training
+        )
+    else:
+        env = RicochetRobotsEnvCornerTarget(
+            board_size=board_size,
+            num_robots=num_robots,
+            max_steps=max_episode_steps,
+            # use_standard_walls=False, # Use the predefined walls
+            # num_edge_walls_per_quadrant=num_edge_walls_per_quadrant,
+            # num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
+            render_mode=None # "human" for visualization, None for faster training
+        )
+
     env = gym.wrappers.RecordEpisodeStatistics(env) # Tracks episode returns and lengths
 
     # --- Agent and Buffer Setup ---
@@ -107,7 +132,11 @@ def main():
         entropy_coef=entropy_coef,
         value_loss_coef=value_loss_coef,
         max_grad_norm=max_grad_norm,
-        device=device
+        device=device,
+        model_type="convlstm",  # or "simple"
+        num_envs=getattr(env, "num_envs", 1),  # If using vectorized envs
+        num_lstm_layers=num_lstm_layers,
+        lstm_hidden_dims=lstm_hidden_dims,
     )
     
     latest_model_path = os.path.join(save_dir, "ppo_ricochet_latest.pth")
@@ -124,13 +153,22 @@ def main():
         action_space_shape=(), # For Discrete action space
         gamma=gamma,
         gae_lambda=gae_lambda,
-        device=device # Buffer stores numpy, device mainly for agent
+        device=device,
+        num_envs=getattr(env, "num_envs", 1),
+        num_lstm_layers=3,  # Should match model
+        lstm_hidden_dims=(32, 32, 32),  # Should match model
+        board_height=board_size,
+        board_width=board_size,
     )
 
     # --- Training Loop ---
     obs_dict, info = env.reset()
     current_total_steps = 0
     num_rollouts_done = 0
+
+    # If using vectorized envs, track dones for each env
+    num_envs = getattr(env, "num_envs", 1)
+    dones = np.zeros(num_envs, dtype=bool)
 
     # For logging
     ep_rew_mean_deque = deque(maxlen=100) # Mean reward of last 100 episodes
@@ -163,23 +201,44 @@ def main():
         current_ep_length = 0
         
         for step in range(num_steps_per_rollout):
-            current_total_steps += 1
+            current_total_steps += num_envs
             current_ep_length += 1
 
-            # Get action from agent
-            action, log_prob, value = agent.get_action_and_value(obs_dict)
-            
-            # Step environment
-            next_obs_dict, reward, terminated, truncated, info = env.step(action.item()) # action is usually [val]
-            done = terminated or truncated
-            
+            # Convert obs_dict to torch tensors (batch dimension)
+            obs_torch = {
+                k: torch.from_numpy(np.array(obs_dict[k])).float().to(device)
+                if k == "board_features"
+                else torch.from_numpy(np.array(obs_dict[k])).long().to(device)
+                for k in obs_dict
+            }
+            # --- Get action and recurrent states ---
+            action, log_prob, entropy, value, h_states, c_states = agent.act(obs_torch, dones)
+
+            # Convert action to numpy for env.step
+            action_np = action.cpu().numpy()
+            if num_envs == 1:
+                action_np = action_np.item()
+            # Step the environment(s)
+            next_obs_dict, reward, terminated, truncated, info = env.step(action_np)
+            done = np.logical_or(terminated, truncated)
+
             # Update episode tracking
             current_ep_reward += reward
 
-            # Store experience
-            rollout_buffer.add(obs_dict, action, reward, done, value, log_prob)
+            # --- Store in buffer, including recurrent states ---
+            rollout_buffer.add(
+                obs={k: np.array(obs_dict[k]) for k in obs_dict},
+                action=action_np,
+                reward=reward,
+                done=done,
+                value=value.detach().cpu().numpy(),
+                log_prob=log_prob.detach().cpu().numpy(),
+                h_states=[h.detach().cpu().numpy() for h in h_states],
+                c_states=[c.detach().cpu().numpy() for c in c_states],
+            )
             
             obs_dict = next_obs_dict
+            dones = done
 
             if done:
                 # Episode completed
@@ -220,7 +279,9 @@ def main():
             batch_log_probs_old,
             batch_advantages,
             batch_returns,
-            batch_values # V(s_t) from rollout, not strictly needed by PPO learn if using returns
+            batch_values, # V(s_t) from rollout, not strictly needed by PPO learn if using returns
+            batch_h_states,
+            batch_c_states,
         ) = rollout_buffer.get()
 
         # Update policy and track metrics
@@ -230,7 +291,9 @@ def main():
             batch_log_probs_old,
             batch_advantages,
             batch_returns,
-            batch_values # Pass V(s_t) for potential use, though PPO uses returns
+            batch_values, # Pass V(s_t) for potential use, though PPO uses returns
+            batch_h_states,
+            batch_c_states,
         )
 
         rollout_buffer.clear()
