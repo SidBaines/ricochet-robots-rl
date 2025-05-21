@@ -1,9 +1,11 @@
 # Class for a simple Ricochet Robots environment in which the target is one step away from the robot
 
 from environment.ricochet_env import RicochetRobotsEnv
+from environment.custom_difficulty_envs import RicochetRobotsEnvCustomDifficulty
 from environment.utils import DIRECTIONS
 from typing import Optional, Tuple, Dict
 import numpy as np
+from environment.board import Board
 
 
 class RicochetRobotsEnvOneStepAway(RicochetRobotsEnv):

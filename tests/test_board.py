@@ -56,5 +56,5 @@ class TestBoard:
 
         # Center area walls (example around (7,7) which is cr-1, cc-1 for cr,cc=8,8)
         # (6,6) SOUTH wall -> (7,6) NORTH wall
-        assert board.has_wall(6,6,SOUTH)
-        assert board.has_wall(7,6,NORTH) 
+        assert board.has_wall(6,7,SOUTH)
+        assert board.has_wall(7,7,NORTH) 

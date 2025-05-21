@@ -33,7 +33,7 @@ class TestRicochetRobotsEnv:
         assert "target_robot_idx" in obs_space
         
         assert isinstance(obs_space["board_features"], Box)
-        assert obs_space["board_features"].shape == (DEFAULT_NUM_ROBOTS + 1, DEFAULT_BOARD_SIZE, DEFAULT_BOARD_SIZE)
+        assert obs_space["board_features"].shape == (DEFAULT_NUM_ROBOTS + 4 + 1, DEFAULT_BOARD_SIZE, DEFAULT_BOARD_SIZE) # 4 for walls, 1 for target
         assert obs_space["board_features"].dtype == np.uint8
         
         assert isinstance(obs_space["target_robot_idx"], Discrete)

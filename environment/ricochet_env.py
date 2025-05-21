@@ -174,10 +174,9 @@ class RicochetRobotsEnv(gym.Env):
         # Ensure target_pos is a tuple of ints
         if isinstance(self.target_pos, np.ndarray):
              self.target_pos = tuple(self.target_pos.tolist())
-
-
-        if self.render_mode == "human":
-            self.render()
+        if self.display_step:
+            if self.render_mode == "human":
+                self.render()
         return self._get_obs(), self._get_info()
 
     def _get_robot_at(self, r: int, c: int) -> Optional[Robot]:

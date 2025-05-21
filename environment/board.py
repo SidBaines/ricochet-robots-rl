@@ -126,8 +126,9 @@ class Board:
         """
         # Block off the center 2x2 square (usually it's impassable or special)
         # For simplicity, we'll just add walls around it.
+        self.add_middle_blocked_walls()
+        # Some example outer walls (these are often specific per quadrant)
         if self.height == 16 and self.width == 16: # Standard size
-            # Some example outer walls (these are often specific per quadrant)
             self.add_wall(2, 2, EAST)
             self.add_wall(2, 2, SOUTH)
 
