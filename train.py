@@ -14,21 +14,23 @@ from agent import PPOAgent, RolloutBuffer
 def main():
     # --- Hyperparameters ---
     total_timesteps = 1_000_000
+    # num_steps_per_rollout = 2048  # Number of steps to run per policy update
     num_steps_per_rollout = 2048  # Number of steps to run per policy update
-    learning_rate = 3e-4
+    learning_rate = 1e-5
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.2
-    ppo_epochs = 30
+    ppo_epochs = 10
     num_minibatches = 32 # SB3 default is 4 for num_steps=2048 -> minibatch_size=64. Let's try 32 -> 64.
     entropy_coef = 0.02
     value_loss_coef = 0.5
     max_grad_norm = 0.5
-    num_lstm_layers = 3
-    lstm_hidden_dims = (32, 32, 32)
+    num_lstm_layers = 2
+    lstm_hidden_dims = (32, 32)
+    repeat_timesteps = 3
     
     board_size = 5 # Default Ricochet Robots board size
-    num_robots = 3  # Default number of robots
+    num_robots = 2  # Default number of robots
     max_episode_steps = 10 # Max steps per episode in env
     num_edge_walls_per_quadrant = 0
     num_floating_walls_per_quadrant = 0
@@ -50,6 +52,7 @@ def main():
     
     # Collect hyperparameters for wandb
     config = {
+        "model_type": "convlstm", # "convlstm" or "simple"
         "algorithm": "PPO",
         "total_timesteps": total_timesteps,
         "num_steps_per_rollout": num_steps_per_rollout,
@@ -69,6 +72,7 @@ def main():
         "num_floating_walls_per_quadrant": num_floating_walls_per_quadrant,
         "num_lstm_layers": num_lstm_layers,
         "lstm_hidden_dims": lstm_hidden_dims,
+        "repeat_timesteps": repeat_timesteps,
     }
     if do_wandb:
         wandb.init(
@@ -96,7 +100,7 @@ def main():
             num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
             render_mode=None # "human" for visualization, None for faster training
         )
-    elif 0:
+    elif 1:
         env = RicochetRobotsEnvOneStepAway(
             board_size=board_size,
             num_robots=num_robots,
@@ -133,7 +137,7 @@ def main():
         value_loss_coef=value_loss_coef,
         max_grad_norm=max_grad_norm,
         device=device,
-        model_type="convlstm",  # or "simple"
+        model_type=config["model_type"],  # "convlstm" or "simple"
         num_envs=getattr(env, "num_envs", 1),  # If using vectorized envs
         num_lstm_layers=num_lstm_layers,
         lstm_hidden_dims=lstm_hidden_dims,
@@ -155,8 +159,8 @@ def main():
         gae_lambda=gae_lambda,
         device=device,
         num_envs=getattr(env, "num_envs", 1),
-        num_lstm_layers=3,  # Should match model
-        lstm_hidden_dims=(32, 32, 32),  # Should match model
+        num_lstm_layers=num_lstm_layers,  # Should match model
+        lstm_hidden_dims=lstm_hidden_dims,  # Should match model
         board_height=board_size,
         board_width=board_size,
     )
@@ -211,8 +215,17 @@ def main():
                 else torch.from_numpy(np.array(obs_dict[k])).long().to(device)
                 for k in obs_dict
             }
+            # Get previous reccurrent states for adding to buffer
+            if agent.is_recurrent:
+                h_states = [h.detach() for h in agent.h_states]
+                c_states = [c.detach() for c in agent.c_states]
+            else:
+                h_states = None
+                c_states = None
             # --- Get action and recurrent states ---
-            action, log_prob, entropy, value, h_states, c_states = agent.act(obs_torch, dones)
+            with torch.no_grad():
+                # print("WARNING: No gradient calculation for action. This might cause us not to be able to learn.")
+                action, log_prob, entropy, value, _, _ = agent.act(obs_torch, dones, update_internal_states=True)
 
             # Convert action to numpy for env.step
             action_np = action.cpu().numpy()
@@ -233,8 +246,8 @@ def main():
                 done=done,
                 value=value.detach().cpu().numpy(),
                 log_prob=log_prob.detach().cpu().numpy(),
-                h_states=[h.detach().cpu().numpy() for h in h_states],
-                c_states=[c.detach().cpu().numpy() for c in c_states],
+                h_states=[h.detach().cpu().numpy() for h in h_states] if h_states else None,
+                c_states=[c.detach().cpu().numpy() for c in c_states] if c_states else None,
             )
             
             obs_dict = next_obs_dict
@@ -267,7 +280,11 @@ def main():
         # Compute advantages and returns
         with torch.no_grad():
             # Get value of the last observation S_{t+N}
-            last_value_np = agent.get_value(obs_dict) # obs_dict is the state after the last step of rollout
+            last_value = agent.get_value(obs_dict)
+            if isinstance(last_value, torch.Tensor):
+                last_value_np = last_value.detach().cpu().numpy()
+            else:
+                last_value_np = np.array(last_value)
             last_done_for_gae = done # done from the last step of the rollout loop
 
         rollout_buffer.compute_advantages_and_returns(last_value_np, last_done_for_gae)
@@ -358,6 +375,8 @@ def main():
             if do_wandb:
                 wandb.save(checkpoint_path)
             print(f"Model saved at timestep {current_total_steps}")
+
+        torch.cuda.empty_cache()
 
     env.close()
     print("Training finished.")

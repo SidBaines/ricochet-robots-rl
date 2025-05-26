@@ -25,6 +25,7 @@ class PPOAgent:
                  num_envs: int = 1,  # <--- Add this if using vectorized envs
                  num_lstm_layers: int = 3,
                  lstm_hidden_dims: Tuple[int, ...] = (32, 32, 32),
+                 repeat_timesteps: int = 3,
                  ):
 
         self.obs_space = obs_space
@@ -49,7 +50,7 @@ class PPOAgent:
             self.network = ActorCriticPPO(obs_space, action_space).to(self.device)
             self.is_recurrent = False
         elif model_type == "convlstm":
-            self.network = DeepRepeatedConvLSTM(obs_space, action_space, num_layers=num_lstm_layers, hidden_dims=lstm_hidden_dims).to(self.device)
+            self.network = DeepRepeatedConvLSTM(obs_space, action_space, num_layers=num_lstm_layers, hidden_dims=lstm_hidden_dims, repeat_K=repeat_timesteps).to(self.device)
             self.is_recurrent = True
         else:
             raise ValueError(f"Invalid model type: {model_type}")
@@ -96,12 +97,16 @@ class PPOAgent:
                 self.h_states[i][env_indices] = 0
                 self.c_states[i][env_indices] = 0
 
-    def act(self, obs: Dict[str, torch.Tensor], dones: Optional[np.ndarray] = None, h_states: Optional[List[torch.Tensor]] = None, c_states: Optional[List[torch.Tensor]] = None):
+    def act(self, obs: Dict[str, torch.Tensor], dones: Optional[np.ndarray] = None, update_internal_states: bool = True):
         """
         Take a step in the environment.
         Args:
             obs: Dict of torch tensors for the current batch of envs.
             dones: np.ndarray of shape (num_envs,) indicating which envs are done.
+            update_internal_states: Whether to update the internal states of the agent. Only matters for reccurrent agents.
+                                    If we are *definitely* taking the action, then we should update the states. If we are 
+                                    simply getting an action but don't expect to actually run it in the environment, then we 
+                                    should not update the states.
         Returns:
             action, log_prob, entropy, value, (next_h_states, next_c_states)
         """
@@ -111,8 +116,11 @@ class PPOAgent:
                 done_indices = np.where(dones)[0]
                 self.reset_states(done_indices)
             action, log_prob, entropy, value, next_h, next_c = self.network.get_action_and_value(
-                obs, h_states, c_states
+                obs, h_states=self.h_states, c_states=self.c_states
             )
+            if update_internal_states:
+                self.h_states = next_h
+                self.c_states = next_c
             return action, log_prob, entropy, value, next_h, next_c
         else:
             action, log_prob, entropy, value = self.network.get_action_and_value(obs)
@@ -255,8 +263,12 @@ class PPOAgent:
                 mb_advantages = advantages_tensor[mb_indices]
                 mb_returns = returns_tensor[mb_indices]
                 # mb_values_old = values_tensor[mb_indices] # V(s_t) from rollout
-                mb_h_states = [h_states_tensor[i][mb_indices] for i in range(len(h_states_tensor))]
-                mb_c_states = [c_states_tensor[i][mb_indices] for i in range(len(c_states_tensor))]
+                if self.is_recurrent:
+                    mb_h_states = [h_states_tensor[i][mb_indices] for i in range(len(h_states_tensor))]
+                    mb_c_states = [c_states_tensor[i][mb_indices] for i in range(len(c_states_tensor))]
+                else:
+                    mb_h_states = None
+                    mb_c_states = None
 
                 # Get new log_probs, values, and entropy from the current policy
                 if self.is_recurrent:

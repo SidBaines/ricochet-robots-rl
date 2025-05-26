@@ -56,11 +56,17 @@ class DeepRepeatedConvLSTM(nn.Module):
         self.kernel_sizes = kernel_sizes
         self.repeat_K = repeat_K
         self.pooling = pooling
+        self.encoder_out_dim = 32
 
+        # Encoder 
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, self.encoder_out_dim, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+        )
         # ConvLSTM stack
         self.convlstm_cells = nn.ModuleList()
         for i in range(num_layers):
-            input_dim = in_channels if i == 0 else hidden_dims[i-1]
+            input_dim = self.encoder_out_dim if i == 0 else hidden_dims[i-1]
             self.convlstm_cells.append(
                 ConvLSTMCell(input_dim, hidden_dims[i], kernel_sizes[i])
             )
@@ -124,16 +130,16 @@ class DeepRepeatedConvLSTM(nn.Module):
             target_robot_idx = target_robot_idx.squeeze(1)
 
         # Repeat the ConvLSTM stack K times, carrying hidden/cell state
+        encoded_features = self.encoder(board_features)
         for _ in range(self.repeat_K):
-            x = board_features  # <-- Always start with board_features for each repeat!
             for i, cell in enumerate(self.convlstm_cells):
-                h, c = h_states[i], c_states[i]
-                h_next, c_next = cell(x, h, c)
-                h_next = self.post_convs[i](h_next)
+                h, c = h_states[i-1], c_states[i-1]
+                h_next, c_next = cell(encoded_features, h, c)
+                # h_next = self.post_convs[i](h_next)
                 h_states[i], c_states[i] = h_next, c_next
-                x = h_next  # input to next layer is output of this layer
 
         # After K repeats, x is the output of the last ConvLSTM+1x1+ReLU
+        x = h_states[-1] + encoded_features
         pooled = self.pool(x).view(x.shape[0], -1)  # (B, hidden_dim)
         target_embed = self.target_robot_embed(target_robot_idx)
         combined = torch.cat([pooled, target_embed], dim=1)
@@ -225,6 +231,8 @@ class ActorCriticPPO(nn.Module):
         # Ensure board_features is float (CNNs expect float)
         if board_features.dtype == torch.uint8:
             board_features = board_features.float()
+        if board_features.ndim == 3:
+            board_features = board_features.unsqueeze(0)  # Ensure batch dimension
         
         # If target_robot_idx is a float (e.g. from a batch), cast to long for embedding
         if target_robot_idx.dtype != torch.long:

@@ -62,8 +62,8 @@ class RolloutBuffer:
             done: bool,
             value: np.ndarray, # V(s_t)
             log_prob: np.ndarray,
-            h_states: list = None,
-            c_states: list = None):
+            h_states: Optional[list] = None,
+            c_states: Optional[list] = None):
         """Add one step of experience to the buffer."""
         if self.ptr >= self.max_size:
             print("Warning: RolloutBuffer is full. Overwriting old data. This shouldn't happen in standard PPO rollout.")
