@@ -83,6 +83,16 @@ def main():
     # --- Environment Setup ---
     # You might want to wrap the env for monitoring, e.g., RecordEpisodeStatistics
     # env = RicochetRobotsEnv(
+    seed = 42  # or make this a command-line argument/config
+    import random
+    import numpy as np
+    import torch
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    # If using CUDA:
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     env = RicochetRobotsEnvOneStepAway(
         board_size=board_size,
         num_robots=num_robots,
@@ -90,7 +100,8 @@ def main():
         use_standard_walls=False, # Use the predefined walls
         num_edge_walls_per_quadrant=num_edge_walls_per_quadrant,
         num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
-        render_mode=None # "human" for visualization, None for faster training
+        render_mode=None, # "human" for visualization, None for faster training
+        seed=seed,  # pass seed to env
     )
     env = gym.wrappers.RecordEpisodeStatistics(env) # Tracks episode returns and lengths
 
@@ -198,6 +209,8 @@ def main():
                 rollout_lengths.append(current_ep_length)
                 
                 # Reset episode tracking
+                # Currently, we move robots but don't change wall positions, because we want to keep the same board for the entire training process.
+                # If we want to reset walls, we need to either make a new env or write a function to reset the board.
                 obs_dict, info = env.reset()
                 current_ep_reward = 0
                 current_ep_length = 0

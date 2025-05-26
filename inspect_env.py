@@ -177,7 +177,7 @@ if 0 < env_step_test.num_robots:
 
 from environment.board import Board
 # Create a board
-board_size = 5
+board_size = 6
 my_board = Board(height=board_size, width=board_size) # Perimeter walls are set up
 
 # Optionally, add the standard central walls
@@ -202,12 +202,13 @@ env_with_random_board = RicochetRobotsEnv(
     board_size=board_size,
     num_robots=4, # Or as desired
     use_standard_walls=False, # We are providing our own board
-    render_mode="human"
+    render_mode="human",
+    seed=None,
 )
 env_with_random_board.board = my_board # Replace the env's default board
 
-obs, info = env_with_random_board.reset(seed=42) # Reset to place robots etc.
-# env_with_random_board.render()
+obs, info = env_with_random_board.reset(seed=None) # Reset to place robots etc.
+env_with_random_board.render()
 
 
 

@@ -9,10 +9,30 @@ from environment.board import Board
 
 
 class RicochetRobotsEnvOneStepAway(RicochetRobotsEnv):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, 
+                 board_size=5, 
+                 num_robots=2, 
+                 max_steps=10, 
+                 num_edge_walls_per_quadrant=0, 
+                 num_floating_walls_per_quadrant=0,
+                 seed=None,
+                 **kwargs):
+        super().__init__(
+            board_size=board_size,
+            num_robots=num_robots,
+            max_steps=max_steps,
+            num_edge_walls_per_quadrant=num_edge_walls_per_quadrant,
+            num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
+            seed=seed,
+            **kwargs
+        )
+        self._seed = seed
+        self._set_seed(seed)
         
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict, Dict]:
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self._seed = seed
+        self._set_seed(self._seed)
         '''
         Reset the environment to create a one-step solvable puzzle.
         '''

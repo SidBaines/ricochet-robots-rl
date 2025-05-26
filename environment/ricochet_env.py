@@ -27,7 +27,8 @@ class RicochetRobotsEnv(gym.Env):
                  num_edge_walls_per_quadrant: Optional[int] = None,
                  num_floating_walls_per_quadrant: Optional[int] = None,
                  display_step: bool = False,
-                 render_mode: Optional[str] = None):
+                 render_mode: Optional[str] = None,
+                 seed: Optional[int] = None):
         super().__init__()
 
         self.display_step = display_step
@@ -67,7 +68,8 @@ class RicochetRobotsEnv(gym.Env):
             
             self.board.generate_random_walls(
                 num_edge_walls_per_quadrant=edge_walls_to_gen,
-                num_floating_walls_per_quadrant=floating_walls_to_gen
+                num_floating_walls_per_quadrant=floating_walls_to_gen,
+                rng=self._np_random  # Pass the seeded RNG
             )
 
         self.robots: List[Robot] = [] # Will be populated in reset
@@ -95,6 +97,20 @@ class RicochetRobotsEnv(gym.Env):
         })
         
         self.np_random = None # Will be seeded in reset
+        self._seed = seed
+        self._set_seed(seed)
+
+    def _set_seed(self, seed):
+        import random
+        import numpy as np
+        import torch
+        self._np_random, _ = gym.utils.seeding.np_random(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        try:
+            torch.manual_seed(seed)
+        except Exception:
+            pass
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
         # Create observation with additional channels for walls
@@ -137,7 +153,9 @@ class RicochetRobotsEnv(gym.Env):
         }
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict, Dict]:
-        super().reset(seed=seed) # Important for seeding self.np_random
+        if seed is not None:
+            self._seed = seed
+        self._set_seed(self._seed)
 
         self.current_step = 0
         
