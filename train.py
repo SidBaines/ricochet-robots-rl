@@ -1,6 +1,7 @@
 import gymnasium as gym
 import torch
 import numpy as np
+import random
 import time
 import os
 import wandb  # Import wandb
@@ -90,6 +91,13 @@ def main():
 
     # --- Environment Setup ---
     # You might want to wrap the env for monitoring, e.g., RecordEpisodeStatistics
+    seed = 42  # or make this a command-line argument/config
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    # If using CUDA:
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     if 0:
         env = RicochetRobotsEnv(
             board_size=board_size,
@@ -270,7 +278,9 @@ def main():
                 rollout_lengths.append(current_ep_length)
                 
                 # Reset episode tracking
-                obs_dict, info = env.reset()
+                # Currently, we move robots but don't change wall positions, because we want to keep the same board for the entire training process.
+                # If we want to reset walls, we need to either make a new env or write a function to reset the board.
+                obs_dict, info = env.reset(seed=current_total_steps)
                 current_ep_reward = 0
                 current_ep_length = 0
         

@@ -7,6 +7,7 @@ class Board:
         self.width = width
         # self.walls[r, c, direction_idx] is True if cell (r,c) has a wall on that side
         self.walls = np.zeros((height, width, 4), dtype=bool)
+        self.blocked_cells = set()
         self._setup_perimeter_walls()
 
     def _setup_perimeter_walls(self):
@@ -119,7 +120,7 @@ class Board:
             self.add_wall(cr, cc , SOUTH) # Wall below (6,6) which is N of (7,6)
             self.add_wall(cr, cc , EAST) # Wall below (6,6) which is N of (7,6)
             self.add_wall(cr, cc , WEST) # Wall below (6,6) which is N of (7,6)
-    
+        self.blocked_cells.update(self.get_central_block_coords())
     def add_standard_ricochet_walls(self):
         """Adds some example walls typical of Ricochet Robots boards.
         This is a simplified example. Real boards have specific configurations.
@@ -144,7 +145,8 @@ class Board:
     def generate_random_walls(self, 
                               num_edge_walls_per_quadrant: int, 
                               num_floating_walls_per_quadrant: int,
-                              max_attempts_factor: int = 30):
+                              max_attempts_factor: int = 30,
+                              rng=None):
         """
         Generates random walls based on specified rules per quadrant.
         - 'edge walls': Single wall segments parallel to a board edge, originating
@@ -156,8 +158,10 @@ class Board:
         It's recommended to call this on a board that already has perimeter walls
         and potentially the standard central block walls.
         """
+        if rng is None:
+            rng = np.random  # fallback to global RNG, but should always pass in env._np_random
+
         central_block = self.get_central_block_coords()
-        
         mid_r, mid_c = self.height // 2, self.width // 2
         quadrant_defs = [
             {"name": "NW", "r_lim": (0, mid_r), "c_lim": (0, mid_c)},
@@ -165,7 +169,7 @@ class Board:
             {"name": "SW", "r_lim": (mid_r, self.height), "c_lim": (0, mid_c)},
             {"name": "SE", "r_lim": (mid_r, self.height), "c_lim": (mid_c, self.width)},
         ]
-
+        
         for quad_idx, quad in enumerate(quadrant_defs):
             r_start, r_end_exclusive = quad["r_lim"]
             c_start, c_end_exclusive = quad["c_lim"]
@@ -219,7 +223,7 @@ class Board:
                     for r_idx in range(r_start, r_end_exclusive):
                         candidate_edge_origins.append(((r_idx, c_edge), NORTH))
             
-            np.random.shuffle(candidate_edge_origins)
+            rng.shuffle(candidate_edge_origins)
             
             placed_this_quad_edge_walls = set() # Stores ((r,c), wall_direction)
 
@@ -277,7 +281,7 @@ class Board:
                         if not is_adj_to_central:
                            potential_l_corners.append((r,c))
             
-            np.random.shuffle(potential_l_corners)
+            rng.shuffle(potential_l_corners)
             
             # L-shape orientations: (wall_direction1_from_corner, wall_direction2_from_corner)
             orientations = [(SOUTH, EAST), (SOUTH, WEST), (NORTH, EAST), (NORTH, WEST)]
@@ -286,7 +290,7 @@ class Board:
                 if placed_floating_count >= num_floating_walls_per_quadrant: break
                 if attempts >= max_total_attempts and placed_floating_count < num_floating_walls_per_quadrant: break
 
-                np.random.shuffle(orientations)
+                rng.shuffle(orientations)
                 for d1, d2 in orientations:
                     attempts += 1
                     # L-shape walls are (cr, cc, d1) and (cr, cc, d2)
@@ -334,3 +338,5 @@ class Board:
         """Checks if a position is valid on the board."""
         return 0 <= r < self.height and 0 <= c < self.width
     
+    def get_blocked_cells(self) -> set[tuple[int, int]]:
+        return self.blocked_cells
