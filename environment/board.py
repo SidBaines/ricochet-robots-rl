@@ -7,6 +7,7 @@ class Board:
         self.width = width
         # self.walls[r, c, direction_idx] is True if cell (r,c) has a wall on that side
         self.walls = np.zeros((height, width, 4), dtype=bool)
+        self.blocked_cells = set()
         self._setup_perimeter_walls()
 
     def _setup_perimeter_walls(self):
@@ -119,7 +120,7 @@ class Board:
             self.add_wall(cr, cc , SOUTH) # Wall below (6,6) which is N of (7,6)
             self.add_wall(cr, cc , EAST) # Wall below (6,6) which is N of (7,6)
             self.add_wall(cr, cc , WEST) # Wall below (6,6) which is N of (7,6)
-    
+        self.blocked_cells.update(self.get_central_block_coords())
     def add_standard_ricochet_walls(self):
         """Adds some example walls typical of Ricochet Robots boards.
         This is a simplified example. Real boards have specific configurations.
@@ -337,3 +338,5 @@ class Board:
         """Checks if a position is valid on the board."""
         return 0 <= r < self.height and 0 <= c < self.width
     
+    def get_blocked_cells(self) -> set[tuple[int, int]]:
+        return self.blocked_cells

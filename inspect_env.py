@@ -320,8 +320,8 @@ next_obs, reward, terminated, truncated, info = env.step(action)
 # %%
 # 6. Test the new simpler RicochetRobotsEnvOneStepAway logic
 from environment.simpler_ricochet_env import RicochetRobotsEnvOneStepAway
-env = RicochetRobotsEnvOneStepAway(board_size=3, num_robots=3, use_standard_walls=False, render_mode="human")
-obs, info = env.reset(seed=None)
+env = RicochetRobotsEnvOneStepAway(board_size=5, num_robots=3, use_standard_walls=False, render_mode="human")
+obs, info = env.reset(seed=42)
 env.render()
 
 

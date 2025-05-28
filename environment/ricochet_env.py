@@ -2,6 +2,9 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 from typing import Optional, Union, List, Tuple, Dict, Any
+import random
+import torch
+
 
 from .board import Board
 from .robot import Robot
@@ -101,9 +104,6 @@ class RicochetRobotsEnv(gym.Env):
         self._set_seed(seed)
 
     def _set_seed(self, seed):
-        import random
-        import numpy as np
-        import torch
         self._np_random, _ = gym.utils.seeding.np_random(seed)
         random.seed(seed)
         np.random.seed(seed)
