@@ -2,14 +2,16 @@
 # %% 
 from agent import PPOAgent
 from environment.ricochet_env import RicochetRobotsEnv
+from environment.simpler_ricochet_env import RicochetRobotsEnvOneStepAway
 import torch
 import os
 import numpy as np
 from environment.utils import DIRECTIONS
 # --- Environment Setup ---
 env = RicochetRobotsEnv(
+# env = RicochetRobotsEnvOneStepAway(
         board_size=5,
-        num_robots=1,
+        num_robots=5,
         max_steps=100,
         use_standard_walls=True,
         board_walls_config=None,
@@ -22,7 +24,8 @@ env = RicochetRobotsEnv(
 
 # %%
 # --- Agent Setup ---
-model_path = "ppo_ricochet_models/run_<TIMESTAMP>/ppo_ricochet_latest.pth"
+# model_path = "ppo_ricochet_models/run_<TIMESTAMP>/ppo_ricochet_latest.pth"
+model_path = "ppo_ricochet_models/run_20250528_124322/ppo_ricochet_latest.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -45,6 +48,9 @@ agent.network.eval() # Ensure model is in evaluation mode
 
 # %%
 # --- Simulation Loop ---
+observations = []
+values = []
+actions = []
 obs, info = env.reset(seed=42)
 print("Env.current_step: ", env.current_step)
 max_steps = env.max_steps
@@ -55,13 +61,28 @@ truncated = False
 while (not terminated) and (not truncated) and (step_num < max_steps):
     action, log_prob, value = agent.select_action(obs, deterministic=False)
     action_to_take = action.item() if isinstance(action, np.ndarray) and action.ndim > 0 else action
-    print("Robot action: ", action_to_take, "corresponding to direction: ", DIRECTIONS[action_to_take//4])
+    observations.append(obs)
+    values.append(value)
+    actions.append(action_to_take)
+    # print("Robot action: ", action_to_take, "corresponding to direction: ", DIRECTIONS[action_to_take//4])
     obs, reward, terminated, truncated, info = env.step(action_to_take)
-    if ((step_num % render_every_n_steps) == 0):
-        env.render()
+    # if ((step_num % render_every_n_steps) == 0):
+    #     env.render()
     step_num += 1
-env.render()
+observations.append(obs)
+values.append(value)
+actions.append(action_to_take)
+# env.render()
 print(f"Terminated: {terminated}, Truncated: {truncated}, Step Num: {step_num}, Current step {env.current_step}, max steps {env.max_steps}")
 # env.close()
 
+# %%
+from environment.visualisation import plot_ricochet_robots_game
+fig = plot_ricochet_robots_game(observations, values, actions)
+# fig.update_layout(
+#     autosize=False,
+#     width=1000,
+#     height=700,
+# )
+fig.show()
 # %%

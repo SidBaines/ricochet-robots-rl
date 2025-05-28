@@ -7,6 +7,7 @@ NORTH, EAST, SOUTH, WEST = 0, 1, 2, 3
 
 # For visualization
 ROBOT_COLORS = ['R', 'G', 'B', 'Y', 'P', 'O'] # Red, Green, Blue, Yellow, Purple, Orange
+ROBOT_COLORS_PLOTLY = ['red', 'green', 'blue', 'gold', 'purple', 'orange']
 TARGET_MARKER = 'T'
 EMPTY_CELL = ' '
 WALL_HORIZONTAL = '---'
