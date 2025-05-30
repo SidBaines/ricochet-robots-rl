@@ -146,7 +146,7 @@ def plot_ricochet_robots_game(observations, values, actions, wall_thickness=6, g
     first_data, first_shapes = make_board_frame(observations[0])
 
     fig = make_subplots(
-        rows=1, cols=2, column_widths=[0.7, 0.3],
+        rows=1, cols=2, column_widths=[0.5, 0.5],
         specs=[[{"type": "scatter"}, {"type": "scatter"}]]
     )
     for trace in first_data:
@@ -156,6 +156,11 @@ def plot_ricochet_robots_game(observations, values, actions, wall_thickness=6, g
     # Set axis for board
     fig.update_xaxes(range=[0, width], row=1, col=1, showgrid=False, zeroline=False, tickvals=list(range(width+1)))
     fig.update_yaxes(range=[height, 0], row=1, col=1, showgrid=False, zeroline=False, tickvals=list(range(height+1)))
+    
+    # Set axis for value plot
+    fig.update_xaxes(range=[0, len(observations)-1], row=1, col=2, showgrid=True, zeroline=True)
+    fig.update_yaxes(range=[min(values), max(values)], row=1, col=2, showgrid=True, zeroline=True)
+    
     fig.update_layout(
         shapes=first_shapes,
         width=900, height=500,
@@ -219,10 +224,17 @@ def plot_ricochet_robots_game(observations, values, actions, wall_thickness=6, g
             x=list(range(i+1)),
             y=values[:i+1],
             mode='lines+markers',
-            name='Value'
+            name='Value',
+            showlegend=False  # Hide legend for all but the first frame
         )
+        # Combine the board data with the value trace
         frame.data = list(frame.data) + [value_trace]
         fig_frames.append(frame)
     fig.frames = fig_frames
+
+    # Update the initial value trace to match the first frame
+    fig.data[1].x = [0]
+    fig.data[1].y = [values[0]]
+    fig.data[1].showlegend = True  # Show legend only for the initial trace
 
     return fig
