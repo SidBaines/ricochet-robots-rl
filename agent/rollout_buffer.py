@@ -2,6 +2,34 @@ import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 
+class RunningMeanStd:
+    def __init__(self, shape=()):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = 0
+
+    def update(self, x):
+        if np.isscalar(x):
+            x = np.array([x])
+        batch_mean = np.mean(x)
+        batch_var = np.var(x)
+        batch_count = len(x)
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
 class RolloutBuffer:
     def __init__(self,
                  num_steps: int,
@@ -55,6 +83,10 @@ class RolloutBuffer:
         self.max_size = self.num_steps
         self.buffer_full = False
 
+        # Reward normalization
+        self.ret = 0
+        self.ret_rms = RunningMeanStd()
+
     def add(self,
             obs: Dict[str, np.ndarray],
             action: np.ndarray,
@@ -68,6 +100,13 @@ class RolloutBuffer:
         if self.ptr >= self.max_size:
             print("Warning: RolloutBuffer is full. Overwriting old data. This shouldn't happen in standard PPO rollout.")
             self.ptr = 0
+
+        # Normalize reward
+        self.ret = self.ret * self.gamma + reward
+        self.ret_rms.update(self.ret)
+        reward = reward / np.sqrt(self.ret_rms.var + 1e-8)
+        if done:
+            self.ret = 0
 
         self.observations_board[self.ptr] = obs["board_features"]
         self.observations_target_idx[self.ptr] = obs["target_robot_idx"]
@@ -91,38 +130,39 @@ class RolloutBuffer:
     def compute_advantages_and_returns(self, last_value: np.ndarray, last_done: bool):
         """
         Compute advantages and returns using GAE.
-        Call this after a rollout is complete (i.e., buffer is full or episode ended).
-        last_value: V(s_{t+N}) - value of the state after the last collected step.
-        last_done: Whether the episode terminated/truncated after the last collected step.
         """
-        if not self.buffer_full and self.ptr < self.num_steps :
-            # This might happen if an episode ends before num_steps is reached.
-            # We only process the valid part of the buffer.
-            # However, for PPO, we typically collect exactly num_steps.
-            # This logic is more for if we decide to process partial rollouts.
-            # For now, assume we always fill num_steps or an episode ends.
-            pass
-
-
-        # Use self.ptr to determine how much of the buffer is filled if not fully num_steps
-        # For standard PPO, self.ptr should be equal to self.num_steps here.
         actual_rollout_length = self.ptr 
+        
+        if actual_rollout_length == 0:
+            return  # Nothing to compute
+        
+        # Ensure last_value is a scalar
+        if isinstance(last_value, np.ndarray):
+            last_value_scalar = last_value.item() if last_value.size == 1 else last_value[0]
+        else:
+            last_value_scalar = float(last_value)
 
         last_gae_lam = 0
         for t in reversed(range(actual_rollout_length)):
             if t == actual_rollout_length - 1:
                 next_non_terminal = 1.0 - float(last_done)
-                next_values = last_value.item()
+                next_values = last_value_scalar
             else:
-                next_non_terminal = 1.0 - self.dones[t + 1]
                 next_values = self.values[t + 1]
             
-            delta = self.rewards[t] + self.gamma * next_values * next_non_terminal - self.values[t]
-            last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
+            # Check if current step is terminal
+            current_non_terminal = 1.0 - float(self.dones[t])
+            
+            delta = self.rewards[t] + self.gamma * next_values * current_non_terminal - self.values[t]
+            last_gae_lam = delta + self.gamma * self.gae_lambda * current_non_terminal * last_gae_lam
             self.advantages[t] = last_gae_lam
+            
+            # Reset last_gae_lam to 0 if this is a terminal state
+            if self.dones[t]:
+                last_gae_lam = 0
         
-        self.returns = self.advantages[:actual_rollout_length] + self.values[:actual_rollout_length]
-        # self.returns[:actual_rollout_length] = self.advantages[:actual_rollout_length] + self.values[:actual_rollout_length]
+        # Only compute returns for the valid portion
+        self.returns[:actual_rollout_length] = self.advantages[:actual_rollout_length] + self.values[:actual_rollout_length]
 
     def get_initial_states_for_batch(self, indices: np.ndarray):
         """
@@ -134,7 +174,7 @@ class RolloutBuffer:
         c_states = [torch.from_numpy(c[i]).to(self.device) for c, i in zip(self.c_states, indices)]
         return h_states, c_states
 
-    def get(self) -> Tuple[List[Dict[str, np.ndarray]], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def get(self) -> Tuple[List[Dict[str, np.ndarray]], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
         """
         Retrieve all data from the buffer.
         Returns data for the agent's learn method.
@@ -161,6 +201,10 @@ class RolloutBuffer:
                 "target_robot_idx": self.observations_target_idx[i].item() # Convert [val] back to scalar
             })
 
+        # Fix LSTM state retrieval - slice each layer separately
+        h_states_batch = [h[:actual_size] for h in self.h_states]  # List of (actual_size, hidden_dim, H, W)
+        c_states_batch = [c[:actual_size] for c in self.c_states]  # List of (actual_size, hidden_dim, H, W)
+
         return (
             obs_list, # List of obs dicts
             self.actions[:actual_size],
@@ -168,8 +212,8 @@ class RolloutBuffer:
             self.advantages[:actual_size],
             self.returns[:actual_size],
             self.values[:actual_size], # V(s_t) from rollout
-            self.h_states[:actual_size],
-            self.c_states[:actual_size],
+            h_states_batch,
+            c_states_batch,
         )
 
     def clear(self):

@@ -17,22 +17,22 @@ def main():
     total_timesteps = 1_000_000
     # num_steps_per_rollout = 2048  # Number of steps to run per policy update
     num_steps_per_rollout = 2048  # Number of steps to run per policy update
-    learning_rate = 1e-5
+    learning_rate = 3e-4
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.2
     ppo_epochs = 10
     num_minibatches = 32 # SB3 default is 4 for num_steps=2048 -> minibatch_size=64. Let's try 32 -> 64.
-    entropy_coef = 0.02
+    entropy_coef = 0.05  # Increased from 0.02 to encourage more exploration
     value_loss_coef = 0.5
     max_grad_norm = 0.5
     num_lstm_layers = 2
     lstm_hidden_dims = (32, 32)
-    repeat_timesteps = 3
+    repeat_timesteps = 1
     
     board_size = 5 # Default Ricochet Robots board size
     num_robots = 2  # Default number of robots
-    max_episode_steps = 10 # Max steps per episode in env
+    max_episode_steps = 5 # Max steps per episode in env
     num_edge_walls_per_quadrant = 0
     num_floating_walls_per_quadrant = 0
 
@@ -45,7 +45,7 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     
     # Initialize wandb
-    do_wandb = True
+    do_wandb = False
     if do_wandb:
         wandb_project = "ricochet_robots_rl"
         wandb_entity = None  # Set to your wandb username or team name if needed
@@ -108,7 +108,7 @@ def main():
             num_floating_walls_per_quadrant=num_floating_walls_per_quadrant,
             render_mode=None # "human" for visualization, None for faster training
         )
-    elif 1:
+    elif 0:
         env = RicochetRobotsEnvOneStepAway(
             board_size=board_size,
             num_robots=num_robots,
@@ -149,6 +149,7 @@ def main():
         num_envs=getattr(env, "num_envs", 1),  # If using vectorized envs
         num_lstm_layers=num_lstm_layers,
         lstm_hidden_dims=lstm_hidden_dims,
+        repeat_timesteps=config["repeat_timesteps"],
     )
     
     latest_model_path = os.path.join(save_dir, "ppo_ricochet_latest.pth")
@@ -216,21 +217,27 @@ def main():
             current_total_steps += num_envs
             current_ep_length += 1
 
-            # Convert obs_dict to torch tensors (batch dimension)
-            obs_torch = {
-                k: torch.from_numpy(np.array(obs_dict[k])).float().to(device)
-                if k == "board_features"
-                else torch.from_numpy(np.array(obs_dict[k])).long().to(device)
-                for k in obs_dict
-            }
-            # Get previous reccurrent states for adding to buffer
+            # Convert obs_dict to torch tensors (ensure batch dimension)
+            obs_torch = {}
+            for k, v in obs_dict.items():
+                if k == "board_features":
+                    v_np = np.array(v) if not isinstance(v, np.ndarray) else v
+                    if v_np.ndim == 3:  # Add batch dimension if missing
+                        v_np = v_np[np.newaxis, ...]
+                    obs_torch[k] = torch.from_numpy(v_np).float().to(device)
+                else:  # target_robot_idx
+                    v_np = np.array([v]) if np.isscalar(v) else np.array(v)
+                    obs_torch[k] = torch.from_numpy(v_np).long().to(device)
+
+            # Store recurrent states BEFORE action
             if agent.is_recurrent:
-                h_states = [h.detach() for h in agent.h_states]
-                c_states = [c.detach() for c in agent.c_states]
+                h_states = [h.detach().cpu().numpy() for h in agent.h_states]
+                c_states = [c.detach().cpu().numpy() for c in agent.c_states]
             else:
                 h_states = None
                 c_states = None
-            # --- Get action and recurrent states ---
+
+            # Get action and recurrent states
             with torch.no_grad():
                 # print("WARNING: No gradient calculation for action. This might cause us not to be able to learn.")
                 action, log_prob, entropy, value, _, _ = agent.act(obs_torch, dones, update_internal_states=True)
@@ -239,6 +246,7 @@ def main():
             action_np = action.cpu().numpy()
             if num_envs == 1:
                 action_np = action_np.item()
+
             # Step the environment(s)
             next_obs_dict, reward, terminated, truncated, info = env.step(action_np)
             done = np.logical_or(terminated, truncated)
@@ -246,7 +254,7 @@ def main():
             # Update episode tracking
             current_ep_reward += reward
 
-            # --- Store in buffer, including recurrent states ---
+            # Store in buffer, including recurrent states
             rollout_buffer.add(
                 obs={k: np.array(obs_dict[k]) for k in obs_dict},
                 action=action_np,
@@ -254,8 +262,8 @@ def main():
                 done=done,
                 value=value.detach().cpu().numpy(),
                 log_prob=log_prob.detach().cpu().numpy(),
-                h_states=[h.detach().cpu().numpy() for h in h_states] if h_states else None,
-                c_states=[c.detach().cpu().numpy() for c in c_states] if c_states else None,
+                h_states=h_states,
+                c_states=c_states,
             )
             
             obs_dict = next_obs_dict
@@ -277,10 +285,21 @@ def main():
                 rollout_rewards.append(current_ep_reward)
                 rollout_lengths.append(current_ep_length)
                 
+                # Debug: Print state norms before reset
+                # if agent.is_recurrent:
+                #     print(f"Before reset - h_states norm: {[h.norm().item() for h in agent.h_states]}")
+                #     print(f"Before reset - c_states norm: {[c.norm().item() for c in agent.c_states]}")
+                
                 # Reset episode tracking
-                # Currently, we move robots but don't change wall positions, because we want to keep the same board for the entire training process.
-                # If we want to reset walls, we need to either make a new env or write a function to reset the board.
                 obs_dict, info = env.reset(seed=current_total_steps)
+                if agent.is_recurrent:
+                    agent.reset_states()  # Reset LSTM states on episode end
+                    
+                    # Debug: Print state norms after reset
+                    # print(f"After reset - h_states norm: {[h.norm().item() for h in agent.h_states]}")
+                    # print(f"After reset - c_states norm: {[c.norm().item() for c in agent.c_states]}")
+                    # print("-" * 40)
+                
                 current_ep_reward = 0
                 current_ep_length = 0
         
@@ -290,7 +309,24 @@ def main():
         # Compute advantages and returns
         with torch.no_grad():
             # Get value of the last observation S_{t+N}
-            last_value = agent.get_value(obs_dict)
+            # Convert the final observation to torch format
+            obs_torch_final = {}
+            for k, v in obs_dict.items():
+                if k == "board_features":
+                    v_np = np.array(v) if not isinstance(v, np.ndarray) else v
+                    if v_np.ndim == 3:  # Add batch dimension if missing
+                        v_np = v_np[np.newaxis, ...]
+                    obs_torch_final[k] = torch.from_numpy(v_np).float().to(device)
+                else:  # target_robot_idx
+                    v_np = np.array([v]) if np.isscalar(v) else np.array(v)
+                    obs_torch_final[k] = torch.from_numpy(v_np).long().to(device)
+            
+            # Get the last value using current LSTM states (which correspond to the last observation)
+            if agent.is_recurrent:
+                last_value = agent.network.get_value(obs_torch_final, agent.h_states, agent.c_states)
+            else:
+                last_value = agent.network.get_value(obs_torch_final)
+            
             if isinstance(last_value, torch.Tensor):
                 last_value_np = last_value.detach().cpu().numpy()
             else:

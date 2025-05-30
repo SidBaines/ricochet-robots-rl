@@ -104,6 +104,18 @@ class DeepRepeatedConvLSTM(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1)
         )
+        
+        # Initialize value function to predict 0 for initial states
+        for m in self.critic_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.constant_(m.bias, 0)
+        
+        # Initialize policy to be more random initially
+        for m in self.actor_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.01)
+                nn.init.constant_(m.bias, 0)
 
     def get_initial_states(self, batch_size: int, device: torch.device = None):
         """Return a tuple of (h_states, c_states) for all layers, each a list of tensors."""

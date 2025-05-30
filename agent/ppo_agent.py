@@ -40,6 +40,7 @@ class PPOAgent:
         self.value_loss_coef = value_loss_coef
         self.max_grad_norm = max_grad_norm
         self.num_envs = num_envs
+        self.total_timesteps = 0
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,6 +61,11 @@ class PPOAgent:
         # --- Recurrent state tracking ---
         if self.is_recurrent:
             self.h_states, self.c_states = self.network.get_initial_states(self.num_envs, self.device)
+
+    def _get_lr(self):
+        """Linear learning rate schedule"""
+        progress = min(1.0, self.total_timesteps / 1_000_000)  # Adjust denominator based on total training steps
+        return self.lr * (1 - progress)
 
     def _obs_to_torch(self, obs: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """Converts a NumPy observation dictionary to a PyTorch tensor dictionary on the correct device."""
@@ -129,7 +135,7 @@ class PPOAgent:
     def get_value(self, obs: Dict[str, torch.Tensor]):
         if self.is_recurrent:
             obs_tensor_dict = self._obs_to_torch(obs)
-            value = self.network.get_value(obs_tensor_dict, [torch.tensor(state) for state in self.h_states], [torch.tensor(state) for state in self.c_states])
+            value = self.network.get_value(obs_tensor_dict, self.h_states, self.c_states)
             return value
         else:
             obs_tensor_dict = self._obs_to_torch(obs)
@@ -147,15 +153,16 @@ class PPOAgent:
             value: The estimated state value (np.ndarray).
         """
         
-        # Add batch dimension if obs is for a single step
+        # Ensure consistent batch dimension handling
         obs_board_features_np = obs_dict["board_features"]
-        if obs_board_features_np.ndim == 3: # (C, H, W)
+        if obs_board_features_np.ndim == 3: # (C, H, W) - add batch dim
             obs_board_features_np = np.expand_dims(obs_board_features_np, axis=0)
         
         obs_target_idx_np = obs_dict["target_robot_idx"]
-        if not isinstance(obs_target_idx_np, np.ndarray) or obs_target_idx_np.ndim == 0:
+        if not isinstance(obs_target_idx_np, np.ndarray):
             obs_target_idx_np = np.array([obs_target_idx_np])
-        
+        elif obs_target_idx_np.ndim == 0:
+            obs_target_idx_np = np.array([obs_target_idx_np])
 
         obs_tensor_dict = self._obs_to_torch({
             "board_features": obs_board_features_np,
@@ -180,9 +187,10 @@ class PPOAgent:
             
             log_prob_tensor = dist.log_prob(action_tensor)
 
-        action_np = action_tensor.cpu().numpy()
-        log_prob_np = log_prob_tensor.cpu().numpy()
-        value_np = value_tensor.squeeze(-1).cpu().numpy()
+        # Remove batch dimension for single environment
+        action_np = action_tensor.squeeze(0).cpu().numpy()
+        log_prob_np = log_prob_tensor.squeeze(0).cpu().numpy()
+        value_np = value_tensor.squeeze().cpu().numpy()
 
         return action_np, log_prob_np, value_np
 
@@ -205,6 +213,13 @@ class PPOAgent:
             entropy_loss: The final entropy loss value
             approx_kl: Approximate KL divergence between old and new policy
         """
+        # Update learning rate
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self._get_lr()
+        
+        # Update total timesteps
+        self.total_timesteps += len(obs_batch)
+
         # Convert numpy arrays to torch tensors
         actions_tensor = torch.from_numpy(actions_batch).to(self.device)
         log_probs_old_tensor = torch.from_numpy(log_probs_old_batch).to(self.device)
