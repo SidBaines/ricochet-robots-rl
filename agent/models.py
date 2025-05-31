@@ -145,7 +145,7 @@ class DeepRepeatedConvLSTM(nn.Module):
         encoded_features = self.encoder(board_features)
         for _ in range(self.repeat_K):
             for i, cell in enumerate(self.convlstm_cells):
-                h, c = h_states[i-1], c_states[i-1]
+                h, c = h_states[i-1], c_states[i]
                 h_next, c_next = cell(encoded_features, h, c)
                 # h_next = self.post_convs[i](h_next)
                 h_states[i], c_states[i] = h_next, c_next
