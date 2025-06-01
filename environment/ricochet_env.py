@@ -4,6 +4,7 @@ import numpy as np
 from typing import Optional, Union, List, Tuple, Dict, Any
 import random
 import torch
+import json
 
 
 from .board import Board
@@ -395,3 +396,45 @@ class RicochetRobotsEnv(gym.Env):
         # Wall to the South of (2,2) / North of (3,2)
         env.board.add_wall(2, 2, SOUTH)
         return env 
+
+    def save_env(self, filepath: str):
+        """Save the full environment state to a JSON file."""
+        def to_pyint_tuple(t):
+            return (int(t[0]), int(t[1]))
+        data = {
+            'board': self.board.to_dict(),
+            'robots': [to_pyint_tuple(robot.pos) for robot in self.robots],
+            'target_pos': to_pyint_tuple(self.target_pos) if self.target_pos is not None else None,
+            'target_robot_idx': int(self.target_robot_idx) if self.target_robot_idx is not None else None,
+            'current_step': int(self.current_step),
+            'max_steps': int(self.max_steps),
+            'num_robots': int(self.num_robots),
+            'height': int(self.height),
+            'width': int(self.width)
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f)
+
+    def load_env(self, filepath: str):
+        """Load the full environment state from a JSON file."""
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        self.height = data['height']
+        self.width = data['width']
+        self.num_robots = data['num_robots']
+        self.max_steps = data.get('max_steps', 200)
+        self.board = Board.from_dict(data['board'])
+        self.robots = [Robot(robot_id=i, color=ROBOT_COLORS[i], initial_pos=tuple(pos)) for i, pos in enumerate(data['robots'])]
+        self.target_pos = tuple(data['target_pos']) if data['target_pos'] is not None else None
+        self.target_robot_idx = data['target_robot_idx']
+        self.current_step = data.get('current_step', 0)
+        # Rebuild action/observation spaces if needed
+        self.action_space = spaces.Discrete(self.num_robots * 4)
+        self.observation_space = spaces.Dict({
+            "board_features": spaces.Box(
+                low=0, high=1,
+                shape=(self.num_robots + 1 + 4, self.height, self.width),
+                dtype=np.uint8
+            ),
+            "target_robot_idx": spaces.Discrete(self.num_robots)
+        }) 

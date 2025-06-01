@@ -340,3 +340,18 @@ class Board:
     
     def get_blocked_cells(self) -> set[tuple[int, int]]:
         return self.blocked_cells
+
+    def to_dict(self):
+        return {
+            'height': self.height,
+            'width': self.width,
+            'walls': self.walls.astype(int).tolist(),
+            'blocked_cells': list(self.blocked_cells)
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        board = cls(data['height'], data['width'])
+        board.walls = np.array(data['walls'], dtype=bool)
+        board.blocked_cells = set(tuple(cell) for cell in data.get('blocked_cells', []))
+        return board
