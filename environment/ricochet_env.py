@@ -15,6 +15,57 @@ from .utils import (
     DEFAULT_BOARD_SIZE, DEFAULT_NUM_ROBOTS
 )
 
+def simulate_robot_move(
+    robot_pos: Tuple[int, int],
+    robot_id: int,
+    direction_idx: int,
+    walls: np.ndarray,
+    robot_positions: List[Tuple[int, int]],
+    robot_ids: List[int],
+    board_height: int,
+    board_width: int
+) -> Tuple[int, int]:
+    """Simulate moving a robot in a given direction and return its final position.
+    
+    Args:
+        robot_pos: Current (row, col) position of the robot to move
+        robot_id: ID of the robot to move
+        direction_idx: Direction to move in (0=NORTH, 1=EAST, 2=SOUTH, 3=WEST)
+        walls: 4D numpy array of walls (height, width, 4) where last dimension is [N,E,S,W]
+        robot_positions: List of (row, col) positions of all robots
+        robot_ids: List of IDs for all robots
+        board_height: Height of the board
+        board_width: Width of the board
+        
+    Returns:
+        Tuple[int, int]: The final (row, col) position the robot would end up at
+    """
+    dr, dc = DIRECTIONS[direction_idx]
+    current_r, current_c = robot_pos
+    
+    # Create a mapping of positions to robot IDs for quick lookup
+    pos_to_robot = {pos: rid for pos, rid in zip(robot_positions, robot_ids)}
+    
+    # Simulate movement until collision
+    while True:
+        if walls[current_r, current_c, direction_idx]:
+            break # Hit a wall from current cell in chosen direction
+
+        next_r, next_c = current_r + dr, current_c + dc
+
+        # Check bounds
+        if not (0 <= next_r < board_height and 0 <= next_c < board_width):
+            break
+
+        # Check for collision with another robot
+        if (next_r, next_c) in pos_to_robot and pos_to_robot[(next_r, next_c)] != robot_id:
+            break # Hit another robot
+
+        # If no collision, move one step
+        current_r, current_c = next_r, next_c
+        
+    return current_r, current_c
+
 class RicochetRobotsEnv(gym.Env):
     metadata = {
         "render_modes": ["human", "ansi", "rgb_array"],
@@ -203,6 +254,31 @@ class RicochetRobotsEnv(gym.Env):
                 return robot
         return None
 
+    def _simulate_robot_move(self, robot_idx: int, direction_idx: int) -> Tuple[int, int]:
+        """Simulate moving a robot in a given direction and return its final position.
+        
+        Args:
+            robot_idx: Index of the robot to move
+            direction_idx: Direction to move in (0=NORTH, 1=EAST, 2=SOUTH, 3=WEST)
+            
+        Returns:
+            Tuple[int, int]: The final (row, col) position the robot would end up at
+        """
+        robot = self.robots[robot_idx]
+        robot_positions = [r.pos for r in self.robots]
+        robot_ids = [r.id for r in self.robots]
+        
+        return simulate_robot_move(
+            robot_pos=robot.pos,
+            robot_id=robot.id,
+            direction_idx=direction_idx,
+            walls=self.board.walls,
+            robot_positions=robot_positions,
+            robot_ids=robot_ids,
+            board_height=self.height,
+            board_width=self.width
+        )
+
     def step(self, action: int) -> Tuple[Dict, float, bool, bool, Dict]:
         if not self.action_space.contains(action):
             raise ValueError(f"Invalid action: {action}")
@@ -210,31 +286,11 @@ class RicochetRobotsEnv(gym.Env):
         robot_to_move_idx = action // 4
         direction_idx = action % 4
         
-        moving_robot = self.robots[robot_to_move_idx]
-        dr, dc = DIRECTIONS[direction_idx]
-
-        current_r, current_c = moving_robot.pos
+        # Get final position from simulation
+        final_r, final_c = self._simulate_robot_move(robot_to_move_idx, direction_idx)
         
-        # Simulate movement until collision
-        while True:
-            if self.board.has_wall(current_r, current_c, direction_idx):
-                break # Hit a wall from current cell in chosen direction
-
-            next_r, next_c = current_r + dr, current_c + dc
-
-            # Check bounds (should be covered by perimeter walls, but good for safety)
-            if not (0 <= next_r < self.height and 0 <= next_c < self.width):
-                break # Should not happen if perimeter walls are set up correctly
-
-            # Check for collision with another robot at next_r, next_c
-            other_robot = self._get_robot_at(next_r, next_c)
-            if other_robot is not None and other_robot.id != moving_robot.id:
-                break # Hit another robot
-
-            # If no collision, move one step
-            current_r, current_c = next_r, next_c
-        
-        moving_robot.set_position(current_r, current_c)
+        # Actually move the robot
+        self.robots[robot_to_move_idx].set_position(final_r, final_c)
         self.current_step += 1
 
         # Check for goal condition
