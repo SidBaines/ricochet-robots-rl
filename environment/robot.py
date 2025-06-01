@@ -8,4 +8,4 @@ class Robot:
         return f"Robot(id={self.id}, color_char='{self.color_char}', pos={self.pos})"
 
     def set_position(self, r: int, c: int):
-        self.pos = (r, c) 
+        self.pos = (r, c)

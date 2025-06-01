@@ -5,7 +5,7 @@ from .base_solver import BaseSolver
 from environment.ricochet_env import simulate_robot_move
 
 class AStarSolver(BaseSolver):
-    """A* solver for Ricochet Robots puzzles."""
+    """A* solver for Ricochet Robots puzzles with early cutoff support."""
     
     def __init__(self, board_size: Tuple[int, int], num_robots: int):
         super().__init__(board_size, num_robots)
@@ -56,18 +56,20 @@ class AStarSolver(BaseSolver):
               robot_positions: List[Tuple[int, int]], 
               target_robot_idx: int,
               target_pos: Tuple[int, int],
-              walls: np.ndarray) -> Optional[List[int]]:
+              walls: np.ndarray,
+              depth_limit: Optional[int] = None) -> Optional[List[int]]:
         """
-        Solve the puzzle using A* search.
+        Solve the puzzle using A* search with optional depth limit for early cutoff.
         
         Args:
             robot_positions: List of (row, col) positions for each robot
             target_robot_idx: Index of the robot that needs to reach the target
             target_pos: (row, col) position of the target
             walls: Boolean array of shape (height, width, 4) indicating walls
+            depth_limit: Maximum depth to search (for curriculum learning early cutoff)
             
         Returns:
-            List of actions that solve the puzzle, or None if no solution exists
+            List of actions that solve the puzzle, or None if no solution exists within depth limit
         """
         # Priority queue for A* search: (f_score, state_key, robot_positions, actions)
         # f_score = g_score (moves so far) + h_score (manhattan distance to target)
@@ -80,6 +82,10 @@ class AStarSolver(BaseSolver):
         
         while pq:
             f_score, state_key, current_positions, actions = heapq.heappop(pq)
+            
+            # Early cutoff check - abort if we've exceeded the depth limit
+            if depth_limit is not None and len(actions) >= depth_limit:
+                continue  # Skip this path, try others
             
             # Check if target robot reached target
             if current_positions[target_robot_idx] == target_pos:
@@ -103,6 +109,11 @@ class AStarSolver(BaseSolver):
                     
                     # Calculate new g_score and f_score
                     new_g_score = len(actions) + 1
+                    
+                    # Early cutoff check - don't explore paths that exceed depth limit
+                    if depth_limit is not None and new_g_score >= depth_limit:
+                        continue
+                    
                     h_score = self._get_manhattan_distance(new_positions[target_robot_idx], target_pos)
                     new_f_score = new_g_score + h_score
                     
@@ -112,10 +123,49 @@ class AStarSolver(BaseSolver):
                         new_actions = actions + [robot_idx * 4 + direction]
                         heapq.heappush(pq, (new_f_score, new_state, new_positions, new_actions))
         
-        # No solution found
+        # No solution found within depth limit
         self.solution = None
         self.solution_length = None
         return None
+    
+    def solve_with_cutoff(self, 
+                         robot_positions: List[Tuple[int, int]], 
+                         target_robot_idx: int,
+                         target_pos: Tuple[int, int],
+                         walls: np.ndarray,
+                         cutoff: int) -> Tuple[Optional[List[int]], bool]:
+        """
+        Solve puzzle with early cutoff, returning both solution and whether cutoff was hit.
+        
+        Convenience method for curriculum learning that makes the cutoff behavior explicit.
+        
+        Args:
+            robot_positions: List of (row, col) positions for each robot
+            target_robot_idx: Index of the robot that needs to reach the target
+            target_pos: (row, col) position of the target
+            walls: Boolean array of shape (height, width, 4) indicating walls
+            cutoff: Maximum depth to search before aborting
+            
+        Returns:
+            Tuple of (solution_actions, cutoff_hit)
+            - solution_actions: List of actions if solved within cutoff, None otherwise
+            - cutoff_hit: True if search was aborted due to cutoff, False if naturally exhausted
+        """
+        solution = self.solve(robot_positions, target_robot_idx, target_pos, walls, depth_limit=cutoff)
+        
+        # If we got a solution, cutoff wasn't hit
+        if solution is not None:
+            return solution, False
+        
+        # If no solution found, we need to determine if it was due to cutoff or no solution exists
+        # Run without cutoff to check (but only if cutoff was reasonably small to avoid infinite search)
+        if cutoff <= 20:  # Reasonable limit for checking
+            full_solution = self.solve(robot_positions, target_robot_idx, target_pos, walls, depth_limit=None)
+            cutoff_hit = full_solution is not None
+            return None, cutoff_hit
+        else:
+            # For large cutoffs, assume cutoff was hit rather than running expensive full search
+            return None, True
     
     def get_solution_length(self) -> Optional[int]:
         """Get the length of the solution found by the solver."""

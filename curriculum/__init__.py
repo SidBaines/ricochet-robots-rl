@@ -1,0 +1,1 @@
+# Curriculum learning package for Ricochet Robots RL 
