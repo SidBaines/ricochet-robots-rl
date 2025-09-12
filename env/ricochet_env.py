@@ -111,6 +111,11 @@ class RicochetRobotsEnv(GymEnvBase):
         self.solver_max_nodes = solver_max_nodes
         self.obs_mode: ObsMode = obs_mode
         self.channels_first = channels_first
+        # If a fixed layout is provided, align env geometry before building spaces
+        if self.fixed_layout is not None:
+            self.height = int(self.fixed_layout.height)
+            self.width = int(self.fixed_layout.width)
+            self.num_robots = int(len(self.fixed_layout.robot_positions))
         # Render API
         self.render_mode = render_mode
         if self.render_mode is not None and self.render_mode not in self.metadata["render_modes"]:

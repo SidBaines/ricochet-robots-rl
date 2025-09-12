@@ -1,63 +1,108 @@
-# Ricochet Robots RL Environment (Step 1)
+# Ricochet Robots RL Training
 
-This repository contains a custom Gymnasium-compatible environment for the Ricochet Robots puzzle, a BFS solver for validation/curriculum, and unit tests.
+This project implements reinforcement learning agents for the puzzle game Ricochet Robots, with a focus on mechanistic interpretability analysis.
 
-## Setup
-
-Install dependencies:
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Run Tests
+## Quick Start
+
+### Training
+
+Train a PPO agent on milestone environments:
 
 ```bash
-pytest -q
+# v0: Single-move task (4x4 grid)
+python train_agent.py --env-mode v0 --timesteps 2000 --n-envs 4
+
+# v1: Four-direction task (5x5 grids)
+python train_agent.py --env-mode v1 --timesteps 6000 --n-envs 4
+
+# Random environment (8x8 grid)
+python train_agent.py --env-mode random --timesteps 100000 --n-envs 8
 ```
 
-## Usage Example
+### Model Architectures
 
-```python
-from env.ricochet_env import RicochetRobotsEnv
+Choose different policy architectures:
 
-env = RicochetRobotsEnv(height=8, width=8, num_robots=2, render_mode="ascii")
-obs, info = env.reset(seed=123)
-action = 0  # robot 0 up
-obs, reward, terminated, truncated, info = env.step(action)
-print(env.render())
+```bash
+# Default MLP for small grids
+python train_agent.py --env-mode v0 --obs-mode image
+
+# Custom small CNN for larger grids
+python train_agent.py --env-mode random --small-cnn --obs-mode image
+
+# ConvLSTM (DRC-lite) for recurrent planning
+python train_agent.py --env-mode random --convlstm --obs-mode image --lstm-layers 2 --lstm-repeats 1
+
+# Symbolic observations with MLP
+python train_agent.py --env-mode random --obs-mode symbolic
 ```
 
-### Gymnasium Registration (optional)
+### Evaluation
 
-To create the env via gym.make:
+Evaluate a trained model:
 
-```python
-import gymnasium as gym
-from env.ricochet_env import register_env
-
-register_env("RicochetRobots-v0", max_episode_steps=100)
-env = gym.make("RicochetRobots-v0", height=8, width=8, num_robots=2, render_mode="ascii")
+```bash
+python evaluate_agent.py --model-path checkpoints/ppo_model.zip --env-mode v0 --episodes 50
 ```
 
-### Notes on API compliance
+## Environment Options
 
-- Seeding follows Gymnasium: use `reset(seed=...)`. The used seed is provided in `info["episode_seed"]`.
-- Rendering uses `render_mode`. With `render_mode="ascii"`, `render()` returns a string. Other modes are not implemented and will raise a clear error.
-- The `info` dict includes `is_success` each step, and `TimeLimit.truncated` when the episode hits `max_steps`.
-- The environment already enforces a time limit via `max_steps`; avoid wrapping with `TimeLimit` unless you disable the internal cap.
+- `--env-mode`: `random`, `v0`, `v1` (milestone layouts)
+- `--height`, `--width`: Grid dimensions (default 8x8)
+- `--num-robots`: Number of robots (default 2)
+- `--include-noop`: Enable no-op actions for "thinking"
+- `--obs-mode`: `image` or `symbolic` observations
+- `--ensure-solvable`: Only generate solvable puzzles (slower)
 
-Additional info keys on reset:
-- `level_solvable` (bool): True if solvability was enforced this episode; False otherwise.
-- `ensure_solvable_enabled` (bool): whether solvability enforcement was enabled.
-- `channel_names` (image mode): the list of observation channel names for logging.
-- Invalid actions raise `gymnasium.error.InvalidAction` when Gymnasium is installed, or `ValueError` otherwise.
+## Training Options
 
-### Import path
+- `--timesteps`: Total training steps
+- `--n-envs`: Number of parallel environments
+- `--lr`: Learning rate (default 3e-4)
+- `--n-steps`: Rollout length (default 128)
+- `--batch-size`: Minibatch size (default 256)
 
-Ensure the project root is on `PYTHONPATH` (e.g., run from repo root or `pip install -e .`) so the entry point `env.ricochet_env:RicochetRobotsEnv` is importable when registering.
+## Logging and Checkpoints
 
-### Observation scaling
+- `--log-dir`: TensorBoard log directory
+- `--save-path`: Model save path
+- `--save-freq`: Checkpoint frequency (timesteps)
+- `--eval-freq`: Evaluation frequency (timesteps)
 
-- Image observations are float32 in [0,1].
-- Symbolic observations use absolute grid indices (float32); downstream code may normalize to [0,1].
+## Testing
+
+Run the test suite:
+
+```bash
+pytest tests/ -v
+```
+
+## Architecture Details
+
+### SmallCNN
+- 3x3 conv layers with padding=1 (safe for small grids)
+- Global average pooling
+- Suitable for 4x4+ grids
+
+### ConvLSTM (DRC-lite)
+- Convolutional LSTM layers for spatial planning
+- Configurable layers and repeats per timestep
+- Designed for recurrent planning behavior
+
+### Milestone Environments
+- **v0**: 4x4 grid, single RIGHT move to goal
+- **v1**: 5x5 grids, one move in each of four directions
+
+## Next Steps
+
+This completes Step 2 of the research plan. The next phase involves:
+- Training agents on more complex environments
+- Mechanistic interpretability analysis
+- Probing internal representations
+- Causal intervention experiments

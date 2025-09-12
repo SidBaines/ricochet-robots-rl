@@ -13,3 +13,4 @@
 - No cell should have more than 1 wall strucuture surrounding it (central-L, edge-T or the forbidden-central-block).
 - Any cell with a wall around it (excluding boundary edge walls, but including walls from central-L, jutting walls from edge-T or the forbidden-central-block) cannot have any of its neighbours be the square around which a central-L or edge-T block is formed.
 - Edge-T structure cannot produce jutting walls which are boundaries to walls on the corner. So for example, an edge-T structure which places a jutting vertical wall to the right of (0,1) is okay, but an edge-T strucutre which places a jutting vertial wall to the left of (0,1) or equivalently to the right of (0,0) is not okay
+- Target square should always be a central-L square

@@ -1,2 +1,5 @@
 *__pycache__*
 rlenv/
+checkpoints/
+runs
+.DS_Store
