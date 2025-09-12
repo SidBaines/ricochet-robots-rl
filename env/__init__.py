@@ -1,5 +1,6 @@
 # Package for Ricochet Robots environment
 from .ricochet_env import RicochetRobotsEnv, FixedLayout  # re-export
+from .curriculum import CurriculumWrapper, CurriculumConfig, create_curriculum_wrapper, create_default_curriculum  # re-export
 
 # Deterministic milestone layouts for training sanity checks
 def fixed_layout_v0_one_move() -> FixedLayout:

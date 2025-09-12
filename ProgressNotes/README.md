@@ -19,3 +19,8 @@ This folder captures the current state of Step 1 (environment + solver) and rela
 - solver_status.md: Summary of BFS/A* solvers, heuristics, metadata, and tests.
 - next_steps.md: Concrete follow-ups and priorities for the next work session.
 - decisions_and_rationale.md: Key decisions, tradeoffs, and reasoning.
+
+## Step 2: RL Training Framework & Models (Complete)
+- step2_training_framework.md: Complete overview of training framework implementation, architectures, and usage.
+- step2_technical_notes.md: Detailed technical implementation notes, design decisions, and integration points.
+- step2_conversation_insights.md: Key insights from user feedback, technical discoveries, and lessons learned.

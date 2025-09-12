@@ -5,6 +5,7 @@ import os
 from typing import Callable
 
 from env import RicochetRobotsEnv, fixed_layout_v0_one_move, fixed_layouts_v1_four_targets
+from env.curriculum import create_curriculum_wrapper, create_curriculum_manager, create_default_curriculum, CurriculumConfig
 try:
     from models.policies import SmallCNN  # type: ignore
     from models.convlstm import ConvLSTMFeaturesExtractor  # type: ignore
@@ -76,6 +77,45 @@ def make_env_factory(args: argparse.Namespace) -> Callable[[], RicochetRobotsEnv
     return _fn
 
 
+def make_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable[[], RicochetRobotsEnv], object]:
+    """Return a thunk to create a curriculum environment instance based on CLI args."""
+    # Create base environment factory for curriculum
+    base_env_factory = make_env_factory(args)
+    
+    # Create curriculum configuration
+    if args.curriculum_config is not None:
+        # Load custom curriculum config from file
+        import json
+        with open(args.curriculum_config, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+        curriculum_config = CurriculumConfig(**config_data)
+    else:
+        # Use default curriculum with CLI overrides
+        curriculum_config = create_default_curriculum()
+        # Override with CLI arguments
+        curriculum_config.success_rate_threshold = args.curriculum_success_threshold
+        curriculum_config.min_episodes_per_level = args.curriculum_min_episodes
+        curriculum_config.success_rate_window_size = args.curriculum_window_size
+        curriculum_config.advancement_check_frequency = args.curriculum_check_freq
+    
+    # Create shared curriculum manager
+    curriculum_manager = create_curriculum_manager(
+        curriculum_config=curriculum_config,
+        initial_level=args.curriculum_initial_level,
+        verbose=args.curriculum_verbose
+    )
+    
+    # Return a function that creates a new curriculum wrapper each time
+    def _fn():
+        return create_curriculum_wrapper(
+            base_env_factory=base_env_factory,
+            curriculum_manager=curriculum_manager,
+            verbose=args.curriculum_verbose
+        )
+    
+    return _fn, curriculum_manager
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train PPO on Ricochet Robots")
     # Env selection
@@ -93,6 +133,16 @@ def main() -> None:
     parser.add_argument("--solver-max-depth", type=int, default=30)
     parser.add_argument("--solver-max-nodes", type=int, default=20000)
     parser.add_argument("--obs-mode", choices=["image", "symbolic"], default="image")
+    
+    # Curriculum learning options
+    parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning")
+    parser.add_argument("--curriculum-config", type=str, help="Path to custom curriculum configuration JSON file")
+    parser.add_argument("--curriculum-initial-level", type=int, default=0, help="Initial curriculum level (0-4)")
+    parser.add_argument("--curriculum-verbose", action="store_true", default=True, help="Print curriculum progression messages")
+    parser.add_argument("--curriculum-success-threshold", type=float, default=0.8, help="Success rate threshold for curriculum advancement")
+    parser.add_argument("--curriculum-min-episodes", type=int, default=100, help="Minimum episodes per curriculum level")
+    parser.add_argument("--curriculum-window-size", type=int, default=200, help="Success rate window size for curriculum advancement")
+    parser.add_argument("--curriculum-check-freq", type=int, default=50, help="Frequency of curriculum advancement checks (episodes)")
 
     # Algo
     parser.add_argument("--algo", choices=["ppo"], default="ppo")
@@ -131,7 +181,14 @@ def main() -> None:
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
 
-    env_factory = make_env_factory(args)
+    # Choose environment factory based on curriculum setting
+    curriculum_manager = None
+    if args.curriculum:
+        env_factory, curriculum_manager = make_curriculum_env_factory(args)
+        print("Curriculum learning enabled - will progressively increase difficulty")
+    else:
+        env_factory = make_env_factory(args)
+        print("Standard training mode - fixed difficulty")
 
     vec_env = make_vec_env(env_factory, n_envs=args.n_envs, seed=args.seed)
 
@@ -178,8 +235,46 @@ def main() -> None:
     # Callbacks: periodic checkpoint and eval success-rate logging
     callbacks = []
     try:
-        from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+        from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
         from stable_baselines3.common.env_util import make_vec_env as _make
+        
+        # Custom callback for curriculum learning
+        class CurriculumCallback(BaseCallback):
+            def __init__(self, curriculum_manager, verbose=0):
+                super().__init__(verbose)
+                self.curriculum_manager = curriculum_manager
+                self.last_logged_level = -1
+                
+            def _on_step(self) -> bool:
+                # Log curriculum stats if available
+                if self.curriculum_manager is not None:
+                    stats = self.curriculum_manager.get_curriculum_stats()
+                    
+                    # Log to console
+                    if self.verbose > 0 and self.num_timesteps % 1000 == 0:
+                        print(f"Curriculum Level {stats['current_level']}: {stats['level_name']} "
+                              f"(Success: {stats['success_rate']:.2f}, Episodes: {stats['episodes_at_level']})")
+                    
+                    # Log to TensorBoard
+                    if hasattr(self, 'logger') and self.logger is not None:
+                        self.logger.record("curriculum/level", stats['current_level'])
+                        self.logger.record("curriculum/success_rate", stats['success_rate'])
+                        self.logger.record("curriculum/episodes_at_level", stats['episodes_at_level'])
+                        self.logger.record("curriculum/total_episodes", stats['total_episodes'])
+                        self.logger.record("curriculum/window_size", stats['window_size'])
+                        
+                        # Log level advancement
+                        if stats['current_level'] != self.last_logged_level:
+                            self.logger.record("curriculum/level_advancement", stats['current_level'])
+                            self.last_logged_level = stats['current_level']
+                
+                return True
+        
+        # Add curriculum callback if curriculum learning is enabled
+        if args.curriculum and curriculum_manager is not None:
+            curriculum_cb = CurriculumCallback(curriculum_manager=curriculum_manager, verbose=1)
+            callbacks.append(curriculum_cb)
+        
         # Wrap separate eval env
         if args.eval_freq > 0:
             eval_env = _make(make_env_factory(args), n_envs=1, seed=args.seed)
