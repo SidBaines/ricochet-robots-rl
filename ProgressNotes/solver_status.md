@@ -25,6 +25,10 @@ Two planners are provided: BFS (optimal in moves within limits) and A* (configur
 - Consider `prioritize_target_first=True` for quicker finds; correctness unchanged.
 - If scaling up: represent robot positions as a fixed tuple and share wall arrays to reduce allocations.
 
+## Determinism and env integration
+- Both BFS and A* are deterministic given a fixed start board and parameters.
+- `ensure_solvable=True` in the env uses BFS to filter boards; the env now reports `level_solvable`, `ensure_solvable_enabled`, and (when enforced) `optimal_length`.
+
 ## Tests (solver)
 - Optimality on tiny boards (length 1).
 - Cutoff behavior (depth=0 -> None).

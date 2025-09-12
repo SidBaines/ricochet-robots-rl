@@ -8,7 +8,7 @@
   - Use `ensure_solvable=True` and `info["optimal_length"]` to bucket episodes.
   - Optionally build a sampler that targets `optimal_length <= N` for staged difficulty.
 - Logging & evaluation:
-  - Log `success`, `steps`, `optimal_length` (when available), and episode returns.
+  - Log `is_success`, `steps`, `optimal_length` (when available), and episode returns.
   - Periodic evaluation using solver for optimality gap on a fixed set.
 
 ## Optional solver improvements
@@ -20,7 +20,13 @@
 - Plan forward hooks in policies to capture activations.
 - Define a small dataset writer that records obs, actions, logits, value, hidden states per step for probe training.
 
-## Engineering hygiene
-- Add docstrings to env class and public methods specifying info keys (`optimal_length`, `solver_limits`, etc.).
-- README training section: how to run PPO baseline with vectorized envs.
-- Expand CLI to pick robots and boards by seed; add display of `optimal_length` when known.
+## Engineering hygiene & docs
+- Add training README section: how to run PPO baseline with vectorized envs; include typical hyperparameters.
+- Consider a tiny `train_agent.py` script to smoke test PPO on trivial configs.
+- Package the repo (pyproject/SETUP) so users can `pip install -e .` and resolve registration entry point robustly.
+- If adding RGB render later, document return type/shape and update metadata.
+
+## Backlog/polish
+- Optional: add a flag to normalize symbolic observations to [0,1] to match common pipelines.
+- Optional: export typed constants for directions in `ricochet_env` mirroring `ricochet_core` for documentation clarity.
+- Optional: expose board-density parameters for random generation (e.g., interior wall count bounds).

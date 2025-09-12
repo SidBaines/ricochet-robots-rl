@@ -12,9 +12,12 @@ try:  # pragma: no cover
     import importlib
     _gym = importlib.import_module("gymnasium")  # type: ignore
     _spaces = importlib.import_module("gymnasium.spaces")  # type: ignore
+    _seeding = importlib.import_module("gymnasium.utils.seeding")  # type: ignore
+    _error = importlib.import_module("gymnasium.error")  # type: ignore
     GymEnvBase = _gym.Env  # type: ignore
     spaces = _spaces  # type: ignore
-except Exception:  # pragma: no cover
+    GymInvalidAction = getattr(_error, "InvalidAction", None)  # type: ignore
+except (ModuleNotFoundError, ImportError):  # pragma: no cover
     class GymEnvBase(object):
         pass
     class _SpacesDummy:  # minimal placeholders to satisfy type usage
@@ -28,6 +31,7 @@ except Exception:  # pragma: no cover
             def __init__(self, n: int):
                 self.n = n
     spaces = _SpacesDummy()  # type: ignore
+    GymInvalidAction = None  # type: ignore
 
 
 @dataclass
@@ -46,6 +50,25 @@ ObsMode = Literal["image", "symbolic"]
 
 
 class RicochetRobotsEnv(GymEnvBase):
+    """Ricochet Robots Gymnasium-compatible environment.
+
+    Determinism and seeding:
+    - Deterministic given the seed provided to __init__ or reset(seed=...).
+    - Randomness flows through self.np_random (Gymnasium seeding utils); the episode's resolved
+      seed is exposed via info["episode_seed"].
+    - When ensure_solvable=True, the environment may retry board generation; retries do not add
+      extra non-determinism beyond RNG draws. The included solver is deterministic.
+
+    Observations:
+    - Image mode: float32 in [0,1]. Channels are named by channel_names; note that the target robot
+      is represented both by a dedicated mask (index 5) and its robot channel (duplication by design).
+    - Symbolic mode: float32 with absolute grid indices (not normalized). Downstream code may wish to
+      normalize to [0,1]. The Box low/high reflect board bounds.
+
+    Rendering:
+    - Only render_mode="ascii" is implemented and returns a string frame.
+    - Other modes are not implemented and will raise a clear error.
+    """
     metadata = {"render_modes": ["ascii"], "render_fps": 4}
 
     def __init__(
@@ -65,6 +88,8 @@ class RicochetRobotsEnv(GymEnvBase):
         solver_max_nodes: int = 20000,
         obs_mode: ObsMode = "image",
         channels_first: bool = False,
+        render_mode: Optional[str] = None,
+        ensure_attempt_limit: int = 50,
     ) -> None:
         super().__init__()
         self.height = height
@@ -81,10 +106,25 @@ class RicochetRobotsEnv(GymEnvBase):
         self.solver_max_nodes = solver_max_nodes
         self.obs_mode: ObsMode = obs_mode
         self.channels_first = channels_first
+        # Render API
+        self.render_mode = render_mode
+        if self.render_mode is not None and self.render_mode not in self.metadata["render_modes"]:
+            raise ValueError(f"Unsupported render_mode {self.render_mode}. Supported: {self.metadata['render_modes']}")
 
-        self._rng: np.random.Generator = np.random.default_rng(seed)
+        # Seeding: adopt Gymnasium convention with self.np_random
+        self.np_random: np.random.Generator
+        self._episode_seed: Optional[int] = None
+        try:  # gymnasium present
+            # _seeding.np_random returns (rng, seed)
+            self.np_random, used_seed = _seeding.np_random(seed)  # type: ignore[name-defined]
+            self._episode_seed = int(used_seed) if used_seed is not None else None
+        except NameError:
+            self.np_random = np.random.default_rng(seed)
+            self._episode_seed = int(seed) if seed is not None else None
         self._board: Optional[Board] = None
         self._num_steps = 0
+        self._cached_wall_obs: Optional[np.ndarray] = None  # (H,W,4) float32 for wall channels
+        self._ensure_attempt_limit = int(ensure_attempt_limit)
 
         # Observation spaces
         if self.obs_mode == "image":
@@ -103,8 +143,24 @@ class RicochetRobotsEnv(GymEnvBase):
                 dtype=np.float32,
             )
         elif self.obs_mode == "symbolic":
+            # [goal_r, goal_c] in [0..H-1], [0..W-1]; one-hot target in [0,1]; robots positions in bounds
             vec_len = 2 + self.num_robots + (self.num_robots * 2)
-            self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(vec_len,), dtype=np.float32)
+            low = np.full((vec_len,), 0.0, dtype=np.float32)
+            high = np.full((vec_len,), 1.0, dtype=np.float32)
+            # goal bounds
+            low[0] = 0.0
+            high[0] = float(self.height - 1)
+            low[1] = 0.0
+            high[1] = float(self.width - 1)
+            # target one-hot already [0,1]
+            # robots positions
+            base = 2 + self.num_robots
+            for i in range(self.num_robots):
+                low[base + 2 * i] = 0.0
+                high[base + 2 * i] = float(self.height - 1)
+                low[base + 2 * i + 1] = 0.0
+                high[base + 2 * i + 1] = float(self.width - 1)
+            self.observation_space = spaces.Box(low=low, high=high, shape=(vec_len,), dtype=np.float32)
         else:
             raise ValueError(f"Unknown obs_mode: {self.obs_mode}")
 
@@ -114,10 +170,24 @@ class RicochetRobotsEnv(GymEnvBase):
 
     # Gymnasium API
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        """Reset the environment and start a new episode.
+
+        Returns (obs, info) per Gymnasium API. info contains keys: 'target_robot',
+        'level_solvable' (optional), 'optimal_length' (if ensured), 'solver_limits' (if ensured),
+        and 'episode_seed' with the seed used for this episode.
+        """
+        # Standard seeding protocol
         if seed is not None:
-            self._rng = np.random.default_rng(seed)
+            try:
+                self.np_random, used_seed = _seeding.np_random(seed)  # type: ignore[name-defined]
+                self._episode_seed = int(used_seed) if used_seed is not None else None
+            except NameError:
+                self.np_random = np.random.default_rng(seed)
+                self._episode_seed = int(seed)
         _ = options  # silence unused
         self._num_steps = 0
+        # clear cached walls in case layout changes
+        self._cached_wall_obs = None
 
         if self.fixed_layout is not None:
             self._board = Board(
@@ -129,8 +199,17 @@ class RicochetRobotsEnv(GymEnvBase):
                 goal_position=self.fixed_layout.goal_position,
                 target_robot=self.fixed_layout.target_robot,
             )
+            # cache static walls for this layout
+            self._build_cached_walls(self._board)
             obs = self._make_obs(self._board)
-            info = {"level_solvable": None, "target_robot": self._board.target_robot}
+            info = {
+                "level_solvable": False,
+                "ensure_solvable_enabled": False,
+                "target_robot": self._board.target_robot,
+                "episode_seed": self._episode_seed,
+            }
+            if self.obs_mode == "image":
+                info["channel_names"] = self.channel_names
             return obs, info
 
         # Otherwise, generate random board, optionally ensure solvable via solver
@@ -150,18 +229,33 @@ class RicochetRobotsEnv(GymEnvBase):
                     break
             except ImportError as exc:
                 raise RuntimeError("ensure_solvable=True but solver unavailable (ImportError)") from exc
-            if attempts >= 50:
+            if attempts >= self._ensure_attempt_limit:
                 raise RuntimeError("Failed to generate solvable board within attempt limit")
 
+        # cache static walls for this layout
+        assert self._board is not None
+        self._build_cached_walls(self._board)
         obs = self._make_obs(self._board)
         # Note: solver None during attempts may be due to cutoffs (depth/nodes), not true unsolvability.
-        info = {"level_solvable": True if self.ensure_solvable else None, "target_robot": self._board.target_robot}
+        info = {
+            "level_solvable": bool(self.ensure_solvable),
+            "ensure_solvable_enabled": bool(self.ensure_solvable),
+            "target_robot": self._board.target_robot,
+            "episode_seed": self._episode_seed,
+        }
+        if self.obs_mode == "image":
+            info["channel_names"] = self.channel_names
         if self.ensure_solvable:
             info["optimal_length"] = optimal_length
             info["solver_limits"] = {"max_depth": self.solver_max_depth, "max_nodes": self.solver_max_nodes}
         return obs, info
 
     def step(self, action: int):
+        """Apply an action and return (obs, reward, terminated, truncated, info).
+
+        info always includes 'steps', 'target_robot', and 'is_success' (bool). When truncated due to
+        max steps, info includes 'TimeLimit.truncated'=True.
+        """
         assert self._board is not None, "Call reset() first"
         self._num_steps += 1
 
@@ -170,6 +264,12 @@ class RicochetRobotsEnv(GymEnvBase):
         info: Dict[str, object] = {}
 
         reward = self.step_penalty
+        # Validate action range early
+        if not (0 <= action < self.action_space.n):
+            if GymInvalidAction is not None:
+                raise GymInvalidAction(f"Invalid action {action}")  # type: ignore[misc]
+            raise ValueError(f"Invalid action {action}")
+
         if self.include_noop and action == self._noop_action:
             reward = self.noop_penalty
         else:
@@ -179,21 +279,49 @@ class RicochetRobotsEnv(GymEnvBase):
         if reached_goal(self._board):
             reward += self.goal_reward
             terminated = True
-            info["success"] = True
+            info["is_success"] = True
 
         if not terminated and self._num_steps >= self.max_steps:
             truncated = True
+            info["TimeLimit.truncated"] = True
 
         obs = self._make_obs(self._board)
         info["steps"] = self._num_steps
         info["target_robot"] = self._board.target_robot
+        if "is_success" not in info:
+            info["is_success"] = False
         return obs, reward, terminated, truncated, info
 
     def render(self):
+        """Render according to render_mode.
+
+        - render_mode=="ascii": returns a string frame.
+        - render_mode is None or unsupported: returns None.
+        """
+        if self.render_mode is None:
+            return None
+        if self.render_mode != "ascii":
+            raise ValueError(f"Unsupported render_mode {self.render_mode}. Supported: {self.metadata['render_modes']}")
         if self._board is None:
             return ""
         from .ricochet_core import render_ascii  # local import to avoid circulars in lints
         return render_ascii(self._board)
+
+    def close(self) -> None:
+        """Close environment resources (no-op)."""
+        return None
+
+    def seed(self, seed: Optional[int] = None):  # legacy convenience
+        """Legacy seeding helper returning [seed]. Prefer reset(seed=...)."""
+        if seed is None:
+            return [self._episode_seed]
+        try:
+            self.np_random, used_seed = _seeding.np_random(seed)  # type: ignore[name-defined]
+            self._episode_seed = int(used_seed) if used_seed is not None else int(seed)
+        except NameError:
+            self.np_random = np.random.default_rng(seed)
+            self._episode_seed = int(seed)
+        return [self._episode_seed]
 
     # Helpers
     def _decode_action(self, action: int) -> Tuple[int, int]:
@@ -216,13 +344,17 @@ class RicochetRobotsEnv(GymEnvBase):
         h, w = board.height, board.width
         C = self._num_channels
         obs = np.zeros((h, w, C), dtype=np.float32)
-        # wall channels 0..3
-        for r in range(h):
-            for c in range(w):
-                obs[r, c, 0] = 1.0 if board.has_wall_up(r, c) else 0.0
-                obs[r, c, 1] = 1.0 if board.has_wall_down(r, c) else 0.0
-                obs[r, c, 2] = 1.0 if board.has_wall_left(r, c) else 0.0
-                obs[r, c, 3] = 1.0 if board.has_wall_right(r, c) else 0.0
+        # wall channels 0..3 from cache
+        if self._cached_wall_obs is not None:
+            obs[:, :, 0:4] = self._cached_wall_obs
+        else:
+            # Fallback if cache not built (should not happen)
+            for r in range(h):
+                for c in range(w):
+                    obs[r, c, 0] = 1.0 if board.has_wall_up(r, c) else 0.0
+                    obs[r, c, 1] = 1.0 if board.has_wall_down(r, c) else 0.0
+                    obs[r, c, 2] = 1.0 if board.has_wall_left(r, c) else 0.0
+                    obs[r, c, 3] = 1.0 if board.has_wall_right(r, c) else 0.0
         # goal channel 4
         gr, gc = board.goal_position
         obs[gr, gc, 4] = 1.0
@@ -265,22 +397,72 @@ class RicochetRobotsEnv(GymEnvBase):
         v_walls[:, w] = True
         # Random interior edges
         max_edges = max(1, (h * w) // 6)
-        num_edges = int(self._rng.integers(0, max_edges))
+        num_edges = int(self.np_random.integers(0, max_edges))
         for _ in range(num_edges):
-            if self._rng.integers(0, 2) == 0:
-                rr = int(self._rng.integers(1, h))
-                cc = int(self._rng.integers(0, w))
+            if self.np_random.integers(0, 2) == 0:
+                rr = int(self.np_random.integers(1, h))
+                cc = int(self.np_random.integers(0, w))
                 h_walls[rr, cc] = True
             else:
-                rr = int(self._rng.integers(0, h))
-                cc = int(self._rng.integers(1, w))
+                rr = int(self.np_random.integers(0, h))
+                cc = int(self.np_random.integers(1, w))
                 v_walls[rr, cc] = True
         # Place goal and robots in free cells
         free_cells: List[Tuple[int, int]] = [(r, c) for r in range(h) for c in range(w)]
-        self._rng.shuffle(free_cells)
+        self.np_random.shuffle(free_cells)
         goal = free_cells.pop()
         robot_positions: Dict[int, Tuple[int, int]] = {}
         for rid in range(self.num_robots):
             robot_positions[rid] = free_cells.pop()
-        target_robot = int(self._rng.integers(0, self.num_robots))
+        target_robot = int(self.np_random.integers(0, self.num_robots))
         return Board(height=h, width=w, h_walls=h_walls, v_walls=v_walls, robot_positions=robot_positions, goal_position=goal, target_robot=target_robot)
+
+    # Public channel names for image observations
+    @property
+    def channel_names(self) -> List[str]:
+        """Human-readable names for image observation channels."""
+        names = ["wall_up", "wall_down", "wall_left", "wall_right", "goal", "target_robot_mask"]
+        names.extend([f"robot_{i}" for i in range(self.num_robots)])
+        return names
+
+    def _build_cached_walls(self, board: Board) -> None:
+        """Precompute static wall indicator channels (H,W,4)."""
+        h, w = board.height, board.width
+        wall = np.zeros((h, w, 4), dtype=np.float32)
+        for r in range(h):
+            for c in range(w):
+                wall[r, c, 0] = 1.0 if board.has_wall_up(r, c) else 0.0
+                wall[r, c, 1] = 1.0 if board.has_wall_down(r, c) else 0.0
+                wall[r, c, 2] = 1.0 if board.has_wall_left(r, c) else 0.0
+                wall[r, c, 3] = 1.0 if board.has_wall_right(r, c) else 0.0
+        self._cached_wall_obs = wall
+
+
+# Optional helper for registration with gymnasium
+def register_env(env_id: str = "RicochetRobots-v0", *, max_episode_steps: Optional[int] = None) -> None:
+    """Register this environment with gymnasium so it can be created via gym.make(env_id).
+
+    Note: This env already enforces a time limit via its max_steps argument. If you also set
+    max_episode_steps here and wrap with Gym's TimeLimit implicitly via gym.make, you may see
+    duplicate truncation behavior. Prefer one source of time limits.
+    """
+    try:
+        from gymnasium.envs.registration import register  # type: ignore
+        from gymnasium.error import Error as GymError  # type: ignore
+        try:
+            kwargs = {}
+            if max_episode_steps is not None:
+                kwargs["max_episode_steps"] = int(max_episode_steps)
+            register(
+                id=env_id,
+                entry_point="env.ricochet_env:RicochetRobotsEnv",
+                **kwargs,
+            )
+        except GymError as e:  # pragma: no cover - depends on gym version behavior
+            # Swallow duplicate registration errors; re-raise others
+            if "already registered" in str(e).lower():
+                return
+            raise
+    except (ModuleNotFoundError, ImportError):
+        # Silently ignore if gymnasium not available
+        pass

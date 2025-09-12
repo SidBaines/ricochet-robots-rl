@@ -50,7 +50,7 @@ def test_goal_termination_and_reward():
     # Move right; v_wall at (0,3) should cause stopping on (0,2) goal
     _, r4, term, _, info = env.step(0 * 4 + RIGHT)
     assert term
-    assert info.get("success", False)
+    assert info.get("is_success", False)
     total_reward = r1 + r2 + r3 + r4
     assert total_reward > 0.9
 

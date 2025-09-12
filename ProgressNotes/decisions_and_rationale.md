@@ -18,7 +18,7 @@
 
 ## Env-solvability integration
 - `ensure_solvable=True` uses solver filtering; `optimal_length` and solver limits provided in `info` for curriculum.
-- Fixed layouts set `level_solvable=None` (unknown), avoiding misleading flags.
+- `level_solvable` is now a strict boolean with companion `ensure_solvable_enabled` to avoid tri-state ambiguity.
 
 ## Testing philosophy
 - Tests target both mechanics (movement, stopping, truncation) and solver properties (optimality, cutoff, multi-robot needs), plus observation shapes/semantics and env-solver roundtrips.
@@ -26,3 +26,10 @@
 ## Performance considerations (future)
 - Walls are immutable; keep them shared across states. Robot positions can be a small tuple for faster hashing.
 - Parent-pointer path reconstruction is used in A*; consider for BFS if we need to reduce allocations and capture metadata more cheaply.
+
+## Gymnasium compliance (Step 1.3)
+- Adopted Gymnasium seeding (`self.np_random`), `reset(seed=...) -> (obs, info)`, and five-return `step` signature.
+- Added `render_mode` with only `"ascii"` supported; `render()` returns a string frame, matching the configured mode.
+- Provided `close()` and legacy `seed()`; invalid actions raise `gymnasium.error.InvalidAction` when available.
+- Symbolic observation space bounds are finite and match board indices; image obs are float32 in [0,1].
+- Registration helper included; supports `max_episode_steps` but warns about duplicate time limits.

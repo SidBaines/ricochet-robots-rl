@@ -21,13 +21,21 @@ Implemented a canonical Ricochet Robots environment with edge-wall mechanics and
 
 ## API details
 - `RicochetRobotsEnv.reset(ensure_solvable=True)` returns `info` with:
-  - `level_solvable`: True for random generation with solver; None for fixed layouts.
+  - `level_solvable` (bool): True when solvability was enforced this episode; False otherwise.
+  - `ensure_solvable_enabled` (bool): whether enforcement was enabled for this episode.
   - `optimal_length`: minimal moves from solver (when enabled).
   - `solver_limits`: dict with `max_depth`, `max_nodes` (when enabled).
   - `target_robot`: index of target robot.
+  - `episode_seed`: resolved seed for this episode.
+  - `channel_names` (image mode): ordered channel labels for logging.
 
 ## Rendering
 - ASCII renderer shows edge walls and robots; useful for QA and CLI demo.
+- Gymnasium-compliant: `render_mode="ascii"` returns a string. Unsupported modes raise a clear error. `render_mode=None` returns `None`.
+
+## Seeding and determinism
+- Uses Gymnasium seeding (`self.np_random` via `gymnasium.utils.seeding.np_random`).
+- Deterministic given a seed. With `ensure_solvable=True`, retries depend only on RNG draws; the solver is deterministic.
 
 ## Tests (env)
 - Sliding and stopping on walls and robots.
@@ -37,6 +45,10 @@ Implemented a canonical Ricochet Robots environment with edge-wall mechanics and
 - No-op semantics: state unchanged, distinct penalty.
 - Solvability integration: `optimal_length` reported; actions applied reach goal.
 
+## Performance
+- Wall channels are cached on reset and reused each step for image observations.
+
 ## Known limitations / notes
 - Image wall encoding chooses directional per-cell planes; this exposes canonical geometry directly to CNNs.
 - Random generator may create tight alcoves; rely on `ensure_solvable=True` for training or later add density/connectivity controls.
+- Internal time limit is enforced by `max_steps`; wrapping additionally with Gym’s TimeLimit may duplicate truncation signals unless configured carefully.
