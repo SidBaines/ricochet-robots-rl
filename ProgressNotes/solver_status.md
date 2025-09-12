@@ -1,3 +1,13 @@
+## Solver Status
+
+- Solver implementation (BFS/A*) unchanged; used for validation and optional solvability checks in env.
+- `initial_testing_cells.py` examples updated to use `env.get_board()` for read-only access.
+- No new constraints added to solver; it should remain consistent with the environment’s movement rules.
+
+Potential future work:
+
+- Add tests to validate that solver solutions can be replayed in the updated environment with spec-driven walls.
+- Optionally enhance solver heuristics aware of structure patterns (not required for current scope).
 # Solver Status (Step 1.2)
 
 Two planners are provided: BFS (optimal in moves within limits) and A* (configurable heuristic).

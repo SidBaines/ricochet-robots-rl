@@ -2,3 +2,4 @@ numpy>=1.26
 gymnasium>=0.29
 pytest>=8.0
 jupyter>=1.0
+matplotlib>=3.7

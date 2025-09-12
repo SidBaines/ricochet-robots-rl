@@ -1,3 +1,26 @@
+## Decisions and Rationale
+
+1) Constructive generation over rejection sampling:
+   - Rationale: Many constraints in `WallSpecifications.md` make naive generate-and-filter expensive. We added structure-aware placement to build valid boards directly while preserving seed determinism.
+
+2) Seed determinism contract (Step 1.3):
+   - Decision: Store a base seed at init and reinitialize RNG on each `reset()` when no new seed is passed. This makes repeated resets deterministic under a given seed and updates determinism when a new seed is provided.
+
+3) Structure separation and adjacency rules:
+   - Implemented checks that avoid Central-L on edges, avoid corner-adjacent Edge-T juts, and prevent neighbors of walled cells from being structure centers. These ensure cleaner puzzles and avoid overly congested local structures.
+
+4) Goal placement inside Central-L:
+   - To focus gameplay around intentionally structured features, the target is now placed in a Central-L cell, randomized under RNG for variety, with a safe fallback.
+
+5) Public `get_board()` accessor:
+   - Avoids external code relying on `_board` internals; returns a clone to preserve env invariants.
+
+6) RGB rendering:
+   - Added basic but configurable drawer to aid debugging and qualitative checks; kept ASCII for quick console output.
+
+Alternatives considered:
+   - Rejection sampling with solver checks was considered but rejected for performance reasons.
+   - Storing full placement plans per quadrant was deemed unnecessary; local checks suffice for the current spec.
 # Decisions and Rationale
 
 ## Canonical edge walls

@@ -69,7 +69,7 @@ class RicochetRobotsEnv(GymEnvBase):
     - Only render_mode="ascii" is implemented and returns a string frame.
     - Other modes are not implemented and will raise a clear error.
     """
-    metadata = {"render_modes": ["ascii"], "render_fps": 4}
+    metadata = {"render_modes": ["ascii", "rgb"], "render_fps": 4}
 
     def __init__(
         self,
@@ -93,6 +93,8 @@ class RicochetRobotsEnv(GymEnvBase):
         # Spec-driven generation configuration
         edge_t_per_quadrant: Optional[int] = None,
         central_l_per_quadrant: Optional[int] = None,
+        # RGB render configuration
+        render_rgb_config: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__()
         self.height = height
@@ -113,6 +115,27 @@ class RicochetRobotsEnv(GymEnvBase):
         self.render_mode = render_mode
         if self.render_mode is not None and self.render_mode not in self.metadata["render_modes"]:
             raise ValueError(f"Unsupported render_mode {self.render_mode}. Supported: {self.metadata['render_modes']}")
+        # RGB render defaults
+        self._render_rgb_cfg: Dict[str, object] = {
+            "cell_size": 20,
+            "grid_color": (200, 200, 200),
+            "grid_thickness": 1,
+            "wall_color": (0, 0, 0),
+            "wall_thickness": 3,
+            "robot_colors": [
+                (220, 50, 50),     # red
+                (50, 120, 220),    # blue
+                (50, 180, 80),     # green
+                (230, 200, 40),    # yellow
+                (180, 80, 180),    # purple (extra if more robots)
+            ],
+            "circle_fill": True,
+            "circle_radius_frac": 0.35,
+            "target_dark_factor": 0.6,
+            "star_thickness": 2,
+        }
+        if render_rgb_config is not None:
+            self._render_rgb_cfg.update(render_rgb_config)
 
         # Seeding: adopt Gymnasium convention with self.np_random
         self.np_random: np.random.Generator
@@ -124,6 +147,8 @@ class RicochetRobotsEnv(GymEnvBase):
         except NameError:
             self.np_random = np.random.default_rng(seed)
             self._episode_seed = int(seed) if seed is not None else None
+        # Preserve a base seed to enforce deterministic resets when no new seed is provided
+        self._base_seed: Optional[int] = int(seed) if seed is not None else self._episode_seed
         self._board: Optional[Board] = None
         self._num_steps = 0
         self._cached_wall_obs: Optional[np.ndarray] = None  # (H,W,4) float32 for wall channels
@@ -192,6 +217,16 @@ class RicochetRobotsEnv(GymEnvBase):
             except NameError:
                 self.np_random = np.random.default_rng(seed)
                 self._episode_seed = int(seed)
+            self._base_seed = int(self._episode_seed) if self._episode_seed is not None else None
+        else:
+            # Re-seed with base seed so that resets are deterministic when no new seed is provided
+            if self._base_seed is not None:
+                try:
+                    self.np_random, used_seed = _seeding.np_random(self._base_seed)  # type: ignore[name-defined]
+                    self._episode_seed = int(used_seed) if used_seed is not None else int(self._base_seed)
+                except NameError:
+                    self.np_random = np.random.default_rng(self._base_seed)
+                    self._episode_seed = int(self._base_seed)
         _ = options  # silence unused
         self._num_steps = 0
         # clear cached walls in case layout changes
@@ -304,16 +339,21 @@ class RicochetRobotsEnv(GymEnvBase):
         """Render according to render_mode.
 
         - render_mode=="ascii": returns a string frame.
+        - render_mode=="rgb": returns an (H_px, W_px, 3) uint8 array.
         - render_mode is None or unsupported: returns None.
         """
         if self.render_mode is None:
             return None
-        if self.render_mode != "ascii":
-            raise ValueError(f"Unsupported render_mode {self.render_mode}. Supported: {self.metadata['render_modes']}")
+        if self._board is None:
+            return "" if self.render_mode == "ascii" else None
+        if self.render_mode == "ascii":
+            from .ricochet_core import render_ascii  # local import to avoid circulars in lints
+            return render_ascii(self._board)
+        if self.render_mode == "rgb":
+            return self._render_rgb(self._board)
         if self._board is None:
             return ""
-        from .ricochet_core import render_ascii  # local import to avoid circulars in lints
-        return render_ascii(self._board)
+        raise ValueError(f"Unsupported render_mode {self.render_mode}. Supported: {self.metadata['render_modes']}")
 
     def close(self) -> None:
         """Close environment resources (no-op)."""
@@ -472,6 +512,33 @@ class RicochetRobotsEnv(GymEnvBase):
         used_interior_h: Set[Tuple[int, int]] = set()  # (row_idx in 1..h-1, col_idx in 0..w-1)
         used_interior_v: Set[Tuple[int, int]] = set()  # (row_idx in 0..h-1, col_idx in 1..w)
 
+        def cell_has_nonboundary_wall(r: int, c: int) -> bool:
+            # top edge is h_walls[r, c] (non-boundary if r > 0)
+            if r > 0 and h_walls[r, c]:
+                return True
+            # bottom edge is h_walls[r+1, c] (non-boundary if r+1 < h)
+            if r + 1 < h and h_walls[r + 1, c]:
+                return True
+            # left edge is v_walls[r, c] (non-boundary if c > 0)
+            if c > 0 and v_walls[r, c]:
+                return True
+            # right edge is v_walls[r, c+1] (non-boundary if c+1 < w)
+            if c + 1 < w and v_walls[r, c + 1]:
+                return True
+            return False
+
+        def neighbors4(r: int, c: int) -> List[Tuple[int, int]]:
+            nbrs: List[Tuple[int, int]] = []
+            if r - 1 >= 0:
+                nbrs.append((r - 1, c))
+            if r + 1 < h:
+                nbrs.append((r + 1, c))
+            if c - 1 >= 0:
+                nbrs.append((r, c - 1))
+            if c + 1 < w:
+                nbrs.append((r, c + 1))
+            return nbrs
+
         def can_place_h(row: int, col: int) -> bool:
             if not (1 <= row <= h - 1 and 0 <= col <= w - 1):
                 return False
@@ -530,28 +597,42 @@ class RicochetRobotsEnv(GymEnvBase):
                 side, pos = choices[idx]
                 if side in ("TOP", "BOTTOM"):
                     r0, c = pos
+                    # Disallow juts adjacent to board corners along top/bottom: c must not be 1 or w-1
+                    if c in (1, w - 1):
+                        continue
                     # Place vertical wall jutting down/up adjacent to border: v_walls[r0, c]
                     if can_place_v(r0, c):
-                        v_walls[r0, c] = True
-                        used_interior_v.add((r0, c))
-                        # Reserve the adjacent interior cell touched by the jut
+                        # Determine the adjacent interior cell around which this edge-T is formed
                         adj_cell = (1 if side == "TOP" else h - 2, c - 1)
-                        reserve_cell(adj_cell)
-                        return True
+                        # Enforce: no neighbor of a walled cell may be a structure center
+                        # i.e., candidate center adj_cell must not have neighbors with non-boundary walls
+                        blocked = any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(adj_cell[0], adj_cell[1]))
+                        if not blocked and (0 <= adj_cell[0] < h and 0 <= adj_cell[1] < w) and adj_cell not in reserved_cells:
+                            v_walls[r0, c] = True
+                            used_interior_v.add((r0, c))
+                            reserve_cell(adj_cell)
+                            return True
                 else:
                     r, c0 = pos
+                    # Disallow juts adjacent to board corners along left/right: r must not be 1 or h-1
+                    if r in (1, h - 1):
+                        continue
                     # Place horizontal wall jutting right/left adjacent to border: h_walls[r, c0]
                     if can_place_h(r, c0):
-                        h_walls[r, c0] = True
-                        used_interior_h.add((r, c0))
                         adj_cell = (r - 1, 1 if side == "LEFT" else w - 2)
-                        reserve_cell(adj_cell)
-                        return True
+                        blocked = any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(adj_cell[0], adj_cell[1]))
+                        if not blocked and (0 <= adj_cell[0] < h and 0 <= adj_cell[1] < w) and adj_cell not in reserved_cells:
+                            h_walls[r, c0] = True
+                            used_interior_h.add((r, c0))
+                            reserve_cell(adj_cell)
+                            return True
             return False
 
         # Central-L orientations
         # orientation encodes which two walls around a cell: TL => top+left, TR => top+right, BL => bottom+left, BR => bottom+right
         orientations = ["TL", "TR", "BL", "BR"]
+
+        central_l_centers: List[Tuple[int, int]] = []
 
         def place_central_l_in_quadrant(q_bounds: Tuple[int, int, int, int], desired_orientation: str) -> bool:
             rs, re, cs, ce = q_bounds
@@ -564,6 +645,9 @@ class RicochetRobotsEnv(GymEnvBase):
                     if r == 0 or r == h - 1 or c == 0 or c == w - 1:
                         continue
                     if (r, c) in reserved_cells:
+                        continue
+                    # Enforce: no neighbor of a walled cell may be a structure center
+                    if any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(r, c)):
                         continue
                     candidates.append((r, c))
             if not candidates:
@@ -604,8 +688,9 @@ class RicochetRobotsEnv(GymEnvBase):
                 v_walls[vr, vc] = True
                 used_interior_h.add((hr, hc))
                 used_interior_v.add((vr, vc))
-                # Reserve the corner cell for structure uniqueness
+                # Reserve the corner cell for structure uniqueness and record as a central-L center
                 reserve_cell((r, c))
+                central_l_centers.append((r, c))
                 return True
             return False
 
@@ -643,16 +728,23 @@ class RicochetRobotsEnv(GymEnvBase):
                 i += 1
                 attempts += 1
 
-        # Place goal and robots in free cells, excluding central block cells
-        free_cells: List[Tuple[int, int]] = []
+        # Place goal inside a central-L square (randomly among placed central-L centers), excluding central forbidden block
         central_set = set((r, c) for r in central_rows for c in central_cols)
+        candidates_goal = [rc for rc in central_l_centers if rc not in central_set]
+        if not candidates_goal:
+            # Fallback: if for some reason no central-L could be placed, select any non-central cell deterministically
+            candidates_goal = [(r, c) for r in range(h) for c in range(w) if (r, c) not in central_set]
+        idx = int(self.np_random.integers(0, len(candidates_goal)))
+        goal = candidates_goal[idx]
+
+        # Place robots in free cells excluding central block and the goal cell
+        free_cells: List[Tuple[int, int]] = []
         for r in range(h):
             for c in range(w):
-                if (r, c) in central_set:
+                if (r, c) in central_set or (r, c) == goal:
                     continue
                 free_cells.append((r, c))
         self.np_random.shuffle(free_cells)
-        goal = free_cells.pop()
         robot_positions: Dict[int, Tuple[int, int]] = {}
         for rid in range(self.num_robots):
             robot_positions[rid] = free_cells.pop()
@@ -678,6 +770,124 @@ class RicochetRobotsEnv(GymEnvBase):
                 wall[r, c, 2] = 1.0 if board.has_wall_left(r, c) else 0.0
                 wall[r, c, 3] = 1.0 if board.has_wall_right(r, c) else 0.0
         self._cached_wall_obs = wall
+
+    # Public accessor for current board (read-only clone)
+    def get_board(self) -> Board:
+        if self._board is None:
+            raise RuntimeError("Environment not initialized. Call reset() first.")
+        return self._board.clone()
+
+    def _render_rgb(self, board: Board) -> np.ndarray:
+        # Extract config
+        cfg = self._render_rgb_cfg
+        cell_size = int(cfg["cell_size"])  # pixels
+        grid_color = tuple(int(x) for x in cfg["grid_color"])  # type: ignore[index]
+        grid_th = int(cfg["grid_thickness"])  # px
+        wall_color = tuple(int(x) for x in cfg["wall_color"])  # type: ignore[index]
+        wall_th = int(cfg["wall_thickness"])  # px
+        robot_colors: List[Tuple[int, int, int]] = [tuple(int(a) for a in t) for t in cfg["robot_colors"]]  # type: ignore[index]
+        circle_fill: bool = bool(cfg["circle_fill"])  # type: ignore[index]
+        circle_r_frac: float = float(cfg["circle_radius_frac"])  # type: ignore[index]
+        target_dark_factor: float = float(cfg["target_dark_factor"])  # type: ignore[index]
+        star_th: int = int(cfg["star_thickness"])  # type: ignore[index]
+
+        H, W = board.height, board.width
+        H_px, W_px = H * cell_size, W * cell_size
+        img = np.ones((H_px, W_px, 3), dtype=np.uint8) * 255
+
+        # Helpers to draw
+        def draw_hline(y: int, x0: int, x1: int, color: Tuple[int, int, int], thickness: int) -> None:
+            y0 = max(0, y - thickness // 2)
+            y1 = min(H_px, y + (thickness - thickness // 2))
+            x0c = max(0, min(x0, x1))
+            x1c = min(W_px, max(x0, x1))
+            img[y0:y1, x0c:x1c] = color
+
+        def draw_vline(x: int, y0: int, y1: int, color: Tuple[int, int, int], thickness: int) -> None:
+            x0 = max(0, x - thickness // 2)
+            x1 = min(W_px, x + (thickness - thickness // 2))
+            y0c = max(0, min(y0, y1))
+            y1c = min(H_px, max(y0, y1))
+            img[y0c:y1c, x0:x1] = color
+
+        def draw_circle(cx: float, cy: float, radius: float, color: Tuple[int, int, int], fill: bool) -> None:
+            # Bounding box
+            x0 = int(max(0, np.floor(cx - radius)))
+            x1 = int(min(W_px - 1, np.ceil(cx + radius)))
+            y0 = int(max(0, np.floor(cy - radius)))
+            y1 = int(min(H_px - 1, np.ceil(cy + radius)))
+            yy, xx = np.ogrid[y0:y1 + 1, x0:x1 + 1]
+            mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius ** 2
+            if fill:
+                img[y0:y1 + 1, x0:x1 + 1][mask] = color
+            else:
+                # outline 1px
+                inner = (xx - cx) ** 2 + (yy - cy) ** 2 <= (radius - 1) ** 2
+                ring = np.logical_and(mask, np.logical_not(inner))
+                img[y0:y1 + 1, x0:x1 + 1][ring] = color
+
+        def draw_star(cx: float, cy: float, arm_len: float, color: Tuple[int, int, int], thickness: int) -> None:
+            # Draw + arms
+            draw_hline(int(cy), int(cx - arm_len), int(cx + arm_len), color, thickness)
+            draw_vline(int(cx), int(cy - arm_len), int(cy + arm_len), color, thickness)
+            # Draw x arms (diagonals) by sampling small line thickness via plotting short lines of squares
+            # Approximate diagonals by drawing small rectangles along the diagonal
+            steps = int(arm_len)
+            for s in range(-steps, steps + 1):
+                x = int(cx + s)
+                y1 = int(cy + s)
+                y2 = int(cy - s)
+                y0a = max(0, y1 - thickness // 2)
+                y1a = min(H_px, y1 + (thickness - thickness // 2))
+                x0a = max(0, x - thickness // 2)
+                x1a = min(W_px, x + (thickness - thickness // 2))
+                img[y0a:y1a, x0a:x1a] = color
+                y0b = max(0, y2 - thickness // 2)
+                y1b = min(H_px, y2 + (thickness - thickness // 2))
+                img[y0b:y1b, x0a:x1a] = color
+
+        # 1) Draw faint grid lines
+        for r in range(H + 1):
+            y = int(r * cell_size)
+            draw_hline(y, 0, W_px, grid_color, grid_th)
+        for c in range(W + 1):
+            x = int(c * cell_size)
+            draw_vline(x, 0, H_px, grid_color, grid_th)
+
+        # 2) Draw walls as thicker black lines. h_walls[r,c] between rows r-1 and r over cell column c
+        for r in range(H + 1):
+            for c in range(W):
+                if board.h_walls[r, c]:
+                    y = int(r * cell_size)
+                    x0 = int(c * cell_size)
+                    x1 = int((c + 1) * cell_size)
+                    draw_hline(y, x0, x1, wall_color, wall_th)
+        for r in range(H):
+            for c in range(W + 1):
+                if board.v_walls[r, c]:
+                    x = int(c * cell_size)
+                    y0 = int(r * cell_size)
+                    y1 = int((r + 1) * cell_size)
+                    draw_vline(x, y0, y1, wall_color, wall_th)
+
+        # 3) Draw robots as filled circles
+        radius = cell_size * float(circle_r_frac)
+        for rid, (rr, cc) in board.robot_positions.items():
+            color = robot_colors[rid % len(robot_colors)]
+            cy = rr * cell_size + cell_size * 0.5
+            cx = cc * cell_size + cell_size * 0.5
+            draw_circle(cx, cy, radius, color, circle_fill)
+
+        # 4) Draw target as a star in darker color of target robot
+        tr = board.target_robot
+        tr_color = robot_colors[tr % len(robot_colors)]
+        dark_color = tuple(int(max(0, min(255, target_dark_factor * v))) for v in tr_color)
+        gr, gc = board.goal_position
+        cy = gr * cell_size + cell_size * 0.5
+        cx = gc * cell_size + cell_size * 0.5
+        draw_star(cx, cy, arm_len=cell_size * 0.35, color=dark_color, thickness=star_th)
+
+        return img
 
 
 # Optional helper for registration with gymnasium

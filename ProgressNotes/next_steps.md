@@ -1,3 +1,29 @@
+## Next Steps
+
+Recommended follow-ups for Stage 1.4 and beyond:
+
+1) Add unit tests for spec enforcement:
+   - Central block placement (odd/even boards).
+   - Edge-T and Central-L counts per quadrant with balanced orientations.
+   - No Central-L on edge cells.
+   - Corner adjacency rule for Edge-T juts.
+   - Neighbor-of-walled-cell cannot be a structure center.
+   - Goal placed in a Central-L cell; robots/goals never in central forbidden block.
+   - Reproducibility: repeated `reset()` with same seed yields identical boards.
+
+2) Visual sanity checks:
+   - Extend `initial_testing_cells.py` to save RGB renders to disk for a few seeds and sizes.
+   - Optionally add overlays to indicate recognized structures during debugging.
+
+3) Performance:
+   - Profile `_generate_random_board` for large boards; consider early pruning if placements struggle due to constraints.
+   - If needed, allow retries within a bounded loop to achieve requested per-quadrant counts, with clear info messages.
+
+4) Curriculum ties (later stages):
+   - Expose difficulty knobs (e.g., control counts or orientations mix) via env params for training curricula.
+
+5) Documentation:
+   - Mirror key rules from `env/WallSpecifications.md` into docstrings of generator helpers for discoverability.
 # Next Steps
 
 ## Step 2 (Training framework and models)

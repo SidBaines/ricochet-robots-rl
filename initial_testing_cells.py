@@ -37,7 +37,7 @@ STEP_PENALTY: float = -0.01
 NOOP_PENALTY: Optional[float] = None  # None -> use STEP_PENALTY
 GOAL_REWARD: float = 1.0
 MAX_STEPS: int = 100
-RENDER_MODE: Optional[str] = "ascii"  # "ascii" or None
+RENDER_MODE: Optional[str] = "rgb"  # "ascii", "rgb" or None
 SEED: Optional[int] = 123
 
 # When ensuring solvable random boards
@@ -115,8 +115,18 @@ env = RicochetRobotsEnv(
 obs, info = env.reset()
 print("Environment reset. Info:", info)
 frame = env.render()
-if frame is not None:
+if RENDER_MODE == "ascii" and frame is not None:
     print(frame)
+elif RENDER_MODE == "rgb" and frame is not None:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+        plt.figure(figsize=(6, 6))
+        plt.imshow(frame)
+        plt.title("Ricochet Robots - RGB Render")
+        plt.axis("off")
+        plt.show()
+    except ImportError:
+        print("matplotlib not available to display RGB frame; shape:", getattr(frame, "shape", None))
 
 
 #%%
@@ -147,7 +157,7 @@ for rid, d in custom_actions:
     obs, reward, terminated, truncated, step_info = env.step(a)
     total_reward += reward
     frame = env.render()
-    if frame is not None:
+    if RENDER_MODE == "ascii" and frame is not None:
         print(frame)
     print({"reward": reward, "terminated": terminated, "truncated": truncated, "info": step_info})
     terminated_any = terminated_any or terminated
@@ -160,7 +170,7 @@ print(f"Cumulative reward: {total_reward:.3f}")
 
 #%%
 # Run solver on current board and replay its plan (BFS)
-solution = solve_bfs(env._board, max_depth=SOLVER_MAX_DEPTH, max_nodes=SOLVER_MAX_NODES)  # type: ignore[attr-defined]
+solution = solve_bfs(env.get_board(), max_depth=SOLVER_MAX_DEPTH, max_nodes=SOLVER_MAX_NODES)
 if solution is None:
     print("Solver did not find a plan within limits.")
 else:
@@ -173,7 +183,7 @@ else:
         obs, reward, terminated, truncated, step_info = env.step(a)
         total_reward += reward
         frame = env.render()
-        if frame is not None:
+        if RENDER_MODE == "ascii" and frame is not None:
             print(frame)
         print({"move": (rid, d), "reward": reward, "terminated": terminated, "truncated": truncated})
         if terminated or truncated:
@@ -185,6 +195,7 @@ else:
 
 #%%
 # Alternative: A* with selectable heuristic
+H_MODE = "admissible_zero"  # one of: "admissible_zero", "admissible_one", "manhattan_cells"
 H_MODE = "admissible_one"  # one of: "admissible_zero", "admissible_one", "manhattan_cells"
 # Time how long it takes to solve 1000 times
 import time
@@ -192,8 +203,19 @@ start_time = time.time()
 for i in range(1):
     env.reset()
     frame = env.render()
-    print(frame)
-    astar_sol = solve_astar(env._board, max_depth=200, max_nodes=100000, h_mode=H_MODE)  # type: ignore[attr-defined]
+    if RENDER_MODE == "ascii":
+        print(frame)
+    elif RENDER_MODE == "rgb" and frame is not None:
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+            plt.figure(figsize=(6, 6))
+            plt.imshow(frame)
+            plt.title("Ricochet Robots - RGB Render")
+            plt.axis("off")
+            plt.show()
+        except ImportError:
+            print("matplotlib not available to display RGB frame; shape:", getattr(frame, "shape", None))
+    astar_sol = solve_astar(env.get_board(), max_depth=200, max_nodes=100000, h_mode=H_MODE)
 end_time = time.time()
 print(f"Time taken: {end_time - start_time} seconds")
 if astar_sol is None:
@@ -203,6 +225,8 @@ else:
 # Print the moves in human readable format
 for rid, d in astar_sol:
     print(f"Move: {rid}, Direction: {DIRS_INVERSE[d]}")
+print(f"Solve length: {len(astar_sol)}")
+
 
 #%%
 # Random rollout for smoke testing
@@ -216,7 +240,7 @@ for t in range(steps):
     obs, reward, terminated, truncated, step_info = env.step(a)
     total_reward += reward
     frame = env.render()
-    if frame is not None:
+    if RENDER_MODE == "ascii" and frame is not None:
         print(frame)
     print({"t": t + 1, "a": a, "reward": reward, "terminated": terminated, "truncated": truncated})
     if terminated or truncated:
