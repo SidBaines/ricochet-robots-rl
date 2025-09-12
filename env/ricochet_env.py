@@ -146,6 +146,7 @@ class RicochetRobotsEnv(GymEnvBase):
                 solution = solve_bfs(board, max_depth=self.solver_max_depth, max_nodes=self.solver_max_nodes)
                 if solution is not None:
                     self._board = board
+                    optimal_length = len(solution)
                     break
             except ImportError as exc:
                 raise RuntimeError("ensure_solvable=True but solver unavailable (ImportError)") from exc
@@ -153,7 +154,11 @@ class RicochetRobotsEnv(GymEnvBase):
                 raise RuntimeError("Failed to generate solvable board within attempt limit")
 
         obs = self._make_obs(self._board)
-        info = {"level_solvable": True, "target_robot": self._board.target_robot}
+        # Note: solver None during attempts may be due to cutoffs (depth/nodes), not true unsolvability.
+        info = {"level_solvable": True if self.ensure_solvable else None, "target_robot": self._board.target_robot}
+        if self.ensure_solvable:
+            info["optimal_length"] = optimal_length
+            info["solver_limits"] = {"max_depth": self.solver_max_depth, "max_nodes": self.solver_max_nodes}
         return obs, info
 
     def step(self, action: int):

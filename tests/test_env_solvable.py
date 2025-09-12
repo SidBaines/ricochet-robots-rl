@@ -5,6 +5,7 @@ import importlib
 
 from env.ricochet_env import RicochetRobotsEnv
 from env.ricochet_core import Board
+from env.solver import solve_bfs, apply_actions
 
 
 def test_ensure_solvable_success(monkeypatch):
@@ -44,3 +45,36 @@ def test_ensure_solvable_attempt_limit_failure(monkeypatch):
     except RuntimeError:
         raised = True
     assert raised
+
+
+def test_ensure_solvable_includes_optimal_length_and_limits(monkeypatch):
+    # Create a board where optimal path length is known (1 move)
+    H, W = 3, 3
+    h_walls = np.zeros((H + 1, W), dtype=bool)
+    v_walls = np.zeros((H, W + 1), dtype=bool)
+    h_walls[0, :] = True
+    h_walls[H, :] = True
+    v_walls[:, 0] = True
+    v_walls[:, W] = True
+    robots = {0: (2, 1)}
+    goal = (0, 1)
+    board = Board(height=H, width=W, h_walls=h_walls, v_walls=v_walls, robot_positions=robots, goal_position=goal, target_robot=0)
+
+    # Patch generator to always produce our board
+    import env.ricochet_env as env_mod
+    monkeypatch.setattr(env_mod.RicochetRobotsEnv, "_generate_random_board", lambda self: board, raising=True)
+
+    env = env_mod.RicochetRobotsEnv(height=H, width=W, num_robots=1, ensure_solvable=True, solver_max_depth=5, solver_max_nodes=100)
+    _, info = env.reset()
+    assert info.get("optimal_length") == 1
+    limits = info.get("solver_limits")
+    assert isinstance(limits, dict)
+    assert limits["max_depth"] == 5 and limits["max_nodes"] == 100
+
+    # Consistency: applying BFS actions reaches goal in that many moves
+    actions = solve_bfs(board, max_depth=5, max_nodes=100)
+    assert actions is not None
+    assert len(actions) == info["optimal_length"]
+    end = apply_actions(board, actions)
+    from env.ricochet_core import reached_goal
+    assert reached_goal(end)
