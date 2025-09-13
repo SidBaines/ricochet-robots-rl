@@ -46,7 +46,7 @@ class FixedLayout:
     target_robot: int
 
 
-ObsMode = Literal["image", "symbolic"]
+ObsMode = Literal["image", "symbolic", "rgb_image"]
 
 
 class RicochetRobotsEnv(GymEnvBase):
@@ -179,6 +179,21 @@ class RicochetRobotsEnv(GymEnvBase):
                 high=1.0,
                 shape=obs_shape,
                 dtype=np.float32,
+            )
+        elif self.obs_mode == "rgb_image":
+            # RGB image observation: uses fixed pixel dimensions for consistent observation space
+            # This ensures all curriculum levels have the same observation space size
+            FIXED_PIXEL_SIZE = 128  # Fixed pixel dimensions for all RGB observations
+            
+            if self.channels_first:
+                obs_shape = (3, FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE)
+            else:
+                obs_shape = (FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE, 3)
+            self.observation_space = spaces.Box(
+                low=0,
+                high=255,
+                shape=obs_shape,
+                dtype=np.uint8,
             )
         elif self.obs_mode == "symbolic":
             # [goal_r, goal_c] in [0..H-1], [0..W-1]; one-hot target in [0,1]; robots positions in bounds
@@ -391,6 +406,8 @@ class RicochetRobotsEnv(GymEnvBase):
     def _make_obs(self, board: Board) -> np.ndarray:
         if self.obs_mode == "image":
             return self._board_to_image_obs(board)
+        elif self.obs_mode == "rgb_image":
+            return self._board_to_rgb_obs(board)
         return self._board_to_symbolic_obs(board)
 
     def _board_to_image_obs(self, board: Board) -> np.ndarray:
@@ -437,6 +454,49 @@ class RicochetRobotsEnv(GymEnvBase):
             np.array(robots_vec, dtype=np.float32),
         ])
         return vec
+
+    def _board_to_rgb_obs(self, board: Board) -> np.ndarray:
+        """Convert board to RGB image observation with fixed pixel dimensions.
+        
+        This creates an RGB image with fixed pixel dimensions (128x128) by adjusting
+        the cell size to fit the board within the fixed pixel space. This ensures
+        consistent observation space across all curriculum levels.
+        """
+        FIXED_PIXEL_SIZE = 128
+        
+        # Calculate cell size to fit the board within the fixed pixel dimensions
+        # Leave some padding around the edges
+        padding = 4  # pixels of padding around the board
+        available_size = FIXED_PIXEL_SIZE - 2 * padding
+        cell_size = max(1, available_size // max(board.height, board.width))
+        
+        # Temporarily update the render config for this observation
+        original_cell_size = self._render_rgb_cfg["cell_size"]
+        self._render_rgb_cfg["cell_size"] = cell_size
+        
+        try:
+            # Use the existing RGB rendering method with adjusted cell size
+            rgb_image = self._render_rgb(board)
+            
+            # Resize to fixed pixel dimensions if needed
+            if rgb_image.shape[:2] != (FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE):
+                from PIL import Image
+                # Convert to PIL Image for resizing
+                pil_image = Image.fromarray(rgb_image)
+                # Resize to fixed dimensions
+                pil_image = pil_image.resize((FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE), Image.Resampling.LANCZOS)
+                rgb_image = np.array(pil_image)
+            
+            # Convert to the correct format based on channels_first setting
+            if self.channels_first:
+                # Convert from (H, W, 3) to (3, H, W)
+                rgb_image = np.transpose(rgb_image, (2, 0, 1))
+            
+            return rgb_image
+            
+        finally:
+            # Restore original cell size
+            self._render_rgb_cfg["cell_size"] = original_cell_size
 
     def _generate_random_board(self) -> Board:
         h, w = self.height, self.width

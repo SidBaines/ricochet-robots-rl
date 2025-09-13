@@ -288,6 +288,13 @@ class CurriculumWrapper(GymEnvBase):
         """Create a new environment instance with current level parameters."""
         level = self._get_current_level()
         
+        # Get observation mode and other settings from the base environment factory
+        # by creating a temporary environment to inspect its settings
+        temp_env = self.base_env_factory()
+        obs_mode = temp_env.obs_mode
+        channels_first = temp_env.channels_first
+        temp_env.close()
+        
         # Create environment with level-specific parameters and optimal length filtering
         self._current_env = OptimalLengthFilteredEnv(
             max_optimal_length=level.max_optimal_length,
@@ -299,8 +306,8 @@ class CurriculumWrapper(GymEnvBase):
             solver_max_depth=level.solver_max_depth,
             solver_max_nodes=level.solver_max_nodes,
             ensure_solvable=True,  # Always ensure solvable for curriculum
-            obs_mode="image",  # Use image mode for consistency
-            channels_first=True,
+            obs_mode=obs_mode,  # Use the same observation mode as base environment
+            channels_first=channels_first,  # Use the same channels_first setting
         )
     
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):

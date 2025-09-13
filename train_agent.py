@@ -134,7 +134,7 @@ def main() -> None:
     parser.add_argument("--ensure-solvable", action="store_true")
     parser.add_argument("--solver-max-depth", type=int, default=30)
     parser.add_argument("--solver-max-nodes", type=int, default=20000)
-    parser.add_argument("--obs-mode", choices=["image", "symbolic"], default="image")
+    parser.add_argument("--obs-mode", choices=["image", "symbolic", "rgb_image"], default="image")
     
     # Curriculum learning options
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning")
@@ -201,32 +201,51 @@ def main() -> None:
     else:
         tiny_grid = min(args.height, args.width) < 8
     
-    # Check if we should use the custom recurrent policy for ConvLSTM
-    if args.obs_mode == "image" and ConvLSTMFeaturesExtractor is not None and args.convlstm:
-        if RecurrentActorCriticPolicy is None:
-            raise ImportError("RecurrentActorCriticPolicy not available. Please check the import.")
-        policy = RecurrentActorCriticPolicy
-        policy_kwargs = dict(
-            features_extractor_class=ConvLSTMFeaturesExtractor,
-            features_extractor_kwargs=dict(
-                features_dim=128,
-                lstm_channels=args.lstm_channels,
-                num_lstm_layers=args.lstm_layers,
-                num_repeats=args.lstm_repeats,
-                use_pool_and_inject=True,
-                use_skip_connections=True,
-            ),
-            net_arch=dict(pi=[128, 128], vf=[128, 128]),
-            normalize_images=False,
-        )
-    elif args.obs_mode == "image" and not tiny_grid:
-        policy = "CnnPolicy"
-        policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]), normalize_images=False)
-        if SmallCNN is not None and args.small_cnn:
-            policy_kwargs.update(dict(features_extractor_class=SmallCNN, features_extractor_kwargs=dict(features_dim=128)))
-    else:
+    # Validate observation mode and policy compatibility
+    if args.obs_mode == "symbolic" and args.convlstm:
+        raise ValueError("ConvLSTM requires image observations, but symbolic mode was selected")
+    
+    # Policy selection based on observation mode and requirements
+    if args.obs_mode in ["image", "rgb_image"]:
+        if args.convlstm and ConvLSTMFeaturesExtractor is not None:
+            # Use ConvLSTM for image observations (preferred per research plan)
+            if RecurrentActorCriticPolicy is None:
+                raise ImportError("RecurrentActorCriticPolicy not available. Please check the import.")
+            policy = RecurrentActorCriticPolicy
+            policy_kwargs = dict(
+                features_extractor_class=ConvLSTMFeaturesExtractor,
+                features_extractor_kwargs=dict(
+                    features_dim=128,
+                    lstm_channels=args.lstm_channels,
+                    num_lstm_layers=args.lstm_layers,
+                    num_repeats=args.lstm_repeats,
+                    use_pool_and_inject=True,
+                    use_skip_connections=True,
+                ),
+                net_arch=dict(pi=[128, 128], vf=[128, 128]),
+                normalize_images=(args.obs_mode == "rgb_image"),  # Normalize RGB images
+            )
+        elif not tiny_grid:
+            # Fallback to CNN for image observations
+            policy = "CnnPolicy"
+            policy_kwargs = dict(
+                net_arch=dict(pi=[128, 128], vf=[128, 128]), 
+                normalize_images=(args.obs_mode == "rgb_image")  # Normalize RGB images
+            )
+            if SmallCNN is not None and args.small_cnn:
+                policy_kwargs.update(dict(features_extractor_class=SmallCNN, features_extractor_kwargs=dict(features_dim=128)))
+            elif not args.convlstm:
+                print("Warning: Using CNN instead of ConvLSTM for image observations. Use --convlstm for ConvLSTM.")
+        else:
+            # Use MLP for very small grids
+            policy = "MlpPolicy"
+            policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]), normalize_images=False)
+    elif args.obs_mode == "symbolic":
+        # Use MLP for symbolic observations
         policy = "MlpPolicy"
         policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]), normalize_images=False)
+    else:
+        raise ValueError(f"Unknown observation mode: {args.obs_mode}")
 
     model = PPO(
         policy,
@@ -299,7 +318,7 @@ def main() -> None:
                         # Check if any environments have finished episodes
                         if self.last_dones is not None:
                             # Reset hidden states for environments that just finished
-                            for env_idx, done in enumerate(self.last_dones):
+                            for done in self.last_dones:
                                 if done:
                                     # Reset hidden states for this environment
                                     # Note: This is a simplified approach - in practice, we'd need
