@@ -6,3 +6,6 @@ matplotlib>=3.7
 torch>=2.3
 stable-baselines3>=2.3.2
 tensorboard>=2.15.0
+# MPS support for M1/M2 Macs
+torch-audio>=2.3
+wandb>=0.17

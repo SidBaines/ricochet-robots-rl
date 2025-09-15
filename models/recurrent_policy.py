@@ -52,6 +52,13 @@ class RecurrentActorCriticPolicy(BasePolicy):
         self.activation_fn = activation_fn
         self.features_dim = features_dim
         self.ortho_init = ortho_init
+        self.normalize_images = normalize_images
+        # Store unused-but-standard args to avoid lint warnings and for future use
+        self._use_sde = use_sde
+        self._log_std_init = log_std_init
+        self._full_std = full_std
+        self._use_expln = use_expln
+        self._initial_std = initial_std
         
         # Initialize hidden states storage
         self._hidden_states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
@@ -73,6 +80,16 @@ class RecurrentActorCriticPolicy(BasePolicy):
         # Initialize optimizer (required by SB3)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr_schedule(1))
         
+    def _preprocess_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        """Convert observations to float in [0,1] when normalize_images is enabled."""
+        if self.normalize_images:
+            if obs.dtype == torch.uint8:
+                obs = obs.float().div_(255.0)
+            else:
+                # Ensure float32 dtype for convs and autocast stability
+                obs = obs.float()
+        return obs
+
     def _build_networks(self):
         """Build the actor and critic networks."""
         # Extract network architecture
@@ -109,7 +126,7 @@ class RecurrentActorCriticPolicy(BasePolicy):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
     
-    def _init_hidden_states(self, batch_size: int, device: torch.device) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    def _init_hidden_states(self, _batch_size: int, _device: torch.device) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Initialize hidden states for the recurrent feature extractor."""
         if not hasattr(self.features_extractor, 'convlstm'):
             return []
@@ -149,38 +166,53 @@ class RecurrentActorCriticPolicy(BasePolicy):
             value: State value estimate
             log_prob: Log probability of the selected action
         """
-        batch_size = obs.shape[0]
+        # Import profiling here to avoid circular imports
+        try:
+            from profiling import profile
+        except ImportError:
+            # Fallback if profiling not available
+            def profile(_name, _track_memory=True):
+                from contextlib import nullcontext
+                return nullcontext()
         
-        # Get current hidden states
-        hidden_states = self._get_hidden_states(batch_size)
-        
-        # Extract features using the recurrent feature extractor
-        if hasattr(self.features_extractor, 'convlstm'):
-            # Recurrent feature extractor - pass hidden states
-            features, new_hidden_states = self.features_extractor(obs, hidden_states)
-            # Update stored hidden states (detach to prevent gradient issues)
-            self._hidden_states = [(h.detach(), c.detach()) for h, c in new_hidden_states]
-        else:
-            # Non-recurrent feature extractor
-            features = self.features_extractor(obs)
-        
-        # Compute action logits and value
-        action_logits = self.action_net(features)
-        value = self.value_net(features).squeeze(-1)
-        
-        # Create action distribution
-        action_dist = self._get_action_dist_from_latent(action_logits)
-        
-        # Sample action
-        if deterministic:
-            action = action_dist.mode()
-        else:
-            action = action_dist.sample()
-        
-        # Compute log probability
-        log_prob = action_dist.log_prob(action)
-        
-        return action, value, log_prob
+        with profile("recurrent_policy_forward", track_memory=True):
+            obs = self._preprocess_obs(obs)
+            batch_size = obs.shape[0]
+            
+            # Get current hidden states
+            with profile("recurrent_policy_get_hidden_states", track_memory=True):
+                hidden_states = self._get_hidden_states(batch_size)
+            
+            # Extract features using the recurrent feature extractor
+            if hasattr(self.features_extractor, 'convlstm'):
+                # Recurrent feature extractor - pass hidden states
+                features, new_hidden_states = self.features_extractor(obs, hidden_states)
+                # Update stored hidden states (detach to prevent gradient issues)
+                self._hidden_states = [(h.detach(), c.detach()) for h, c in new_hidden_states]
+            else:
+                # Non-recurrent feature extractor
+                features = self.features_extractor(obs)
+            
+            # Compute action logits and value
+            with profile("recurrent_policy_action_value", track_memory=True):
+                action_logits = self.action_net(features)
+                value = self.value_net(features).squeeze(-1)
+            
+            # Create action distribution
+            with profile("recurrent_policy_action_dist", track_memory=True):
+                action_dist = self._get_action_dist_from_latent(action_logits)
+            
+            # Sample action
+            with profile("recurrent_policy_action_sampling", track_memory=True):
+                if deterministic:
+                    action = action_dist.mode()
+                else:
+                    action = action_dist.sample()
+                
+                # Compute log probability
+                log_prob = action_dist.log_prob(action)
+            
+            return action, value, log_prob
     
     def _get_action_dist_from_latent(self, latent_pi: torch.Tensor) -> Distribution:
         """Get action distribution from latent policy."""
@@ -206,31 +238,42 @@ class RecurrentActorCriticPolicy(BasePolicy):
             log_prob: Log probability of actions
             entropy: Entropy of action distribution
         """
-        batch_size = obs.shape[0]
+        # Import profiling here to avoid circular imports
+        try:
+            from profiling import profile
+        except ImportError:
+            # Fallback if profiling not available
+            def profile(_name, _track_memory=True):
+                from contextlib import nullcontext
+                return nullcontext()
         
-        # Get current hidden states
-        hidden_states = self._get_hidden_states(batch_size)
-        
-        # Extract features
-        if hasattr(self.features_extractor, 'convlstm'):
-            features, new_hidden_states = self.features_extractor(obs, hidden_states)
-            # Update stored hidden states (detach to prevent gradient issues)
-            self._hidden_states = [(h.detach(), c.detach()) for h, c in new_hidden_states]
-        else:
-            features = self.features_extractor(obs)
-        
-        # Compute action logits and value
-        action_logits = self.action_net(features)
-        value = self.value_net(features).squeeze(-1)
-        
-        # Create action distribution
-        action_dist = self._get_action_dist_from_latent(action_logits)
-        
-        # Compute log probability and entropy
-        log_prob = action_dist.log_prob(actions)
-        entropy = action_dist.entropy()
-        
-        return value, log_prob, entropy
+        with profile("recurrent_policy_evaluate_actions", track_memory=True):
+            obs = self._preprocess_obs(obs)
+            batch_size = obs.shape[0]
+            
+            # Get current hidden states
+            hidden_states = self._get_hidden_states(batch_size)
+            
+            # Extract features
+            if hasattr(self.features_extractor, 'convlstm'):
+                features, new_hidden_states = self.features_extractor(obs, hidden_states)
+                # Update stored hidden states (detach to prevent gradient issues)
+                self._hidden_states = [(h.detach(), c.detach()) for h, c in new_hidden_states]
+            else:
+                features = self.features_extractor(obs)
+            
+            # Compute action logits and value
+            action_logits = self.action_net(features)
+            value = self.value_net(features).squeeze(-1)
+            
+            # Create action distribution
+            action_dist = self._get_action_dist_from_latent(action_logits)
+            
+            # Compute log probability and entropy
+            log_prob = action_dist.log_prob(actions)
+            entropy = action_dist.entropy()
+            
+            return value, log_prob, entropy
     
     def get_hidden_states(self) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Get current hidden states for analysis."""
@@ -258,6 +301,7 @@ class RecurrentActorCriticPolicy(BasePolicy):
         if observation.dim() == 3:  # (C, H, W)
             observation = observation.unsqueeze(0)  # (1, C, H, W)
         
+        observation = self._preprocess_obs(observation)
         action, value, _ = self.forward(observation, deterministic)
         
         # Remove batch dimension for single observation
@@ -273,22 +317,33 @@ class RecurrentActorCriticPolicy(BasePolicy):
         Returns:
             values: State value estimates
         """
-        batch_size = obs.shape[0]
+        # Import profiling here to avoid circular imports
+        try:
+            from profiling import profile
+        except ImportError:
+            # Fallback if profiling not available
+            def profile(_name, _track_memory=True):
+                from contextlib import nullcontext
+                return nullcontext()
         
-        # Get current hidden states
-        hidden_states = self._get_hidden_states(batch_size)
-        
-        # Extract features using the recurrent feature extractor
-        if hasattr(self.features_extractor, 'convlstm'):
-            # Recurrent feature extractor - pass hidden states
-            features, new_hidden_states = self.features_extractor(obs, hidden_states)
-            # Update stored hidden states (detach to prevent gradient issues)
-            self._hidden_states = [(h.detach(), c.detach()) for h, c in new_hidden_states]
-        else:
-            # Non-recurrent feature extractor
-            features = self.features_extractor(obs)
-        
-        # Compute value
-        value = self.value_net(features).squeeze(-1)
-        
-        return value
+        with profile("recurrent_policy_predict_values", track_memory=True):
+            obs = self._preprocess_obs(obs)
+            batch_size = obs.shape[0]
+            
+            # Get current hidden states
+            hidden_states = self._get_hidden_states(batch_size)
+            
+            # Extract features using the recurrent feature extractor
+            if hasattr(self.features_extractor, 'convlstm'):
+                # Recurrent feature extractor - pass hidden states
+                features, new_hidden_states = self.features_extractor(obs, hidden_states)
+                # Update stored hidden states (detach to prevent gradient issues)
+                self._hidden_states = [(h.detach(), c.detach()) for h, c in new_hidden_states]
+            else:
+                # Non-recurrent feature extractor
+                features = self.features_extractor(obs)
+            
+            # Compute value
+            value = self.value_net(features).squeeze(-1)
+            
+            return value
