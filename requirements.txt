@@ -5,7 +5,13 @@ jupyter>=1.0
 matplotlib>=3.7
 torch>=2.3
 stable-baselines3>=2.3.2
+sb3-contrib>=2.3.0
 tensorboard>=2.15.0
 # MPS support for M1/M2 Macs
-torch-audio>=2.3
+torchaudio>=2.3
 wandb>=0.17
+# Puzzle bank dependencies
+pandas>=2.0
+pyarrow>=10.0
+tqdm>=4.64
+Pillow>=9.0

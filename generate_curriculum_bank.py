@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""
+Generate puzzle bank for curriculum levels.
+
+This script generates puzzles for all curriculum levels defined in the shared
+curriculum configuration. It can use either the default curriculum or load
+from a custom JSON configuration file.
+
+Usage:
+    # Use default curriculum
+    python generate_curriculum_bank.py --bank_dir ./puzzle_bank --puzzles_per_level 1000
+    
+    # Use custom curriculum config
+    python generate_curriculum_bank.py --config my_curriculum.json --bank_dir ./puzzle_bank --puzzles_per_level 1000
+"""
+
+import argparse
+import json
+from pathlib import Path
+from typing import Dict, List, Any
+
+from env.puzzle_bank import PuzzleBank, SpecKey
+from env.precompute_pipeline import PuzzleGenerator
+from env.curriculum_config import get_curriculum_specs_for_precomputation
+
+
+def load_curriculum_config(config_path: str) -> Dict[str, Any]:
+    """Load curriculum configuration from JSON file."""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def generate_curriculum_bank(
+    config_path: str = None,
+    bank_dir: str = "./puzzle_bank",
+    puzzles_per_level: int = 1000,
+    solver_config: Dict[str, int] = None,
+    verbose: bool = False
+) -> None:
+    """Generate puzzle bank for all curriculum levels.
+    
+    Args:
+        config_path: Path to curriculum config JSON file (optional, uses default if None)
+        bank_dir: Directory to store puzzle bank
+        puzzles_per_level: Number of puzzles to generate per level
+        solver_config: Solver configuration
+    """
+    if solver_config is None:
+        solver_config = {"max_depth": 10, "max_nodes": 100000}
+    
+    # Use shared curriculum config or load from file
+    if config_path and Path(config_path).exists():
+        config = load_curriculum_config(config_path)
+        levels = config["levels"]
+        print(f"Loaded curriculum from {config_path} with {len(levels)} levels")
+        
+        # Convert spec_key dictionaries to SpecKey objects
+        for level in levels:
+            if isinstance(level["spec_key"], dict):
+                spec_dict = level["spec_key"]
+                level["spec_key"] = SpecKey(
+                    height=spec_dict["height"],
+                    width=spec_dict["width"],
+                    num_robots=spec_dict["num_robots"],
+                    edge_t_per_quadrant=spec_dict["edge_t_per_quadrant"],
+                    central_l_per_quadrant=spec_dict["central_l_per_quadrant"],
+                    generator_rules_version=spec_dict["generator_rules_version"]
+                )
+    else:
+        # Use default curriculum from shared config
+        levels = get_curriculum_specs_for_precomputation()
+        print(f"Using default curriculum with {len(levels)} levels")
+    
+    print(f"Generating {puzzles_per_level} puzzles per level")
+    print(f"Bank directory: {bank_dir}")
+    print("=" * 60)
+    
+    # Create bank and generator
+    bank = PuzzleBank(bank_dir)
+    generator = PuzzleGenerator(bank, solver_config, verbose=verbose)
+    
+    # Generate puzzles for each level
+    total_puzzles = 0
+    for level in levels:
+        level_name = level["name"]
+        spec_key = level["spec_key"]  # Already a SpecKey object from shared config
+        
+        print(f"\nGenerating puzzles for Level {level['level']}: {level_name}")
+        print(f"  Spec: {spec_key.height}x{spec_key.width}, {spec_key.num_robots} robots")
+        print(f"  Optimal length: {level['min_optimal_length']}-{level['max_optimal_length']}")
+        print(f"  Robots moved: {level['min_robots_moved']}-{level['max_robots_moved']}")
+        
+        # Generate puzzles with criteria
+        criteria = {
+            'min_optimal_length': level['min_optimal_length'],
+            'max_depth': level['max_optimal_length'],
+            'max_optimal_length': level['max_optimal_length'],
+            'min_robots_moved': level['min_robots_moved'],
+            'max_robots_moved': level['max_robots_moved']
+        }
+        stats = generator.generate_puzzles_for_spec(spec_key, num_puzzles=puzzles_per_level, criteria=criteria)
+        
+        print(f"  Generated: {stats['generated']}")
+        print(f"  Solved: {stats['solved']}")
+        print(f"  Failed: {stats['failed']}")
+        print(f"  Success rate: {stats['success_rate']:.2%}")
+        print(f"  Time: {stats['elapsed_time']:.1f}s")
+        
+        total_puzzles += stats['solved']
+    
+    # Final bank statistics
+    bank_stats = bank.get_stats()
+    print(f"\n" + "=" * 60)
+    print(f"GENERATION COMPLETE")
+    print(f"=" * 60)
+    print(f"Total puzzles generated: {total_puzzles}")
+    print(f"Bank statistics:")
+    print(f"  Total puzzles: {bank_stats['total_puzzles']}")
+    print(f"  Partitions: {bank_stats['partition_count']}")
+    
+    if bank_stats['optimal_length_stats']:
+        ol_stats = bank_stats['optimal_length_stats']
+        print(f"  Optimal length range: {ol_stats['min']}-{ol_stats['max']}")
+        print(f"  Optimal length mean: {ol_stats['mean']:.1f}")
+    
+    if bank_stats['robots_moved_stats']:
+        rm_stats = bank_stats['robots_moved_stats']
+        print(f"  Robots moved range: {rm_stats['min']}-{rm_stats['max']}")
+        print(f"  Robots moved mean: {rm_stats['mean']:.1f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate puzzle bank for curriculum levels")
+    parser.add_argument("--config", help="Path to curriculum config JSON file (optional, uses default if not provided)")
+    parser.add_argument("--bank_dir", default="./puzzle_bank", help="Directory to store puzzle bank")
+    parser.add_argument("--puzzles_per_level", type=int, default=1000, help="Number of puzzles per level")
+    parser.add_argument("--max_depth", type=int, default=10, help="Solver max depth")
+    parser.add_argument("--max_nodes", type=int, default=100000, help="Solver max nodes")
+    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    
+    args = parser.parse_args()
+    
+    solver_config = {
+        "max_depth": args.max_depth,
+        "max_nodes": args.max_nodes
+    }
+    
+    generate_curriculum_bank(
+        config_path=args.config,
+        bank_dir=args.bank_dir,
+        puzzles_per_level=args.puzzles_per_level,
+        solver_config=solver_config,
+        verbose=args.verbose
+    )
+
+
+if __name__ == "__main__":
+    main()

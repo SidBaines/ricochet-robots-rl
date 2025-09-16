@@ -80,7 +80,7 @@ class RicochetRobotsEnv(GymEnvBase):
         step_penalty: float = -0.01,
         goal_reward: float = 1.0,
         noop_penalty: Optional[float] = None,
-        max_steps: int = 100,
+        max_steps: int = 10,
         fixed_layout: Optional[FixedLayout] = None,
         seed: Optional[int] = None,
         ensure_solvable: bool = False,

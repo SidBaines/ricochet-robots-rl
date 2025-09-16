@@ -5,7 +5,7 @@ import torch.nn as nn
 from typing import Dict, List, Optional, Tuple, Any
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.distributions import Distribution
+from stable_baselines3.common.distributions import Distribution, CategoricalDistribution
 from stable_baselines3.common.utils import get_device
 from gymnasium.spaces import Box, Discrete
 
@@ -64,6 +64,8 @@ class RecurrentActorCriticPolicy(BasePolicy):
         self._hidden_states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
         self._batch_size: Optional[int] = None
         self._device = get_device("auto")
+        # Pending episode_starts mask to reset hidden states per env on next forward
+        self._pending_episode_starts: Optional[torch.Tensor] = None
         
         # Create feature extractor first
         self.features_extractor = self.features_extractor_class(
@@ -148,6 +150,37 @@ class RecurrentActorCriticPolicy(BasePolicy):
         if batch_size is not None:
             self._batch_size = batch_size
         self._hidden_states = None
+
+    def set_episode_starts(self, episode_starts: torch.Tensor | List[bool]):
+        """Queue per-env resets to apply on the next forward/eval call.
+
+        episode_starts: shape [batch] boolean mask or list; True means env just reset.
+        """
+        if isinstance(episode_starts, list):
+            episode_starts = torch.tensor(episode_starts, dtype=torch.bool, device=self._device)
+        elif not isinstance(episode_starts, torch.Tensor):
+            raise TypeError("episode_starts must be a Tensor or list of bools")
+        self._pending_episode_starts = episode_starts.to(self._device).bool()
+
+    def _apply_pending_episode_starts(self, hidden_states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Zero hidden states for batch indices where episode_starts is True."""
+        if hidden_states is None or self._pending_episode_starts is None:
+            return hidden_states
+        mask = self._pending_episode_starts
+        # Clear pending mask after applying once
+        self._pending_episode_starts = None
+        # Each (h, c) has shape [B, C, H, W]; mask is [B]
+        for i, (h, c) in enumerate(hidden_states):
+            if not isinstance(h, torch.Tensor) or not isinstance(c, torch.Tensor):
+                return None
+            if mask.numel() != h.shape[0]:
+                # Batch mismatch; drop all states to avoid leakage
+                return None
+            if mask.any():
+                h[mask] = 0.0
+                c[mask] = 0.0
+                hidden_states[i] = (h, c)
+        return hidden_states
     
     def forward(
         self, 
@@ -182,6 +215,7 @@ class RecurrentActorCriticPolicy(BasePolicy):
             # Get current hidden states
             with profile("recurrent_policy_get_hidden_states", track_memory=True):
                 hidden_states = self._get_hidden_states(batch_size)
+                hidden_states = self._apply_pending_episode_starts(hidden_states)
             
             # Extract features using the recurrent feature extractor
             if hasattr(self.features_extractor, 'convlstm'):
@@ -213,12 +247,27 @@ class RecurrentActorCriticPolicy(BasePolicy):
                 log_prob = action_dist.log_prob(action)
             
             return action, value, log_prob
+
+    def get_distribution(self, obs: torch.Tensor) -> Distribution:
+        """SB3-compatible API: return the action distribution given observations."""
+        obs = self._preprocess_obs(obs)
+        batch_size = obs.shape[0]
+
+        hidden_states = self._get_hidden_states(batch_size)
+
+        if hasattr(self.features_extractor, 'convlstm'):
+            features, new_hidden_states = self.features_extractor(obs, hidden_states)
+            self._hidden_states = [(h.detach(), c.detach()) for h, c in new_hidden_states]
+        else:
+            features = self.features_extractor(obs)
+
+        action_logits = self.action_net(features)
+        return self._get_action_dist_from_latent(action_logits)
     
     def _get_action_dist_from_latent(self, latent_pi: torch.Tensor) -> Distribution:
-        """Get action distribution from latent policy."""
-        from stable_baselines3.common.distributions import CategoricalDistribution
-        dist = CategoricalDistribution(latent_pi)
-        dist.proba_distribution(latent_pi)
+        """Create a categorical action distribution from policy logits."""
+        dist = CategoricalDistribution(self.action_space.n)
+        dist.proba_distribution(action_logits=latent_pi)
         return dist
     
     def evaluate_actions(
@@ -253,6 +302,7 @@ class RecurrentActorCriticPolicy(BasePolicy):
             
             # Get current hidden states
             hidden_states = self._get_hidden_states(batch_size)
+            hidden_states = self._apply_pending_episode_starts(hidden_states)
             
             # Extract features
             if hasattr(self.features_extractor, 'convlstm'):
@@ -270,6 +320,8 @@ class RecurrentActorCriticPolicy(BasePolicy):
             action_dist = self._get_action_dist_from_latent(action_logits)
             
             # Compute log probability and entropy
+            if actions.dtype != torch.long:
+                actions = actions.long()
             log_prob = action_dist.log_prob(actions)
             entropy = action_dist.entropy()
             
@@ -332,6 +384,7 @@ class RecurrentActorCriticPolicy(BasePolicy):
             
             # Get current hidden states
             hidden_states = self._get_hidden_states(batch_size)
+            hidden_states = self._apply_pending_episode_starts(hidden_states)
             
             # Extract features using the recurrent feature extractor
             if hasattr(self.features_extractor, 'convlstm'):

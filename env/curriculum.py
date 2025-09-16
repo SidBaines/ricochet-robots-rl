@@ -3,16 +3,19 @@ Curriculum Learning Wrapper for Ricochet Robots Environment
 
 This module provides a curriculum wrapper that progressively increases difficulty
 during training by adjusting environment parameters based on agent performance.
+Now supports both online solving and bank-based curriculum learning.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass
 from collections import deque
 
 from .ricochet_env import RicochetRobotsEnv, GymEnvBase
+from .puzzle_bank import PuzzleBank, SpecKey
+from .criteria_env import CriteriaFilteredEnv, PuzzleCriteria, BankCurriculumManager
 
 
 class OptimalLengthFilteredEnv(RicochetRobotsEnv):
@@ -501,3 +504,199 @@ def create_curriculum_wrapper(
         curriculum_manager=curriculum_manager,
         verbose=verbose
     )
+
+
+# Bank-based curriculum functions
+
+def create_bank_curriculum_levels() -> List[Dict[str, Any]]:
+    """Create curriculum levels for bank-based learning.
+    
+    Returns:
+        List of curriculum level specifications
+    """
+    from .curriculum_config import get_bank_curriculum_levels
+    return get_bank_curriculum_levels()
+
+
+def create_bank_curriculum_manager(
+    bank: PuzzleBank,
+    curriculum_levels: Optional[List[Dict[str, Any]]] = None,
+    success_rate_threshold: float = 0.8,
+    min_episodes_per_level: int = 100,
+    success_rate_window_size: int = 200,
+    advancement_check_frequency: int = 50,
+    verbose: bool = True
+) -> BankCurriculumManager:
+    """Create a bank-based curriculum manager.
+    
+    Args:
+        bank: Puzzle bank to sample from
+        curriculum_levels: Optional custom curriculum levels
+        success_rate_threshold: Success rate required to advance
+        min_episodes_per_level: Minimum episodes before advancement check
+        success_rate_window_size: Window size for success rate calculation
+        advancement_check_frequency: How often to check for advancement
+        verbose: Whether to print progress
+    
+    Returns:
+        Configured BankCurriculumManager instance
+    """
+    if curriculum_levels is None:
+        curriculum_levels = create_bank_curriculum_levels()
+    
+    return BankCurriculumManager(
+        bank=bank,
+        curriculum_levels=curriculum_levels,
+        success_rate_threshold=success_rate_threshold,
+        min_episodes_per_level=min_episodes_per_level,
+        success_rate_window_size=success_rate_window_size,
+        advancement_check_frequency=advancement_check_frequency,
+        verbose=verbose
+    )
+
+
+def create_bank_curriculum_wrapper(
+    bank: PuzzleBank,
+    curriculum_manager: BankCurriculumManager,
+    obs_mode: str = "rgb_image",
+    channels_first: bool = True,
+    render_mode: Optional[str] = None,
+    verbose: bool = True
+) -> CriteriaFilteredEnv:
+    """Create a bank-based curriculum wrapper.
+    
+    Args:
+        bank: Puzzle bank to sample from
+        curriculum_manager: Bank curriculum manager
+        obs_mode: Observation mode
+        channels_first: Whether to use channels-first format
+        render_mode: Rendering mode
+        verbose: Whether to print debug information
+    
+    Returns:
+        Configured CriteriaFilteredEnv instance
+    """
+    # Get current criteria from curriculum manager
+    criteria = curriculum_manager.get_current_criteria()
+    
+    return CriteriaFilteredEnv(
+        bank=bank,
+        criteria=criteria,
+        obs_mode=obs_mode,
+        channels_first=channels_first,
+        render_mode=render_mode,
+        verbose=verbose
+    )
+
+
+class BankCurriculumWrapper(GymEnvBase):
+    """
+    Wrapper that implements bank-based curriculum learning by progressively
+    increasing difficulty based on agent performance.
+    
+    This wrapper uses the puzzle bank to provide puzzles matching specific
+    criteria without requiring online solving.
+    """
+    
+    def __init__(
+        self,
+        bank: PuzzleBank,
+        curriculum_manager: BankCurriculumManager,
+        obs_mode: str = "rgb_image",
+        channels_first: bool = True,
+        render_mode: Optional[str] = None,
+        verbose: bool = True
+    ):
+        """Initialize bank curriculum wrapper.
+        
+        Args:
+            bank: Puzzle bank to sample from
+            curriculum_manager: Bank curriculum manager
+            obs_mode: Observation mode
+            channels_first: Whether to use channels-first format
+            render_mode: Rendering mode
+            verbose: Whether to print debug information
+        """
+        self.bank = bank
+        self.curriculum_manager = curriculum_manager
+        self.obs_mode = obs_mode
+        self.channels_first = channels_first
+        self.render_mode = render_mode
+        self.verbose = verbose
+        
+        # Create current environment
+        self._current_env = None
+        self._last_known_level = self.curriculum_manager.current_level
+        self._create_current_env()
+        
+        if self.verbose:
+            level = self.curriculum_manager.curriculum_levels[self.curriculum_manager.current_level]
+            print(f"Bank curriculum wrapper initialized at level {self.curriculum_manager.current_level}: {level['name']}")
+    
+    def _create_current_env(self) -> None:
+        """Create a new environment instance with current level criteria."""
+        criteria = self.curriculum_manager.get_current_criteria()
+        
+        self._current_env = CriteriaFilteredEnv(
+            bank=self.bank,
+            criteria=criteria,
+            obs_mode=self.obs_mode,
+            channels_first=self.channels_first,
+            render_mode=self.render_mode,
+            verbose=self.verbose
+        )
+    
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        """Reset the environment and return initial observation."""
+        return self._current_env.reset(seed=seed, options=options)
+    
+    def step(self, action):
+        """Step the environment and track success for curriculum progression."""
+        obs, reward, terminated, truncated, info = self._current_env.step(action)
+        
+        # Track episode completion and success
+        if terminated or truncated:
+            success = info.get('is_success', False) and not truncated
+            self.curriculum_manager.record_episode_result(success)
+            
+            # Check if curriculum level has changed and recreate environment if needed
+            if self.curriculum_manager.current_level != self._last_known_level:
+                self._create_current_env()
+                self._last_known_level = self.curriculum_manager.current_level
+        
+        return obs, reward, terminated, truncated, info
+    
+    def get_current_level(self) -> int:
+        """Get current curriculum level."""
+        return self.curriculum_manager.get_current_level()
+    
+    def get_success_rate(self) -> float:
+        """Get current success rate over the sliding window."""
+        return self.curriculum_manager.get_success_rate()
+    
+    def get_episodes_at_level(self) -> int:
+        """Get number of episodes completed at current level."""
+        return self.curriculum_manager.get_episodes_at_level()
+    
+    def get_curriculum_stats(self) -> Dict[str, Any]:
+        """Get comprehensive curriculum statistics."""
+        return self.curriculum_manager.get_stats()
+    
+    # Delegate other methods to current environment
+    def render(self, *args, **kwargs):
+        return self._current_env.render(*args, **kwargs)
+    
+    def close(self, *args, **kwargs):
+        return self._current_env.close(*args, **kwargs)
+    
+    @property
+    def action_space(self):
+        return self._current_env.action_space
+    
+    @property
+    def observation_space(self):
+        return self._current_env.observation_space
+    
+    @property
+    def metadata(self):
+        return self._current_env.metadata

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 from .hub import MonitoringHub
 
@@ -139,8 +139,9 @@ class OptimalityGapEvaluator:
 
 
 class TrajectoryRecorder:
-    def __init__(self, episodes: int = 5) -> None:
+    def __init__(self, episodes: int = 5, capture_render: bool = False) -> None:
         self.episodes = int(episodes)
+        self.capture_render = bool(capture_render)
 
     def record(self, make_env_fn, model) -> List[Dict[str, Any]]:
         trajectories: List[Dict[str, Any]] = []
@@ -150,9 +151,24 @@ class TrajectoryRecorder:
             done = False
             trunc = False
             steps: List[Dict[str, Any]] = []
+            frames: List[Any] = []  # type: ignore
+            if self.capture_render:
+                try:
+                    frame0 = env.render()
+                    if frame0 is not None:
+                        frames.append(frame0)
+                except Exception:
+                    pass
             while not (done or trunc):
                 action, _ = model.predict(obs, deterministic=True)
                 next_obs, reward, done, trunc, info = env.step(int(action))
+                if self.capture_render:
+                    try:
+                        f = env.render()
+                        if f is not None:
+                            frames.append(f)
+                    except Exception:
+                        pass
                 steps.append({
                     "action": int(action),
                     "reward": float(reward),
@@ -163,9 +179,58 @@ class TrajectoryRecorder:
                 obs = next_obs
             trajectories.append({
                 "steps": steps,
-                "success": bool(info.get("is_success", False))
+                "success": bool(info.get("is_success", False)),
+                "frames": frames if self.capture_render else None,
             })
             env.close()
         return trajectories
 
+
+
+def rollout_episode_with_recurrent_support(env_factory: Callable[[], Any], model: Any, deterministic: bool = True) -> Dict[str, Any]:
+    """Run a single episode handling both sb3-contrib RecurrentPPO and custom recurrent policies.
+
+    Returns a dict with success flag and length.
+    """
+    env = env_factory()
+    obs, info = env.reset()
+    done = False
+    trunc = False
+    steps = 0
+
+    # sb3-contrib RecurrentPPO state tracking
+    lstm_state = None
+    episode_starts = True
+
+    # Custom policy detection
+    policy_obj = getattr(model, 'policy', model)
+    custom_recurrent = hasattr(policy_obj, 'set_episode_starts')
+
+    while not (done or trunc):
+        if hasattr(model, 'predict'):
+            # Try recurrent signature first
+            try:
+                action_out = model.predict(obs, state=lstm_state, episode_start=episode_starts, deterministic=deterministic)  # type: ignore[arg-type]
+                if isinstance(action_out, tuple) and len(action_out) == 2 and not isinstance(action_out[1], (tuple, list)):
+                    action, _ = action_out
+                else:
+                    action, lstm_state = action_out  # type: ignore[assignment]
+            except TypeError:
+                # Fallback for feedforward models
+                action, _ = model.predict(obs, deterministic=deterministic)
+        else:
+            # Assume custom policy-like API with _predict
+            if custom_recurrent:
+                policy_obj.set_episode_starts([episode_starts])
+            action, _ = policy_obj._predict(obs, deterministic=deterministic)  # type: ignore[attr-defined]
+
+        obs, _, done, trunc, info = env.step(int(action))
+        if custom_recurrent:
+            policy_obj.set_episode_starts([done or trunc])
+        episode_starts = done or trunc
+        steps += 1
+
+    result = {"is_success": info.get("is_success", False), "length": steps}
+    env.close()
+    return result
 

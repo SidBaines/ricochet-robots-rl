@@ -734,4 +734,506 @@ print(f"  Episodes at level: {final_stats['episodes_at_level']}")
 print(f"  Total episodes: {final_stats['total_episodes']}")
 
 
+#%%
+# =============================================================================
+# PUZZLE BANK SYSTEM EXPLORATION CELLS
+# =============================================================================
+# These cells demonstrate the new bank-based curriculum system that uses
+# precomputed puzzles instead of online solving during training.
+
+#%%
+# Test basic puzzle bank functionality
+print("TESTING PUZZLE BANK SYSTEM")
+print("=" * 50)
+
+from env.puzzle_bank import PuzzleBank, SpecKey
+from env.precompute_pipeline import PuzzleGenerator
+from env.criteria_env import CriteriaFilteredEnv, PuzzleCriteria
+from env.curriculum import create_bank_curriculum_manager, BankCurriculumWrapper
+if 0:
+    # Create a temporary bank for testing
+    import tempfile
+
+    # Use a temporary directory for testing
+    temp_bank_dir = tempfile.mkdtemp(prefix="test_bank_")
+    print(f"Using temporary bank directory: {temp_bank_dir}")
+
+    # Create bank
+    bank = PuzzleBank(temp_bank_dir)
+    print(f"Bank created with {bank.get_puzzle_count()} puzzles")
+    # Generate some test puzzles
+    print("GENERATING TEST PUZZLES")
+    print("=" * 30)
+
+    # Define a simple spec for testing
+    test_spec = SpecKey(
+        height=6, width=6, num_robots=1,
+        edge_t_per_quadrant=1, central_l_per_quadrant=1
+    )
+
+    # Create generator
+    solver_config = {"max_depth": 30, "max_nodes": 20000}
+    generator = PuzzleGenerator(bank, solver_config)
+
+    # Generate a small number of puzzles
+    print(f"Generating puzzles for spec: {test_spec}")
+    stats = generator.generate_puzzles_for_spec(test_spec, num_puzzles=10)
+
+    print(f"Generation complete:")
+    print(f"  Requested: {stats['requested']}")
+    print(f"  Generated: {stats['generated']}")
+    print(f"  Solved: {stats['solved']}")
+    print(f"  Failed: {stats['failed']}")
+    print(f"  Success rate: {stats['success_rate']:.2%}")
+
+    # Check bank stats
+    bank_stats = bank.get_stats()
+    print(f"\nBank statistics:")
+    print(f"  Total puzzles: {bank_stats['total_puzzles']}")
+    print(f"  Partitions: {bank_stats['partition_count']}")
+
+# %%
+if 0:
+    from env.puzzle_bank import PuzzleBank, SpecKey
+
+    bank = PuzzleBank("./puzzle_bank")
+    spec = SpecKey(height=16, width=16, num_robots=1, edge_t_per_quadrant=2, central_l_per_quadrant=2)
+
+    # Count puzzles matching specific criteria
+    puzzles = list(bank.query_puzzles(
+        spec_key=spec,
+        min_optimal_length=1,
+        max_optimal_length=5,
+        min_robots_moved=1,
+        max_robots_moved=1
+    ))
+    count = len(puzzles)
+    print(f"Puzzles matching criteria: {count}")
+
+#%%
+# Test criteria filtering
+print("TESTING CRITERIA FILTERING")
+print("=" * 40)
+bank = PuzzleBank("./puzzle_bank")
+
+test_spec = SpecKey(
+    height=16, width=16, num_robots=1,
+    edge_t_per_quadrant=2, central_l_per_quadrant=2
+)
+# Define criteria for filtering
+criteria = PuzzleCriteria(
+    spec_key=test_spec,
+    min_optimal_length=1,
+    max_optimal_length=4,
+    min_robots_moved=1,
+    max_robots_moved=1
+)
+
+print(f"Criteria: {criteria}")
+print(f"  Spec: {criteria.spec_key}")
+print(f"  Optimal length: {criteria.min_optimal_length}-{criteria.max_optimal_length}")
+print(f"  Robots moved: {criteria.min_robots_moved}-{criteria.max_robots_moved}")
+
+# Query puzzles matching criteria
+matching_puzzles = list(bank.query_puzzles(
+    spec_key=criteria.spec_key,
+    min_optimal_length=criteria.min_optimal_length,
+    max_optimal_length=criteria.max_optimal_length,
+    min_robots_moved=criteria.min_robots_moved,
+    max_robots_moved=criteria.max_robots_moved
+))
+
+print(f"\nFound {len(matching_puzzles)} puzzles matching criteria:")
+for i, puzzle in enumerate(matching_puzzles[:5]):  # Show first 5
+    print(f"  Puzzle {i+1}: seed={puzzle.seed}, length={puzzle.optimal_length}, robots={puzzle.robots_moved}")
+
+#%%
+# Test criteria-filtered environment
+print("TESTING CRITERIA-FILTERED ENVIRONMENT")
+print("=" * 50)
+
+# Create criteria-filtered environment
+criteria_env = CriteriaFilteredEnv(
+    bank=bank,
+    criteria=criteria,
+    obs_mode="rgb_image",  # Use RGB for fixed observation shape
+    channels_first=True,
+    verbose=True
+)
+
+print(f"Criteria-filtered environment created")
+print(f"Action space: {criteria_env.action_space}")
+print(f"Observation space: {criteria_env.observation_space}")
+
+# Test reset
+print(f"\nTesting reset:")
+obs, info = criteria_env.reset()
+print(f"Observation shape: {obs.shape}")
+print(f"Reset info keys: {list(info.keys())}")
+
+if 'bank_metadata' in info and info['bank_metadata'] is not None:
+    metadata = info['bank_metadata']
+    print(f"Puzzle metadata:")
+    print(f"  Seed: {metadata.seed}")
+    print(f"  Optimal length: {metadata.optimal_length}")
+    print(f"  Robots moved: {metadata.robots_moved}")
+
+# Test step
+print(f"\nTesting step:")
+action = 0  # First action
+obs, reward, terminated, truncated, step_info = criteria_env.step(action)
+print(f"Step result: reward={reward}, terminated={terminated}, truncated={truncated}")
+
+# Test render
+frame = criteria_env.render()
+if frame is not None:
+    print(f"Render frame shape: {frame.shape}")
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6, 6))
+        plt.imshow(frame)
+        plt.title("Criteria-Filtered Environment - RGB Render")
+        plt.axis("off")
+        plt.show()
+    except ImportError:
+        print("matplotlib not available to display RGB frame")
+
+#%%
+# Test bank-based curriculum manager
+print("TESTING BANK-BASED CURRICULUM MANAGER")
+print("=" * 50)
+
+# Create curriculum levels for testing
+test_curriculum_levels = [
+    {
+        "level": 0,
+        "name": "Test Easy",
+        "spec_key": SpecKey(height=4, width=4, num_robots=1, edge_t_per_quadrant=0, central_l_per_quadrant=0),
+        "min_optimal_length": 1,
+        "max_optimal_length": 3,
+        "min_robots_moved": 1,
+        "max_robots_moved": 1
+    },
+    {
+        "level": 1,
+        "name": "Test Medium",
+        "spec_key": SpecKey(height=6, width=6, num_robots=1, edge_t_per_quadrant=1, central_l_per_quadrant=1),
+        "min_optimal_length": 2,
+        "max_optimal_length": 5,
+        "min_robots_moved": 1,
+        "max_robots_moved": 1
+    }
+]
+
+# Generate puzzles for both levels
+for level in test_curriculum_levels:
+    print(f"Generating puzzles for {level['name']}...")
+    generator.generate_puzzles_for_spec(level['spec_key'], num_puzzles=15)
+
+# Create bank curriculum manager
+bank_manager = create_bank_curriculum_manager(
+    bank=bank,
+    curriculum_levels=test_curriculum_levels,
+    success_rate_threshold=0.6,  # Lower threshold for testing
+    min_episodes_per_level=5,
+    success_rate_window_size=10,
+    advancement_check_frequency=5,
+    verbose=True
+)
+
+print(f"Bank curriculum manager created")
+print(f"Current level: {bank_manager.get_current_level()}")
+print(f"Success rate: {bank_manager.get_success_rate():.3f}")
+
+#%%
+# Test bank curriculum wrapper
+print("TESTING BANK CURRICULUM WRAPPER")
+print("=" * 50)
+
+# Create bank curriculum wrapper
+bank_wrapper = BankCurriculumWrapper(
+    bank=bank,
+    curriculum_manager=bank_manager,
+    obs_mode="rgb_image",
+    channels_first=True,
+    verbose=True
+)
+
+print(f"Bank curriculum wrapper created")
+print(f"Current level: {bank_wrapper.get_current_level()}")
+print(f"Success rate: {bank_wrapper.get_success_rate():.3f}")
+
+# Test wrapper functionality
+print(f"\nTesting wrapper reset:")
+obs, info = bank_wrapper.reset()
+print(f"Observation shape: {obs.shape}")
+print(f"Reset info keys: {list(info.keys())}")
+
+if 'criteria' in info:
+    criteria_info = info['criteria']
+    print(f"Current criteria:")
+    print(f"  Spec: {criteria_info['spec_key']}")
+    print(f"  Optimal length: {criteria_info['min_optimal_length']}-{criteria_info['max_optimal_length']}")
+    print(f"  Robots moved: {criteria_info['min_robots_moved']}-{criteria_info['max_robots_moved']}")
+
+# Test step
+print(f"\nTesting wrapper step:")
+action = 0
+obs, reward, terminated, truncated, step_info = bank_wrapper.step(action)
+print(f"Step result: reward={reward}, terminated={terminated}, truncated={truncated}")
+
+# Test render
+frame = bank_wrapper.render()
+if frame is not None:
+    print(f"Render frame shape: {frame.shape}")
+
+#%%
+# Test curriculum advancement with bank
+print("TESTING BANK CURRICULUM ADVANCEMENT")
+print("=" * 50)
+
+# Reset manager to level 0
+bank_manager.current_level = 0
+bank_manager.level_start_episode = 0
+bank_manager.success_rate_window.clear()
+bank_manager.episode_count = 0
+
+print(f"Starting at level: {bank_manager.get_current_level()}")
+
+# Simulate episodes with varying success rates
+NUM_EPISODES = 50
+SUCCESS_RATE_PATTERN = [0.4, 0.7, 0.9]  # Success rates for different phases
+
+print(f"\nSimulating {NUM_EPISODES} episodes...")
+
+for episode in range(NUM_EPISODES):
+    # Determine success rate based on episode number
+    phase = min(episode // 20, len(SUCCESS_RATE_PATTERN) - 1)
+    success_rate = SUCCESS_RATE_PATTERN[phase]
+    
+    # Simulate episode result
+    success = np.random.random() < success_rate
+    bank_manager.record_episode_result(success)
+    
+    # Check for level changes
+    current_level = bank_manager.get_current_level()
+    if episode > 0 and current_level != bank_manager.current_level:
+        print(f"Episode {episode}: Advanced to level {current_level}")
+    
+    # Print progress every 10 episodes
+    if episode % 10 == 0:
+        stats = bank_manager.get_stats()
+        print(f"Episode {episode}: Level {stats['current_level']}, "
+              f"Success rate: {stats['success_rate']:.3f}, "
+              f"Episodes at level: {stats['episodes_at_level']}")
+
+print(f"\nFinal bank curriculum state:")
+final_stats = bank_manager.get_stats()
+print(f"  Current level: {final_stats['current_level']}")
+print(f"  Level name: {final_stats['level_name']}")
+print(f"  Success rate: {final_stats['success_rate']:.3f}")
+print(f"  Episodes at level: {final_stats['episodes_at_level']}")
+print(f"  Total episodes: {final_stats['total_episodes']}")
+
+#%%
+# Compare bank vs online curriculum
+print("COMPARING BANK VS ONLINE CURRICULUM")
+print("=" * 50)
+
+# Create online curriculum manager for comparison
+from env.curriculum import create_curriculum_manager, create_default_curriculum
+
+online_config = create_default_curriculum()
+online_manager = create_curriculum_manager(online_config, initial_level=0, verbose=False)
+
+print("Online curriculum levels:")
+for i, level in enumerate(online_config.levels):
+    print(f"  Level {i}: {level.name} ({level.height}x{level.width}, {level.num_robots} robots)")
+
+print(f"\nBank curriculum levels:")
+for i, level in enumerate(test_curriculum_levels):
+    spec = level['spec_key']
+    print(f"  Level {i}: {level['name']} ({spec.height}x{spec.width}, {spec.num_robots} robots)")
+
+print(f"\nKey differences:")
+print(f"  Online: Uses solver during training (slower, more diverse)")
+print(f"  Bank: Uses precomputed puzzles (faster, more controlled)")
+print(f"  Online: Variable observation shapes across levels")
+print(f"  Bank: Fixed observation shapes with rgb_image mode")
+
+#%%
+# Test bank sampling strategies
+print("TESTING BANK SAMPLING STRATEGIES")
+print("=" * 50)
+
+# Test sampling with different criteria
+test_criteria = [
+    PuzzleCriteria(test_spec, min_optimal_length=1, max_optimal_length=2),
+    PuzzleCriteria(test_spec, min_optimal_length=3, max_optimal_length=4),
+    PuzzleCriteria(test_spec, min_optimal_length=5, max_optimal_length=6),
+]
+
+for i, criteria in enumerate(test_criteria):
+    print(f"\nTesting criteria {i+1}: length {criteria.min_optimal_length}-{criteria.max_optimal_length}")
+    
+    # Sample puzzles using bank.get_puzzles
+    puzzles = list(bank.query_puzzles(
+        spec_key=criteria.spec_key,
+        min_optimal_length=criteria.min_optimal_length,
+        max_optimal_length=criteria.max_optimal_length,
+        min_robots_moved=criteria.min_robots_moved,
+        max_robots_moved=criteria.max_robots_moved,
+        limit=3
+    ))
+    
+    if puzzles:
+        puzzle = puzzles[0]  # Take first puzzle
+        print(f"  Found puzzle: seed={puzzle.seed}, length={puzzle.optimal_length}, robots={puzzle.robots_moved}")
+        print(f"  Found {len(puzzles)} total puzzles matching criteria")
+    else:
+        print(f"  No puzzle found matching criteria")
+
+#%%
+# Clean up temporary bank
+print("CLEANING UP")
+print("=" * 20)
+
+import shutil
+shutil.rmtree(temp_bank_dir)
+print(f"Removed temporary bank directory: {temp_bank_dir}")
+
+print(f"\nBank system testing complete!")
+print(f"To use in training, run:")
+print(f"  python precompute_bank.py --bank_dir ./puzzle_bank --verbose")
+print(f"  python train_agent.py --curriculum --use_bank_curriculum --bank_dir ./puzzle_bank --obs-mode rgb_image")
+
+# %%
+# Single level render
+bank = PuzzleBank("./puzzle_bank")
+test_spec = SpecKey(
+    height=16, width=16, num_robots=1,
+    edge_t_per_quadrant=2, central_l_per_quadrant=2
+)
+# Define criteria for filtering
+criteria = PuzzleCriteria(
+    spec_key=test_spec,
+    min_optimal_length=1,
+    max_optimal_length=1,
+    min_robots_moved=1,
+    max_robots_moved=1
+)
+
+print(f"Criteria: {criteria}")
+print(f"  Spec: {criteria.spec_key}")
+print(f"  Optimal length: {criteria.min_optimal_length}-{criteria.max_optimal_length}")
+print(f"  Robots moved: {criteria.min_robots_moved}-{criteria.max_robots_moved}")
+
+# Query puzzles matching criteria
+matching_puzzles = list(bank.query_puzzles(
+    spec_key=criteria.spec_key,
+    min_optimal_length=criteria.min_optimal_length,
+    max_optimal_length=criteria.max_optimal_length,
+    min_robots_moved=criteria.min_robots_moved,
+    max_robots_moved=criteria.max_robots_moved
+))
+
+print(f"\nFound {len(matching_puzzles)} puzzles matching criteria:")
+for i, puzzle in enumerate(matching_puzzles[:1]):  # Show first 1
+    print(f"  Puzzle {i+1}: seed={puzzle.seed}, length={puzzle.optimal_length}, robots={puzzle.robots_moved}")
+    # Actually use the seed to generate the puzzle
+    env = RicochetRobotsEnv(
+        height=puzzle.spec_key.height,
+        width=puzzle.spec_key.width,
+        num_robots=puzzle.spec_key.num_robots,
+        edge_t_per_quadrant=puzzle.spec_key.edge_t_per_quadrant,
+        central_l_per_quadrant=puzzle.spec_key.central_l_per_quadrant,
+        seed=puzzle.seed,
+        obs_mode="image",
+        channels_first=True,
+        render_mode="rgb"
+    )
+    env.reset()
+    frame = env.render()
+    if frame is not None:
+        # print(f"Rendered puzzle: {frame}")
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+            plt.figure(figsize=(4, 4))
+            plt.imshow(frame)
+            plt.title("Ricochet Robots - RGB Render")
+            plt.axis("off")
+            plt.show()
+        except ImportError:
+            print("matplotlib not available to display RGB frame; shape:", getattr(frame, "shape", None))
+
+
+
+
+# %%
+# Loop over levels and sample/render some puzzles
+# Generate the curriculum levels
+from env.precompute_pipeline import CurriculumSpecGenerator
+curriculum_levels = CurriculumSpecGenerator.create_curriculum_specs()
+print(f"Curriculum levels: {curriculum_levels}")
+
+# Loop over levels and sample/render some puzzles
+for level in curriculum_levels:
+    print(f"Level: {level['name']}")
+    # print(f"  Spec: {level['spec_key']}")
+    # print(f"  Optimal length: {level['min_optimal_length']}-{level['max_optimal_length']}")
+    # print(f"  Robots moved: {level['min_robots_moved']}-{level['max_robots_moved']}")
+
+    bank = PuzzleBank("./puzzle_bank")
+    # Define criteria for filtering
+    criteria = PuzzleCriteria(
+        spec_key=level['spec_key'],
+        min_optimal_length=level['min_optimal_length'],
+        max_optimal_length=level['max_optimal_length'],
+        min_robots_moved=level['min_robots_moved'],
+        max_robots_moved=level['max_robots_moved']
+    )
+
+    # print(f"Criteria: {criteria}")
+    # print(f"  Spec: {criteria.spec_key}")
+    # print(f"  Optimal length: {criteria.min_optimal_length}-{criteria.max_optimal_length}")
+    # print(f"  Robots moved: {criteria.min_robots_moved}-{criteria.max_robots_moved}")
+
+    # Query puzzles matching criteria
+    matching_puzzles = list(bank.query_puzzles(
+        spec_key=criteria.spec_key,
+        min_optimal_length=criteria.min_optimal_length,
+        max_optimal_length=criteria.max_optimal_length,
+        min_robots_moved=criteria.min_robots_moved,
+        max_robots_moved=criteria.max_robots_moved
+    ))
+
+    print(f"\nFound {len(matching_puzzles)} puzzles matching criteria:")
+    for i, puzzle in enumerate(matching_puzzles[:1]):  # Show first 1
+        print(f"  Puzzle {i+1}: seed={puzzle.seed}, length={puzzle.optimal_length}, robots={puzzle.robots_moved}")
+        # Actually use the seed to generate the puzzle
+        env = RicochetRobotsEnv(
+            height=puzzle.spec_key.height,
+            width=puzzle.spec_key.width,
+            num_robots=puzzle.spec_key.num_robots,
+            edge_t_per_quadrant=puzzle.spec_key.edge_t_per_quadrant,
+            central_l_per_quadrant=puzzle.spec_key.central_l_per_quadrant,
+            seed=puzzle.seed,
+            obs_mode="image",
+            channels_first=True,
+            render_mode="rgb"
+        )
+        env.reset()
+        frame = env.render()
+        if frame is not None:
+            # print(f"Rendered puzzle: {frame}")
+            try:
+                import matplotlib.pyplot as plt  # type: ignore
+                plt.figure(figsize=(4, 4))
+                plt.imshow(frame)
+                plt.title("Ricochet Robots - RGB Render")
+                plt.axis("off")
+                plt.show()
+            except ImportError:
+                print("matplotlib not available to display RGB frame; shape:", getattr(frame, "shape", None))
+
 # %%
