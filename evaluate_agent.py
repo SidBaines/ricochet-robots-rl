@@ -20,7 +20,9 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--env-mode", choices=["random", "v0", "v1"], default="random")
     parser.add_argument("--obs-mode", choices=["image", "symbolic"], default="image")
-    parser.add_argument("--recurrent", action="store_true", help="Load sb3-contrib RecurrentPPO model or custom recurrent policy")
+    parser.add_argument("--recurrent", action="store_true", help="Load sb3-contrib RecurrentPPO model (CnnLstmPolicy)")
+    parser.add_argument("--drc", action="store_true", help="Load DRC model trained with sb3-contrib RecurrentPPO")
+    parser.add_argument("--resnet", action="store_true", help="Load ResNet baseline checkpoint (feed-forward)")
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--height", type=int, default=8)
     parser.add_argument("--width", type=int, default=8)
@@ -34,18 +36,24 @@ def main() -> None:
         RecurrentPPO = importlib.import_module("sb3_contrib").RecurrentPPO  # type: ignore[attr-defined]
     except Exception:
         RecurrentPPO = None  # type: ignore
-    # Try to import custom recurrent policy for registration
+    # Import DRC policy class so checkpoints referencing it can load
     try:
-        from models.recurrent_policy import RecurrentActorCriticPolicy  # type: ignore
-        # Registering custom policies for SB3 load if needed happens implicitly by import
-        _custom_policy_available = True
+        from models.drc_policy import DRCRecurrentPolicy  # type: ignore
+        _drc_policy_available = True
     except Exception:
-        RecurrentActorCriticPolicy = None  # type: ignore
-        _custom_policy_available = False
+        DRCRecurrentPolicy = None  # type: ignore
+        _drc_policy_available = False
+    # Import ResNet extractor so PPO can instantiate custom extractor if referenced
+    try:
+        from models.resnet import ResNetFeaturesExtractor  # type: ignore
+        _resnet_available = True
+    except Exception:
+        ResNetFeaturesExtractor = None  # type: ignore
+        _resnet_available = False
 
     env = make_single_env(args)
     policy_type = "CnnPolicy" if args.obs_mode == "image" else "MlpPolicy"
-    if args.recurrent and RecurrentPPO is not None:
+    if (args.recurrent or args.drc) and RecurrentPPO is not None:
         model = RecurrentPPO.load(args.model_path)  # type: ignore[assignment]
     else:
         # Attempt to load with SB3; if the checkpoint references a custom policy, the prior import makes it available

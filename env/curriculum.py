@@ -356,6 +356,10 @@ class CurriculumWrapper(GymEnvBase):
     def close(self, *args, **kwargs):
         return self._current_env.close(*args, **kwargs)
     
+    def get_board(self):
+        """Forward underlying board for visualization utilities."""
+        return self._current_env.get_board()
+    
     @property
     def action_space(self):
         return self._current_env.action_space
@@ -604,6 +608,7 @@ class BankCurriculumWrapper(GymEnvBase):
         curriculum_manager: BankCurriculumManager,
         obs_mode: str = "rgb_image",
         channels_first: bool = True,
+        include_noop: bool = False,
         render_mode: Optional[str] = None,
         verbose: bool = True
     ):
@@ -621,6 +626,7 @@ class BankCurriculumWrapper(GymEnvBase):
         self.curriculum_manager = curriculum_manager
         self.obs_mode = obs_mode
         self.channels_first = channels_first
+        self.include_noop = include_noop
         self.render_mode = render_mode
         self.verbose = verbose
         
@@ -642,6 +648,7 @@ class BankCurriculumWrapper(GymEnvBase):
             criteria=criteria,
             obs_mode=self.obs_mode,
             channels_first=self.channels_first,
+            include_noop=self.include_noop,
             render_mode=self.render_mode,
             verbose=self.verbose
         )
@@ -688,6 +695,10 @@ class BankCurriculumWrapper(GymEnvBase):
     
     def close(self, *args, **kwargs):
         return self._current_env.close(*args, **kwargs)
+    
+    def get_board(self):
+        """Forward underlying board for visualization utilities."""
+        return self._current_env.get_board()
     
     @property
     def action_space(self):

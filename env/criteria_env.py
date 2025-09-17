@@ -73,6 +73,7 @@ class CriteriaFilteredEnv(GymEnvBase):
         criteria: PuzzleCriteria,
         obs_mode: str = "rgb_image",
         channels_first: bool = True,
+        include_noop: bool = False,
         render_mode: Optional[str] = None,
         verbose: bool = False
     ):
@@ -90,6 +91,7 @@ class CriteriaFilteredEnv(GymEnvBase):
         self.criteria = criteria
         self.obs_mode = obs_mode
         self.channels_first = channels_first
+        self.include_noop = include_noop
         self.verbose = verbose
         
         # Initialize sampler
@@ -144,6 +146,7 @@ class CriteriaFilteredEnv(GymEnvBase):
                 fixed_layout=fixed_layout,
                 obs_mode=self.obs_mode,
                 channels_first=self.channels_first,
+                include_noop=self.include_noop,
                 render_mode=self.render_mode
             )
             
@@ -168,6 +171,7 @@ class CriteriaFilteredEnv(GymEnvBase):
             ensure_solvable=True,  # Fallback to solvable generation
             obs_mode=self.obs_mode,
             channels_first=self.channels_first,
+            include_noop=self.include_noop,
             render_mode=self.render_mode
         )
         
@@ -262,6 +266,12 @@ class CriteriaFilteredEnv(GymEnvBase):
         if self._current_env is None:
             return None
         return self._current_env.render(*args, **kwargs)
+
+    def get_board(self):
+        """Forward underlying board for visualization utilities."""
+        if self._current_env is None:
+            raise RuntimeError("Environment not initialized")
+        return self._current_env.get_board()
     
     def close(self, *args, **kwargs):
         """Close environment."""

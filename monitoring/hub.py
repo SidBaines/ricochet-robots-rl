@@ -55,6 +55,16 @@ class MonitoringHub:
         for b in self._backends:
             b.record_image(key, image, step)
 
+    def log_video(self, key: str, video_frames: Any, step: Optional[int] = None, fps: int = 4) -> None:
+        for b in self._backends:
+            # Not all backends may implement record_video; guard accordingly
+            rec = getattr(b, 'record_video', None)
+            if callable(rec):
+                try:
+                    rec(key, video_frames, step, fps)  # type: ignore[misc]
+                except Exception:
+                    pass
+
     def flush(self) -> None:
         for b in self._backends:
             b.flush()

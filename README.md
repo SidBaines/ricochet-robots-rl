@@ -83,6 +83,18 @@ Run the test suite:
 pytest tests/ -v
 ```
 
+## Visualisation
+
+Two offline renderers are available:
+
+- Matplotlib-style raster renderer: `env/visuals/mpl_renderer.py`
+- Plotly renderer (PNG export via kaleido): `env/visuals/plotly_renderer.py`
+
+Use `initial_visualisation_cells.py` (with `#%%` cells) to:
+- Load the bank curriculum from `puzzle_bank` and `curriculum_config_example2.json`
+- Load a checkpointed PPO model
+- Record and preview episodes at a few curriculum levels with both renderers
+
 ## Architecture Details
 
 ### SmallCNN

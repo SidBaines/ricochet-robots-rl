@@ -7,6 +7,7 @@ torch>=2.3
 stable-baselines3>=2.3.2
 sb3-contrib>=2.3.0
 tensorboard>=2.15.0
+moviepy==1.0.3
 # MPS support for M1/M2 Macs
 torchaudio>=2.3
 wandb>=0.17
@@ -15,3 +16,6 @@ pandas>=2.0
 pyarrow>=10.0
 tqdm>=4.64
 Pillow>=9.0
+plotly>=5.22
+kaleido>=0.2.1
+imageio>=2.30.0
