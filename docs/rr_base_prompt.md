@@ -33,13 +33,12 @@ Train RL agents to solve Ricochet Robots, then analyze how they plan using mecha
 
 ## Pipeline
 The pipeline for carrying out this process can be broken down into several stages.
-<!-- This is where we will describe the actual process of puzzle generation & storage, model training (incl curriculum learning), model evaluation & gameplay visualisation, mechanistic interpretability & visualisation -->
 
-1. **Puzzle bank + curriculum**: Generate puzzles offline, compute optimal lengths, store parquet + manifest; sample by difficulty.
-2. **Environment**: Gym-style `RicochetRobotsEnv` with fixed-size RGB observations and discrete (robot×direction) actions; optional no-op.
-3. **Training**: SB3 (PPO / RecurrentPPO) with selectable policy (DRC, CNN/ResNet); vectorized envs; TensorBoard logging; checkpoints.
+1. **Puzzle bank + curriculum**: Generate puzzles offline, compute optimal lengths, store & then sample by difficulty.
+2. **Environment**: Gym-style `RicochetRobotsEnv` with fixed-size observations and discrete (robot×direction) actions; optional no-op.
+3. **Training**: SB3 (PPO / RecurrentPPO) with selectable policy (DRC, CNN/ResNet, potentially others); vectorized envs; TensorBoard/wandb logging; checkpoints.
 4. **Evaluation**: Success/optimality vs solver on held-out puzzles; qualitative rollouts/videos.
-5. **Interpretability**: Activation capture, linear probes, saliency, feature viz, activation patching; export plots/summaries.
+5. **Interpretability**: Activation capture, linear probes, saliency, feature viz, activation patching, any other useful/insightful techniques; export plots/summaries.
 
 ## Your Role
 
@@ -58,10 +57,10 @@ The project development follows a five-stage process:
 
 ## Documentation
 ### Overview
-In the main repository, there is a `README.md` where we store the overall current status of the project, including pointers to further documentation where appropriate.
+In the main repository, there is a `README.md` where we store the overall current status of the project, including pointers to further documentation where appropriate. **You should read this**.
 
 ### Current task
-Relevant context for the current task will be kept in a `WorkInProgress.md` file.
+Relevant context for the current task will be kept in a `WorkInProgress.md` file. **You should also read this**.
 
 ### Previously completed steps
 A folder called ProgressNotes will contain, for each implemented feature, both a concise & detailed summary of the implemented feature and a review of the status of the feature (including any remaining tasks or uncertainties).
@@ -90,7 +89,6 @@ Details are described here:
 - Support extensions (multi-target sequences) after single-target baseline.
 
 ## Sample Generation Methods
-<!-- Descibe how we'll generate and store the puzzles -->
 
 - Offline generation with a layout generator; verify solvability via BFS/A* solver.
 - Store boards and metadata in parquet; maintain a manifest with counts, difficulties, and seeds.
@@ -103,7 +101,6 @@ The following is a non-exhaustive list of different types of Models we want to t
 The others are baselines, or attempts to replicate the key concept of split-personality training by other means: Inducing a switch in personality in the model's generation, so that the model generates output according to a different goal that is unaffected by the instructions or learned behaviors of the main personality.
 
 ### 1. Deep Repeating Conolutional networks (Primary Method)
-<!-- Brief description, point to relevant documentation -->
 
  - Conv encoder → stacked ConvLSTM core iterated N times per step → policy/value heads. Optional no-op action enables explicit thinking steps.
  - Baselines: small CNN/ResNet; MLP for symbolic observations.
@@ -164,3 +161,6 @@ The following are typical review_focus we might use. The details will differ dep
 
 - Vectorized envs; avoid solver calls in reset; prefer bank sampling.
 - Profile env step; optimize hotspots or reduce observation size if needed.
+
+
+<!-- Please think about the current task, read any code you think you need to, and then made edits to the WorkInProgress.md file to lay out an initial plan for tackling this tasks, any questions or uncertainties you have, and make any other notes you think are useful or important. Do not write any code yet. -->
