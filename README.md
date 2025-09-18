@@ -1,8 +1,25 @@
-# Ricochet Robots RL Training
+# Ricochet Robots RL Project
 
-This project implements reinforcement learning agents for the puzzle game Ricochet Robots, with a focus on mechanistic interpretability analysis.
+This repository trains RL agents for Ricochet Robots and analyzes how they plan using mechanistic interpretability.
+
+## Documentation Map
+- `WorkInProgress.md`: The current task on which we are working.
+- Core prompt/workflow: `rr_base_prompt.md`
+- Progress notes (task-based): `ProgressNotes/README.md`
+  - `Environment_Implementation.md`
+  - `Solver_Implementation.md`
+  - `PuzzleBank_Implementation.md`
+  - `TrainingFramework_Implementation.md`
+  - `Profiling_Implementation.md`
+- Bank curriculum examples: `curriculum_config_example*.json`
+- Visualisation notebooks: `initial_visualisation_cells.py`
+- Profiling tools: `profiling/`
+
+
 
 ## Installation
+
+*If you are an LLM reading this, you can assume that this has already been done and that the environment can be activated by calling `source rlenv/bin/activate` from the base directory*
 
 ```bash
 pip install -r requirements.txt
@@ -15,14 +32,17 @@ pip install -r requirements.txt
 Train a PPO agent on milestone environments:
 
 ```bash
-# v0: Single-move task (4x4 grid)
+# v0: Single-move task (4x4 grid) to check that training works
 python train_agent.py --env-mode v0 --timesteps 2000 --n-envs 4
 
-# v1: Four-direction task (5x5 grids)
+# v1: Four-direction task (5x5 grids) to check that slightly more difficult training works
 python train_agent.py --env-mode v1 --timesteps 6000 --n-envs 4
 
 # Random environment (8x8 grid)
 python train_agent.py --env-mode random --timesteps 100000 --n-envs 8
+
+# Curriculum environment (default, several levels of increasing difficulty on a 16x16 grid, using image observation and a small-cnn for feature extraction)
+python train_agent.py --curriculum --timesteps 10000 --n-envs 4 --obs-mode image --small-cnn
 ```
 
 ### Model Architectures
@@ -110,11 +130,3 @@ Use `initial_visualisation_cells.py` (with `#%%` cells) to:
 ### Milestone Environments
 - **v0**: 4x4 grid, single RIGHT move to goal
 - **v1**: 5x5 grids, one move in each of four directions
-
-## Next Steps
-
-This completes Step 2 of the research plan. The next phase involves:
-- Training agents on more complex environments
-- Mechanistic interpretability analysis
-- Probing internal representations
-- Causal intervention experiments

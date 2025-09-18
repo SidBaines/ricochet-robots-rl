@@ -68,9 +68,6 @@ class PuzzleMetadata:
     spec_key: SpecKey
     solver_key: SolverKey
     board_hash: bytes  # blake3 hash of full board state (including target_robot)
-    # Extended reproducibility
-    board_seed: Optional[int] = None  # explicit seed used to generate this board
-    layout_hash: Optional[bytes] = None  # hash of layout excluding target_robot
     
     # Solution metrics
     optimal_length: int
@@ -89,6 +86,10 @@ class PuzzleMetadata:
     # Metadata
     created_at: float
     run_id: str
+
+    # Extended reproducibility
+    board_seed: Optional[int] = None  # explicit seed used to generate this board
+    layout_hash: Optional[bytes] = None  # hash of layout excluding target_robot
     
     # Optional layout blob (for generator drift recovery)
     layout_blob: Optional[bytes] = None
