@@ -17,7 +17,7 @@ Usage:
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, Any
 
 from env.puzzle_bank import PuzzleBank, SpecKey
 from env.precompute_pipeline import PuzzleGenerator
@@ -34,7 +34,7 @@ def generate_curriculum_bank(
     config_path: str = None,
     bank_dir: str = "./puzzle_bank",
     puzzles_per_level: int = 1000,
-    solver_config: Dict[str, int] = None,
+    solver_config: Dict[str, Any] = None,
     verbose: bool = False
 ) -> None:
     """Generate puzzle bank for all curriculum levels.
@@ -46,7 +46,7 @@ def generate_curriculum_bank(
         solver_config: Solver configuration
     """
     if solver_config is None:
-        solver_config = {"max_depth": 10, "max_nodes": 100000}
+        solver_config = {"solver_type": "bfs", "max_depth": 10, "max_nodes": 100000}
     
     # Use shared curriculum config or load from file
     if config_path and Path(config_path).exists():
@@ -110,11 +110,11 @@ def generate_curriculum_bank(
     
     # Final bank statistics
     bank_stats = bank.get_stats()
-    print(f"\n" + "=" * 60)
-    print(f"GENERATION COMPLETE")
-    print(f"=" * 60)
+    print("\n" + "=" * 60)
+    print("GENERATION COMPLETE")
+    print("=" * 60)
     print(f"Total puzzles generated: {total_puzzles}")
-    print(f"Bank statistics:")
+    print("Bank statistics:")
     print(f"  Total puzzles: {bank_stats['total_puzzles']}")
     print(f"  Partitions: {bank_stats['partition_count']}")
     
@@ -134,6 +134,8 @@ def main():
     parser.add_argument("--config", help="Path to curriculum config JSON file (optional, uses default if not provided)")
     parser.add_argument("--bank_dir", default="./puzzle_bank", help="Directory to store puzzle bank")
     parser.add_argument("--puzzles_per_level", type=int, default=1000, help="Number of puzzles per level")
+    parser.add_argument("--solver", choices=["bfs", "astar_zero", "astar_one"], default="bfs", 
+                       help="Solver type: bfs (BFS), astar_zero (A* with zero heuristic), astar_one (A* with one heuristic)")
     parser.add_argument("--max_depth", type=int, default=10, help="Solver max depth")
     parser.add_argument("--max_nodes", type=int, default=100000, help="Solver max nodes")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
@@ -141,6 +143,7 @@ def main():
     args = parser.parse_args()
     
     solver_config = {
+        "solver_type": args.solver,
         "max_depth": args.max_depth,
         "max_nodes": args.max_nodes
     }

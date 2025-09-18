@@ -28,7 +28,7 @@ except ImportError:
 from collections import defaultdict
 
 from .ricochet_core import Board, apply_action, reached_goal
-from .ricochet_env import RicochetRobotsEnv, FixedLayout
+from .ricochet_env import RicochetRobotsEnv, FixedLayout, generate_board_from_spec_with_seed
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,10 @@ class PuzzleMetadata:
     seed: int
     spec_key: SpecKey
     solver_key: SolverKey
-    board_hash: bytes  # blake3 hash of board state
+    board_hash: bytes  # blake3 hash of full board state (including target_robot)
+    # Extended reproducibility
+    board_seed: Optional[int] = None  # explicit seed used to generate this board
+    layout_hash: Optional[bytes] = None  # hash of layout excluding target_robot
     
     # Solution metrics
     optimal_length: int
@@ -99,6 +102,8 @@ class PuzzleMetadata:
         data['solver_key'] = json.dumps(asdict(self.solver_key))
         # Convert bytes to hex for JSON serialization
         data['board_hash'] = self.board_hash.hex()
+        if data.get('layout_hash') is not None:
+            data['layout_hash'] = self.layout_hash.hex() if isinstance(self.layout_hash, (bytes, bytearray)) else data['layout_hash']
         if self.layout_blob is not None:
             data['layout_blob'] = self.layout_blob.hex()
         return data
@@ -127,6 +132,19 @@ class PuzzleMetadata:
                 data['layout_blob'] = None
         else:
             data['layout_blob'] = None
+
+        # Optional fields: board_seed, layout_hash
+        if 'board_seed' in data and data['board_seed'] == '':
+            data['board_seed'] = None
+        if 'layout_hash' in data:
+            lh = data.get('layout_hash')
+            if lh and isinstance(lh, str) and lh.strip() and lh != 'nan':
+                try:
+                    data['layout_hash'] = bytes.fromhex(lh)
+                except ValueError:
+                    data['layout_hash'] = None
+            else:
+                data['layout_hash'] = None
         
         # Reconstruct SpecKey and SolverKey - handle both dict and string formats
         import ast
@@ -182,6 +200,9 @@ class PuzzleBank:
         self.bank_dir = Path(bank_dir)
         self.bank_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id or f"run_{int(time.time())}"
+        # In-memory cache of partition DataFrames keyed by partition path
+        # This avoids re-reading Parquet/CSV on every query during training
+        self._partition_df_cache: Dict[Path, "pd.DataFrame"] = {}
         
         # Create manifest file for tracking partitions
         self.manifest_path = self.bank_dir / "manifest.json"
@@ -209,6 +230,31 @@ class PuzzleBank:
         """Get path for a partition."""
         partition_key = spec_key.to_partition_key()
         return self.bank_dir / f"{partition_key}.parquet"
+    
+    def _load_partition_dataframe(self, partition_path: Path) -> "pd.DataFrame":
+        """Load a partition into a pandas DataFrame, using an in-memory cache."""
+        # Fast path: cached
+        if partition_path in self._partition_df_cache:
+            return self._partition_df_cache[partition_path]
+        # Load from disk
+        if not partition_path.exists():
+            df = pd.DataFrame([])
+            self._partition_df_cache[partition_path] = df
+            return df
+        if pa is not None and pq is not None:
+            table = pq.read_table(partition_path)
+            df = table.to_pandas()
+        else:
+            df = pd.read_csv(partition_path)
+        # Clean NaNs to consistent blanks for string fields
+        df = df.fillna('')
+        self._partition_df_cache[partition_path] = df
+        return df
+    
+    def get_partition_dataframe(self, spec_key: SpecKey) -> "pd.DataFrame":
+        """Public helper to access a cached DataFrame for a spec partition."""
+        partition_path = self._get_partition_path(spec_key)
+        return self._load_partition_dataframe(partition_path)
     
     def add_puzzles(self, puzzles: List[PuzzleMetadata]) -> None:
         """Add puzzles to the bank.
@@ -299,21 +345,12 @@ class PuzzleBank:
         
         count = 0
         for partition_path in partition_paths:
-            if not partition_path.exists():
-                continue
-            
-            # Read partition
-            if pa is not None and pq is not None:
-                table = pq.read_table(partition_path)
-                df = table.to_pandas()
-            else:
-                # Fallback to CSV if pyarrow not available
-                df = pd.read_csv(partition_path)
-            
-            # Clean data - handle NaN values that might come from parquet/csv
-            df = df.fillna('')  # Replace NaN with empty string for string fields
+            # Load via cache (empty DataFrame if not present)
+            df = self._load_partition_dataframe(partition_path)
             
             # Apply filters
+            if len(df) == 0:
+                continue
             mask = pd.Series([True] * len(df))
             
             if min_optimal_length is not None:
@@ -412,6 +449,74 @@ class BankSampler:
         """
         self.bank = bank
         self.sampling_strategy = sampling_strategy
+        # Cache of pre-filtered, shuffled views for fast per-episode sampling
+        # key -> { 'df': DataFrame, 'order': np.ndarray[int], 'pos': int, 'rng': np.random.Generator }
+        self._criteria_cache: Dict[Tuple[str, int, int, int, int], Dict[str, Any]] = {}
+
+    def _criteria_key(
+        self,
+        spec_key: SpecKey,
+        min_optimal_length: Optional[int],
+        max_optimal_length: Optional[int],
+        min_robots_moved: Optional[int],
+        max_robots_moved: Optional[int],
+    ) -> Tuple[str, int, int, int, int]:
+        # Use partition string plus numeric bounds (None -> sentinel -1)
+        part = spec_key.to_partition_key()
+        def _n(v: Optional[int]) -> int:
+            return -1 if v is None else int(v)
+        return (part, _n(min_optimal_length), _n(max_optimal_length), _n(min_robots_moved), _n(max_robots_moved))
+
+    def _get_or_build_iterator(
+        self,
+        spec_key: SpecKey,
+        min_optimal_length: Optional[int],
+        max_optimal_length: Optional[int],
+        min_robots_moved: Optional[int],
+        max_robots_moved: Optional[int],
+        random_seed: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        key = self._criteria_key(spec_key, min_optimal_length, max_optimal_length, min_robots_moved, max_robots_moved)
+        it = self._criteria_cache.get(key)
+        if it is None:
+            # Build filtered DataFrame from cached partition
+            df = self.bank.get_partition_dataframe(spec_key)
+            if len(df) == 0:
+                return None
+            mask = pd.Series([True] * len(df))
+            if min_optimal_length is not None:
+                mask &= df['optimal_length'] >= min_optimal_length
+            if max_optimal_length is not None:
+                mask &= df['optimal_length'] <= max_optimal_length
+            if min_robots_moved is not None:
+                mask &= df['robots_moved'] >= min_robots_moved
+            if max_robots_moved is not None:
+                mask &= df['robots_moved'] <= max_robots_moved
+            filtered = df[mask]
+            if len(filtered) == 0:
+                return None
+            # Initialize RNG and shuffled order
+            rng = np.random.default_rng(random_seed)
+            order = np.arange(len(filtered))
+            rng.shuffle(order)
+            it = {"df": filtered.reset_index(drop=True), "order": order, "pos": 0, "rng": rng}
+            self._criteria_cache[key] = it
+        return it
+    
+    def _next_row(self, it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        df = it["df"]
+        order = it["order"]
+        pos = it["pos"]
+        if pos >= len(order):
+            # reshuffle and reset
+            it["rng"].shuffle(order)
+            pos = 0
+        if len(order) == 0:
+            return None
+        idx = int(order[pos])
+        it["pos"] = pos + 1
+        row = df.iloc[idx]
+        return row.to_dict()
     
     def sample_puzzle(
         self,
@@ -422,32 +527,21 @@ class BankSampler:
         max_robots_moved: Optional[int] = None,
         random_seed: Optional[int] = None
     ) -> Optional[PuzzleMetadata]:
-        """Sample a single puzzle matching criteria.
-        
-        Args:
-            spec_key: Generation spec for the puzzle
-            min_optimal_length: Minimum optimal solution length
-            max_optimal_length: Maximum optimal solution length
-            min_robots_moved: Minimum number of robots moved
-            max_robots_moved: Maximum number of robots moved
-            random_seed: Random seed for reproducible sampling
-            
-        Returns:
-            PuzzleMetadata if found, None otherwise
-        """
-        puzzles = list(self.bank.query_puzzles(
-            spec_key=spec_key,
-            min_optimal_length=min_optimal_length,
-            max_optimal_length=max_optimal_length,
-            min_robots_moved=min_robots_moved,
-            max_robots_moved=max_robots_moved,
-            limit=1,
-            random_seed=random_seed
-        ))
-        
-        if puzzles:
-            return puzzles[0]
-        return None
+        """Sample a single puzzle matching criteria using a cached iterator."""
+        it = self._get_or_build_iterator(
+            spec_key,
+            min_optimal_length,
+            max_optimal_length,
+            min_robots_moved,
+            max_robots_moved,
+            random_seed,
+        )
+        if it is None:
+            return None
+        data = self._next_row(it)
+        if data is None:
+            return None
+        return PuzzleMetadata.from_dict(data)
     
     def sample_puzzles(
         self,
@@ -459,35 +553,25 @@ class BankSampler:
         max_robots_moved: Optional[int] = None,
         random_seed: Optional[int] = None
     ) -> List[PuzzleMetadata]:
-        """Sample multiple puzzles matching criteria.
-        
-        Args:
-            spec_key: Generation spec for the puzzle
-            count: Number of puzzles to sample
-            min_optimal_length: Minimum optimal solution length
-            max_optimal_length: Maximum optimal solution length
-            min_robots_moved: Minimum number of robots moved
-            max_robots_moved: Maximum number of robots moved
-            random_seed: Random seed for reproducible sampling
-            
-        Returns:
-            List of PuzzleMetadata
-        """
-        puzzles = list(self.bank.query_puzzles(
-            spec_key=spec_key,
-            min_optimal_length=min_optimal_length,
-            max_optimal_length=max_optimal_length,
-            min_robots_moved=min_robots_moved,
-            max_robots_moved=max_robots_moved,
-            limit=count,
-            random_seed=random_seed
-        ))
-        
-        if self.sampling_strategy == "stratified":
-            # TODO: Implement stratified sampling by bins
-            pass
-        
-        return puzzles
+        """Sample multiple puzzles matching criteria using the cached iterator."""
+        it = self._get_or_build_iterator(
+            spec_key,
+            min_optimal_length,
+            max_optimal_length,
+            min_robots_moved,
+            max_robots_moved,
+            random_seed,
+        )
+        if it is None:
+            return []
+        out: List[PuzzleMetadata] = []
+        for _ in range(int(max(0, count))):
+            data = self._next_row(it)
+            if data is None:
+                break
+            out.append(PuzzleMetadata.from_dict(data))
+        # Future: implement stratified strategy here
+        return out
 
 
 def compute_board_hash(board: Board) -> bytes:
@@ -510,6 +594,27 @@ def compute_board_hash(board: Board) -> bytes:
     gr, gc = board.goal_position
     buf += struct.pack('<III', int(board.target_robot), int(gr), int(gc))
     # Compute hash (use SHA-256 as fallback if blake3 not available)
+    try:
+        return hashlib.blake3(buf).digest()
+    except AttributeError:
+        return hashlib.sha256(buf).digest()
+
+
+def compute_layout_hash(board: Board) -> bytes:
+    """Compute deterministic binary hash of the board layout excluding target_robot.
+
+    Includes dimensions, walls, robots positions, and goal position, but excludes
+    which robot is target to allow multi-round episodes on same layout.
+    """
+    buf = bytearray()
+    buf += struct.pack('<II', int(board.height), int(board.width))
+    buf += board.h_walls.tobytes()
+    buf += board.v_walls.tobytes()
+    for rid in sorted(board.robot_positions.keys()):
+        r, c = board.robot_positions[rid]
+        buf += struct.pack('<III', int(rid), int(r), int(c))
+    gr, gc = board.goal_position
+    buf += struct.pack('<II', int(gr), int(gc))
     try:
         return hashlib.blake3(buf).digest()
     except AttributeError:
@@ -563,25 +668,26 @@ def create_fixed_layout_from_seed(metadata: PuzzleMetadata) -> FixedLayout:
     Returns:
         FixedLayout for use with environment
     """
-    # Create environment with spec parameters
-    env = RicochetRobotsEnv(
+    # Generate board directly from spec and seed without constructing an environment
+    seed_to_use = int(metadata.board_seed) if getattr(metadata, 'board_seed', None) is not None else int(metadata.seed)
+    board = generate_board_from_spec_with_seed(
         height=metadata.spec_key.height,
         width=metadata.spec_key.width,
         num_robots=metadata.spec_key.num_robots,
         edge_t_per_quadrant=metadata.spec_key.edge_t_per_quadrant,
         central_l_per_quadrant=metadata.spec_key.central_l_per_quadrant,
-        ensure_solvable=False,  # We'll validate hash instead
-        obs_mode="image"  # Doesn't matter for layout generation
+        seed=seed_to_use,
     )
-    
-    # Generate board with specific seed
-    obs, info = env.reset(seed=metadata.seed)
-    board = env.get_board()
     
     # Validate hash matches
     computed_hash = compute_board_hash(board)
     if computed_hash != metadata.board_hash:
-        raise ValueError(f"Board hash mismatch for seed {metadata.seed}")
+        # If layout_hash is available, provide additional diagnostics and try layout-level check
+        if getattr(metadata, 'layout_hash', None) is not None:
+            comp_layout = compute_layout_hash(board)
+            if comp_layout == metadata.layout_hash:
+                raise ValueError(f"Board target mismatch for seed {seed_to_use}: layout matches but target_robot differs")
+        raise ValueError(f"Board hash mismatch for seed {seed_to_use}")
     
     # Create FixedLayout
     return FixedLayout(

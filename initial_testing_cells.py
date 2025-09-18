@@ -817,7 +817,7 @@ print("=" * 40)
 bank = PuzzleBank("./puzzle_bank")
 
 test_spec = SpecKey(
-    height=16, width=16, num_robots=1,
+    height=16, width=16, num_robots=4,
     edge_t_per_quadrant=2, central_l_per_quadrant=2
 )
 # Define criteria for filtering

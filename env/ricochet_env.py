@@ -70,6 +70,8 @@ class RicochetRobotsEnv(GymEnvBase):
     - Other modes are not implemented and will raise a clear error.
     """
     metadata = {"render_modes": ["ascii", "rgb"], "render_fps": 4}
+    # Class-level cache for RGB backgrounds per (H, W, cell_size, grid_color, grid_th, wall_color, wall_th)
+    _RGB_BG_CACHE: Dict[Tuple[int, int, int, Tuple[int, int, int], int, Tuple[int, int, int], int], np.ndarray] = {}
 
     def __init__(
         self,
@@ -141,6 +143,8 @@ class RicochetRobotsEnv(GymEnvBase):
         }
         if render_rgb_config is not None:
             self._render_rgb_cfg.update(render_rgb_config)
+        # Per-instance cache: RGB internal walls overlay built for current layout (excludes boundary walls)
+        self._rgb_internal_walls_overlay: Optional[np.ndarray] = None
 
         # Seeding: adopt Gymnasium convention with self.np_random
         self.np_random: np.random.Generator
@@ -163,6 +167,8 @@ class RicochetRobotsEnv(GymEnvBase):
         default_per_quad = 2 if side_min < 10 else 4
         self._edge_t_per_quadrant = default_per_quad if edge_t_per_quadrant is None else int(edge_t_per_quadrant)
         self._central_l_per_quadrant = default_per_quad if central_l_per_quadrant is None else int(central_l_per_quadrant)
+        # Track the exact per-episode board seed used to generate the current board
+        self._last_board_seed: Optional[int] = None
 
         # Observation spaces
         if self.obs_mode == "image":
@@ -276,6 +282,12 @@ class RicochetRobotsEnv(GymEnvBase):
             # cache static walls for this layout
             with profile("env_build_cached_walls", track_memory=True):
                 self._build_cached_walls(self._board)
+            # Build per-layout internal walls RGB overlay cache (for rgb render mode)
+            try:
+                if self.render_mode == "rgb":
+                    self._build_rgb_internal_walls_overlay(self._board)
+            except Exception:
+                self._rgb_internal_walls_overlay = None
             with profile("env_make_obs", track_memory=True):
                 obs = self._make_obs(self._board)
             info = {
@@ -314,6 +326,12 @@ class RicochetRobotsEnv(GymEnvBase):
         assert self._board is not None
         with profile("env_build_cached_walls", track_memory=True):
             self._build_cached_walls(self._board)
+        # Build per-layout internal walls RGB overlay cache (for rgb render mode)
+        try:
+            if self.render_mode == "rgb":
+                self._build_rgb_internal_walls_overlay(self._board)
+        except Exception:
+            self._rgb_internal_walls_overlay = None
         with profile("env_make_obs", track_memory=True):
             obs = self._make_obs(self._board)
         # Note: solver None during attempts may be due to cutoffs (depth/nodes), not true unsolvability.
@@ -323,6 +341,9 @@ class RicochetRobotsEnv(GymEnvBase):
             "target_robot": self._board.target_robot,
             "episode_seed": self._episode_seed,
         }
+        # Expose the exact per-episode board seed used to build this board
+        if hasattr(self, "_last_board_seed") and self._last_board_seed is not None:
+            info["board_seed"] = int(self._last_board_seed)
         if self.obs_mode == "image":
             info["channel_names"] = self.channel_names
         if self.ensure_solvable:
@@ -521,360 +542,39 @@ class RicochetRobotsEnv(GymEnvBase):
         
         with profile("env_rgb_observation_generation", track_memory=True):
             FIXED_PIXEL_SIZE = 96
-            
-            # Calculate cell size to fit the board within the fixed pixel dimensions
-            # Leave some padding around the edges
-            padding = 4  # pixels of padding around the board
+            # Padding around the board within the fixed output
+            padding = 4
             available_size = FIXED_PIXEL_SIZE - 2 * padding
             cell_size = max(1, available_size // max(board.height, board.width))
-            
-            # Temporarily update the render config for this observation
-            original_cell_size = self._render_rgb_cfg["cell_size"]
-            self._render_rgb_cfg["cell_size"] = cell_size
-            
-            try:
-                # Use the existing RGB rendering method with adjusted cell size
-                with profile("env_rgb_rendering", track_memory=True):
-                    rgb_image = self._render_rgb(board)
-                
-                # Resize to fixed pixel dimensions if needed
-                if rgb_image.shape[:2] != (FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE):
-                    with profile("env_rgb_resizing", track_memory=True):
-                        from PIL import Image
-                        # Convert to PIL Image for resizing
-                        pil_image = Image.fromarray(rgb_image)
-                        # Resize to fixed dimensions
-                        pil_image = pil_image.resize((FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE), Image.Resampling.LANCZOS)
-                        rgb_image = np.array(pil_image)
-                
-                # Convert to the correct format based on channels_first setting
-                if self.channels_first:
-                    # Convert from (H, W, 3) to (3, H, W)
-                    rgb_image = np.transpose(rgb_image, (2, 0, 1))
-                
-                return rgb_image
-                
-            finally:
-                # Restore original cell size
-                self._render_rgb_cfg["cell_size"] = original_cell_size
+            # Compute board pixel dims and canvas
+            H_px = int(board.height * cell_size)
+            W_px = int(board.width * cell_size)
+            # Compose into fixed-size canvas without resizing
+            canvas = np.ones((FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE, 3), dtype=np.uint8) * 255
+            y0 = padding + (available_size - H_px) // 2
+            x0 = padding + (available_size - W_px) // 2
+            # Render board region with caching
+            with profile("env_rgb_rendering_cached", track_memory=True):
+                region = self._render_rgb_cached(board, cell_size)
+            canvas[y0:y0+H_px, x0:x0+W_px] = region
+            if self.channels_first:
+                canvas = np.transpose(canvas, (2, 0, 1))
+            return canvas
 
     def _generate_random_board(self) -> Board:
-        h, w = self.height, self.width
-        assert h == w, "Boards should always be square per specification"
-        # Initialize empty walls then set borders
-        h_walls = np.zeros((h + 1, w), dtype=bool)
-        v_walls = np.zeros((h, w + 1), dtype=bool)
-        h_walls[0, :] = True
-        h_walls[h, :] = True
-        v_walls[:, 0] = True
-        v_walls[:, w] = True
-
-        # Track reserved cells that already host a structure (to satisfy rule: max 1 structure per cell)
-        reserved_cells: Set[Tuple[int, int]] = set()
-
-        # Helper to mark a cell as having a structure
-        def reserve_cell(cell: Tuple[int, int]) -> None:
-            r, c = cell
-            if 0 <= r < h and 0 <= c < w:
-                reserved_cells.add((r, c))
-
-        # Build forbidden central block: walls surrounding central 1x1 (odd) or 2x2 (even)
-        if h % 2 == 1:
-            mid = h // 2
-            # Walls around (mid, mid)
-            h_walls[mid, mid] = True  # above
-            h_walls[mid + 1, mid] = True  # below
-            v_walls[mid, mid] = True  # left
-            v_walls[mid, mid + 1] = True  # right
-            reserve_cell((mid, mid))
-            central_rows = [mid]
-            central_cols = [mid]
-        else:
-            mid = h // 2
-            # Central 2x2 cells: (mid-1, mid-1), (mid-1, mid), (mid, mid-1), (mid, mid)
-            # Walls around the perimeter of this 2x2 block
-            # Horizontal walls above and below the 2x2 block
-            h_walls[mid-1, mid - 1] = True
-            h_walls[mid-1, mid] = True
-            h_walls[mid + 1, mid - 1] = True
-            h_walls[mid + 1, mid] = True
-            # Vertical walls left and right of the 2x2 block
-            v_walls[mid - 1, mid-1] = True
-            v_walls[mid, mid-1] = True
-            v_walls[mid - 1, mid + 1] = True
-            v_walls[mid, mid + 1] = True
-            # Reserve the 2x2 central cells
-            for rr in (mid - 1, mid):
-                for cc in (mid - 1, mid):
-                    reserve_cell((rr, cc))
-            central_rows = [mid - 1, mid]
-            central_cols = [mid - 1, mid]
-
-        # Define quadrant bounds excluding the central rows/cols
-        # Each bound is (r_start, r_end_inclusive, c_start, c_end_inclusive)
-        def ranges_excluding_central(size: int, central_idxs: List[int]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-            # returns (low_range, high_range) as inclusive (start,end)
-            unique = sorted(set(central_idxs))
-            if len(unique) == 1:
-                mid_idx = unique[0]
-                return (0, mid_idx - 1), (mid_idx + 1, size - 1)
-            else:
-                # two central indices for even
-                low_end = unique[0] - 1
-                high_start = unique[1] + 1
-                return (0, low_end), (high_start, size - 1)
-
-        (r0_start, r0_end), (r1_start, r1_end) = ranges_excluding_central(h, central_rows)
-        (c0_start, c0_end), (c1_start, c1_end) = ranges_excluding_central(w, central_cols)
-        quadrants = {
-            "NW": (r0_start, r0_end, c0_start, c0_end),
-            "NE": (r0_start, r0_end, c1_start, c1_end),
-            "SW": (r1_start, r1_end, c0_start, c0_end),
-            "SE": (r1_start, r1_end, c1_start, c1_end),
-        }
-
-        # Placement helpers
-        used_interior_h: Set[Tuple[int, int]] = set()  # (row_idx in 1..h-1, col_idx in 0..w-1)
-        used_interior_v: Set[Tuple[int, int]] = set()  # (row_idx in 0..h-1, col_idx in 1..w)
-
-        def cell_has_nonboundary_wall(r: int, c: int) -> bool:
-            # top edge is h_walls[r, c] (non-boundary if r > 0)
-            if r > 0 and h_walls[r, c]:
-                return True
-            # bottom edge is h_walls[r+1, c] (non-boundary if r+1 < h)
-            if r + 1 < h and h_walls[r + 1, c]:
-                return True
-            # left edge is v_walls[r, c] (non-boundary if c > 0)
-            if c > 0 and v_walls[r, c]:
-                return True
-            # right edge is v_walls[r, c+1] (non-boundary if c+1 < w)
-            if c + 1 < w and v_walls[r, c + 1]:
-                return True
-            return False
-
-        def neighbors4(r: int, c: int) -> List[Tuple[int, int]]:
-            nbrs: List[Tuple[int, int]] = []
-            if r - 1 >= 0:
-                nbrs.append((r - 1, c))
-            if r + 1 < h:
-                nbrs.append((r + 1, c))
-            if c - 1 >= 0:
-                nbrs.append((r, c - 1))
-            if c + 1 < w:
-                nbrs.append((r, c + 1))
-            return nbrs
-
-        def can_place_h(row: int, col: int) -> bool:
-            if not (1 <= row <= h - 1 and 0 <= col <= w - 1):
-                return False
-            if h_walls[row, col]:
-                return False
-            # Avoid touching non-border existing walls: ensure adjacent interior edges are free for central-L constraints
-            neighbors = [
-                (row - 1, col), (row + 1, col)
-            ]
-            for nr, nc in neighbors:
-                if 1 <= nr <= h - 1 and 0 <= nc <= w - 1 and h_walls[nr, nc]:
-                    return False
-            return True
-
-        def can_place_v(row: int, col: int) -> bool:
-            if not (0 <= row <= h - 1 and 1 <= col <= w - 1):
-                return False
-            if v_walls[row, col]:
-                return False
-            neighbors = [
-                (row, col - 1), (row, col + 1)
-            ]
-            for nr, nc in neighbors:
-                if 0 <= nr <= h - 1 and 1 <= nc <= w - 1 and v_walls[nr, nc]:
-                    return False
-            return True
-
-        def place_edge_t_in_quadrant(q_bounds: Tuple[int, int, int, int]) -> bool:
-            rs, re, cs, ce = q_bounds
-            if rs > re or cs > ce:
-                return False
-            # Choose one of four sides from this quadrant that lies on the board boundary
-            choices: List[Tuple[str, Tuple[int, int]]] = []
-            # From top boundary within [cs..ce]: place vertical wall at row 0 between (0,c-1)-(0,c) as v_walls[0,c]
-            if rs == 0:
-                for c in range(cs + 1, ce + 1):
-                    choices.append(("TOP", (0, c)))  # v_walls[0, c]
-            # From bottom boundary
-            if re == h - 1:
-                for c in range(cs + 1, ce + 1):
-                    choices.append(("BOTTOM", (h - 1, c)))  # v_walls[h-1, c]
-            # From left boundary
-            if cs == 0:
-                for r in range(rs + 1, re + 1):
-                    choices.append(("LEFT", (r, 0)))  # h_walls[r,0]
-            # From right boundary
-            if ce == w - 1:
-                for r in range(rs + 1, re + 1):
-                    choices.append(("RIGHT", (r, w - 1)))  # h_walls[r, w-1]
-            if not choices:
-                return False
-            # Shuffle deterministically via self.np_random
-            idxs = np.arange(len(choices))
-            self.np_random.shuffle(idxs)
-            for idx in idxs:
-                side, pos = choices[idx]
-                if side in ("TOP", "BOTTOM"):
-                    r0, c = pos
-                    # Disallow juts adjacent to board corners along top/bottom: c must not be 1 or w-1
-                    if c in (1, w - 1):
-                        continue
-                    # Place vertical wall jutting down/up adjacent to border: v_walls[r0, c]
-                    if can_place_v(r0, c):
-                        # Determine the adjacent interior cell around which this edge-T is formed
-                        adj_cell = (1 if side == "TOP" else h - 2, c - 1)
-                        # Enforce: no neighbor of a walled cell may be a structure center
-                        # i.e., candidate center adj_cell must not have neighbors with non-boundary walls
-                        blocked = any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(adj_cell[0], adj_cell[1]))
-                        if not blocked and (0 <= adj_cell[0] < h and 0 <= adj_cell[1] < w) and adj_cell not in reserved_cells:
-                            v_walls[r0, c] = True
-                            used_interior_v.add((r0, c))
-                            reserve_cell(adj_cell)
-                            return True
-                else:
-                    r, c0 = pos
-                    # Disallow juts adjacent to board corners along left/right: r must not be 1 or h-1
-                    if r in (1, h - 1):
-                        continue
-                    # Place horizontal wall jutting right/left adjacent to border: h_walls[r, c0]
-                    if can_place_h(r, c0):
-                        adj_cell = (r - 1, 1 if side == "LEFT" else w - 2)
-                        blocked = any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(adj_cell[0], adj_cell[1]))
-                        if not blocked and (0 <= adj_cell[0] < h and 0 <= adj_cell[1] < w) and adj_cell not in reserved_cells:
-                            h_walls[r, c0] = True
-                            used_interior_h.add((r, c0))
-                            reserve_cell(adj_cell)
-                            return True
-            return False
-
-        # Central-L orientations
-        # orientation encodes which two walls around a cell: TL => top+left, TR => top+right, BL => bottom+left, BR => bottom+right
-        orientations = ["TL", "TR", "BL", "BR"]
-
-        central_l_centers: List[Tuple[int, int]] = []
-
-        def place_central_l_in_quadrant(q_bounds: Tuple[int, int, int, int], desired_orientation: str) -> bool:
-            rs, re, cs, ce = q_bounds
-            if rs > re or cs > ce:
-                return False
-            candidates: List[Tuple[int, int]] = []
-            for r in range(rs, re + 1):
-                for c in range(cs, ce + 1):
-                    # Central-L cannot be around an edge square
-                    if r == 0 or r == h - 1 or c == 0 or c == w - 1:
-                        continue
-                    if (r, c) in reserved_cells:
-                        continue
-                    # Enforce: no neighbor of a walled cell may be a structure center
-                    if any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(r, c)):
-                        continue
-                    candidates.append((r, c))
-            if not candidates:
-                return False
-            idxs = np.arange(len(candidates))
-            self.np_random.shuffle(idxs)
-            for idx in idxs:
-                r, c = candidates[idx]
-                # Determine which interior edges would be used by the L at this cell
-                need_h: Optional[Tuple[int, int]] = None
-                need_v: Optional[Tuple[int, int]] = None
-                if desired_orientation == "TL":
-                    need_h = (r, c)  # top wall above the cell
-                    need_v = (r, c)  # left wall of the cell
-                elif desired_orientation == "TR":
-                    need_h = (r, c)  # top
-                    need_v = (r, c + 1)  # right wall uses v_walls[r, c+1]
-                elif desired_orientation == "BL":
-                    need_h = (r + 1, c)  # bottom wall below the cell
-                    need_v = (r, c)  # left
-                else:  # "BR"
-                    need_h = (r + 1, c)
-                    need_v = (r, c + 1)
-                # Check within interior ranges and not touching other interior walls
-                if need_h is None or need_v is None:
-                    continue
-                hr, hc = need_h
-                vr, vc = need_v
-                if not can_place_h(hr, hc):
-                    continue
-                if not can_place_v(vr, vc):
-                    continue
-                # Also ensure the required edges are not on the outer border (to avoid touching existing walls per spec)
-                if hr in (0, h) or vc in (0, w):
-                    continue
-                # Place them
-                h_walls[hr, hc] = True
-                v_walls[vr, vc] = True
-                used_interior_h.add((hr, hc))
-                used_interior_v.add((vr, vc))
-                # Reserve the corner cell for structure uniqueness and record as a central-L center
-                reserve_cell((r, c))
-                central_l_centers.append((r, c))
-                return True
-            return False
-
-        # Place structures per quadrant
-        # 1) Edge-T
-        for _, bounds in quadrants.items():
-            count = self._edge_t_per_quadrant
-            placed = 0
-            # Attempt multiple times to place required count
-            attempts = 0
-            while placed < count and attempts < count * 10:
-                if place_edge_t_in_quadrant(bounds):
-                    placed += 1
-                attempts += 1
-
-        # 2) Central-L with as even orientation distribution as possible
-        for _, bounds in quadrants.items():
-            count = self._central_l_per_quadrant
-            if count <= 0:
-                continue
-            # Build orientation list as evenly as possible
-            orient_list: List[str] = []
-            for i in range(count):
-                orient_list.append(orientations[i % 4])
-            # Shuffle list deterministically for variety across seeds
-            idxs = np.arange(len(orient_list))
-            self.np_random.shuffle(idxs)
-            orient_list = [orient_list[i] for i in idxs]
-            placed = 0
-            attempts = 0
-            i = 0
-            while placed < count and attempts < count * 20 and i < len(orient_list):
-                if place_central_l_in_quadrant(bounds, orient_list[i]):
-                    placed += 1
-                i += 1
-                attempts += 1
-
-        # Place goal inside a central-L square (randomly among placed central-L centers), excluding central forbidden block
-        central_set = set((r, c) for r in central_rows for c in central_cols)
-        candidates_goal = [rc for rc in central_l_centers if rc not in central_set]
-        if not candidates_goal:
-            # Fallback: if for some reason no central-L could be placed, select any non-central cell deterministically
-            candidates_goal = [(r, c) for r in range(h) for c in range(w) if (r, c) not in central_set]
-        idx = int(self.np_random.integers(0, len(candidates_goal)))
-        goal = candidates_goal[idx]
-
-        # Place robots in free cells excluding central block and the goal cell
-        free_cells: List[Tuple[int, int]] = []
-        for r in range(h):
-            for c in range(w):
-                if (r, c) in central_set or (r, c) == goal:
-                    continue
-                free_cells.append((r, c))
-        self.np_random.shuffle(free_cells)
-        robot_positions: Dict[int, Tuple[int, int]] = {}
-        for rid in range(self.num_robots):
-            robot_positions[rid] = free_cells.pop()
-        target_robot = int(self.np_random.integers(0, self.num_robots))
-        return Board(height=h, width=w, h_walls=h_walls, v_walls=v_walls, robot_positions=robot_positions, goal_position=goal, target_robot=target_robot)
+        # Draw a per-episode board seed from the env RNG
+        seed_used = int(self.np_random.integers(0, 2**31 - 1))
+        # Record it for reproducibility/debugging
+        self._last_board_seed = seed_used
+        # Generate deterministically from the explicit seed only (no external RNG)
+        return generate_board_from_spec_with_seed(
+            height=self.height,
+            width=self.width,
+            num_robots=self.num_robots,
+            edge_t_per_quadrant=self._edge_t_per_quadrant,
+            central_l_per_quadrant=self._central_l_per_quadrant,
+            seed=seed_used,
+        )
 
     # Public channel names for image observations
     @property
@@ -913,7 +613,6 @@ class RicochetRobotsEnv(GymEnvBase):
                 return nullcontext()
         
         with profile("env_rgb_render_setup", track_memory=True):
-            # Extract config
             cfg = self._render_rgb_cfg
             cell_size = int(cfg["cell_size"])  # pixels
             grid_color = tuple(int(x) for x in cfg["grid_color"])  # type: ignore[index]
@@ -928,7 +627,9 @@ class RicochetRobotsEnv(GymEnvBase):
 
             H, W = board.height, board.width
             H_px, W_px = H * cell_size, W * cell_size
-            img = np.ones((H_px, W_px, 3), dtype=np.uint8) * 255
+            # Start from cached background with grid+boundary walls
+            bg = self._get_rgb_background(H, W, cell_size, grid_color, grid_th, wall_color, wall_th)
+            img = bg.copy()
 
         # Helpers to draw
         def draw_hline(y: int, x0: int, x1: int, color: Tuple[int, int, int], thickness: int) -> None:
@@ -981,31 +682,12 @@ class RicochetRobotsEnv(GymEnvBase):
                 y1b = min(H_px, y2 + (thickness - thickness // 2))
                 img[y0b:y1b, x0a:x1a] = color
 
-        # 1) Draw faint grid lines
-        with profile("env_rgb_draw_grid", track_memory=True):
-            for r in range(H + 1):
-                y = int(r * cell_size)
-                draw_hline(y, 0, W_px, grid_color, grid_th)
-            for c in range(W + 1):
-                x = int(c * cell_size)
-                draw_vline(x, 0, H_px, grid_color, grid_th)
-
-        # 2) Draw walls as thicker black lines. h_walls[r,c] between rows r-1 and r over cell column c
-        with profile("env_rgb_draw_walls", track_memory=True):
-            for r in range(H + 1):
-                for c in range(W):
-                    if board.h_walls[r, c]:
-                        y = int(r * cell_size)
-                        x0 = int(c * cell_size)
-                        x1 = int((c + 1) * cell_size)
-                        draw_hline(y, x0, x1, wall_color, wall_th)
-            for r in range(H):
-                for c in range(W + 1):
-                    if board.v_walls[r, c]:
-                        x = int(c * cell_size)
-                        y0 = int(r * cell_size)
-                        y1 = int((r + 1) * cell_size)
-                        draw_vline(x, y0, y1, wall_color, wall_th)
+        # 1) Internal walls overlay (excluding boundary walls) drawn once per layout
+        with profile("env_rgb_draw_internal_walls", track_memory=True):
+            if self._rgb_internal_walls_overlay is None:
+                self._build_rgb_internal_walls_overlay(board)
+            if self._rgb_internal_walls_overlay is not None:
+                img = np.maximum(img, self._rgb_internal_walls_overlay)
 
         # 3) Draw robots as filled circles
         with profile("env_rgb_draw_robots", track_memory=True):
@@ -1027,6 +709,449 @@ class RicochetRobotsEnv(GymEnvBase):
             draw_star(cx, cy, arm_len=cell_size * 0.35, color=dark_color, thickness=star_th)
 
         return img
+
+    def _render_rgb_cached(self, board: Board, cell_size: int) -> np.ndarray:
+        # Compose cached background + internal walls overlay + dynamic robots/target into board-sized image
+        cfg = self._render_rgb_cfg
+        grid_color = tuple(int(x) for x in cfg["grid_color"])  # type: ignore[index]
+        grid_th = int(cfg["grid_thickness"])  # px
+        wall_color = tuple(int(x) for x in cfg["wall_color"])  # type: ignore[index]
+        wall_th = int(cfg["wall_thickness"])  # px
+        robot_colors: List[Tuple[int, int, int]] = [tuple(int(a) for a in t) for t in cfg["robot_colors"]]  # type: ignore[index]
+        circle_fill: bool = bool(cfg["circle_fill"])  # type: ignore[index]
+        circle_r_frac: float = float(cfg["circle_radius_frac"])  # type: ignore[index]
+        target_dark_factor: float = float(cfg["target_dark_factor"])  # type: ignore[index]
+        star_th: int = int(cfg["star_thickness"])  # type: ignore[index]
+
+        H, W = board.height, board.width
+        H_px, W_px = H * cell_size, W * cell_size
+        bg = self._get_rgb_background(H, W, cell_size, grid_color, grid_th, wall_color, wall_th)
+        img = bg.copy()
+        if self._rgb_internal_walls_overlay is None or self._rgb_internal_walls_overlay.shape[:2] != (H_px, W_px):
+            self._build_rgb_internal_walls_overlay(board, cell_size_override=cell_size)
+        if self._rgb_internal_walls_overlay is not None:
+            img = np.maximum(img, self._rgb_internal_walls_overlay)
+
+        # Inline draw helpers for robots/target
+        def draw_hline(y: int, x0: int, x1: int, color: Tuple[int, int, int], thickness: int) -> None:
+            y0 = max(0, y - thickness // 2)
+            y1 = min(H_px, y + (thickness - thickness // 2))
+            x0c = max(0, min(x0, x1))
+            x1c = min(W_px, max(x0, x1))
+            img[y0:y1, x0c:x1c] = color
+
+        def draw_vline(x: int, y0: int, y1: int, color: Tuple[int, int, int], thickness: int) -> None:
+            x0 = max(0, x - thickness // 2)
+            x1 = min(W_px, x + (thickness - thickness // 2))
+            y0c = max(0, min(y0, y1))
+            y1c = min(H_px, max(y0, y1))
+            img[y0c:y1c, x0:x1] = color
+
+        def draw_circle(cx: float, cy: float, radius: float, color: Tuple[int, int, int], fill: bool) -> None:
+            x0 = int(max(0, np.floor(cx - radius)))
+            x1 = int(min(W_px - 1, np.ceil(cx + radius)))
+            y0 = int(max(0, np.floor(cy - radius)))
+            y1 = int(min(H_px - 1, np.ceil(cy + radius)))
+            yy, xx = np.ogrid[y0:y1 + 1, x0:x1 + 1]
+            mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius ** 2
+            if fill:
+                img[y0:y1 + 1, x0:x1 + 1][mask] = color
+            else:
+                inner = (xx - cx) ** 2 + (yy - cy) ** 2 <= (radius - 1) ** 2
+                ring = np.logical_and(mask, np.logical_not(inner))
+                img[y0:y1 + 1, x0:x1 + 1][ring] = color
+
+        def draw_star(cx: float, cy: float, arm_len: float, color: Tuple[int, int, int], thickness: int) -> None:
+            draw_hline(int(cy), int(cx - arm_len), int(cx + arm_len), color, thickness)
+            draw_vline(int(cx), int(cy - arm_len), int(cy + arm_len), color, thickness)
+            steps = int(arm_len)
+            for s in range(-steps, steps + 1):
+                x = int(cx + s)
+                y1 = int(cy + s)
+                y2 = int(cy - s)
+                y0a = max(0, y1 - thickness // 2)
+                y1a = min(H_px, y1 + (thickness - thickness // 2))
+                x0a = max(0, x - thickness // 2)
+                x1a = min(W_px, x + (thickness - thickness // 2))
+                img[y0a:y1a, x0a:x1a] = color
+                y0b = max(0, y2 - thickness // 2)
+                y1b = min(H_px, y2 + (thickness - thickness // 2))
+                img[y0b:y1b, x0a:x1a] = color
+
+        # Draw robots
+        radius = cell_size * float(circle_r_frac)
+        for rid, (rr, cc) in board.robot_positions.items():
+            color = robot_colors[rid % len(robot_colors)]
+            cy = rr * cell_size + cell_size * 0.5
+            cx = cc * cell_size + cell_size * 0.5
+            draw_circle(cx, cy, radius, color, circle_fill)
+
+        # Draw target star
+        tr = board.target_robot
+        tr_color = robot_colors[tr % len(robot_colors)]
+        dark_color = tuple(int(max(0, min(255, target_dark_factor * v))) for v in tr_color)
+        gr, gc = board.goal_position
+        cy = gr * cell_size + cell_size * 0.5
+        cx = gc * cell_size + cell_size * 0.5
+        draw_star(cx, cy, arm_len=cell_size * 0.35, color=dark_color, thickness=star_th)
+        return img
+
+    def _get_rgb_background(self, H: int, W: int, cell_size: int, grid_color: Tuple[int, int, int], grid_th: int, wall_color: Tuple[int, int, int], wall_th: int) -> np.ndarray:
+        key = (int(H), int(W), int(cell_size), tuple(int(x) for x in grid_color), int(grid_th), tuple(int(x) for x in wall_color), int(wall_th))
+        cached = RicochetRobotsEnv._RGB_BG_CACHE.get(key)
+        if cached is not None:
+            return cached
+        H_px, W_px = int(H * cell_size), int(W * cell_size)
+        img = np.ones((H_px, W_px, 3), dtype=np.uint8) * 255
+        # Draw grid
+        for r in range(H + 1):
+            y = int(r * cell_size)
+            y0 = max(0, y - grid_th // 2)
+            y1 = min(H_px, y + (grid_th - grid_th // 2))
+            img[y0:y1, 0:W_px] = grid_color
+        for c in range(W + 1):
+            x = int(c * cell_size)
+            x0 = max(0, x - grid_th // 2)
+            x1 = min(W_px, x + (grid_th - grid_th // 2))
+            img[0:H_px, x0:x1] = grid_color
+        # Draw boundary walls (top/bottom/left/right)
+        # Horizontal top and bottom
+        y = 0
+        y0 = max(0, y - wall_th // 2)
+        y1 = min(H_px, y + (wall_th - wall_th // 2))
+        img[y0:y1, 0:W_px] = wall_color
+        y = H_px
+        y0 = max(0, y - wall_th // 2)
+        y1 = min(H_px, y + (wall_th - wall_th // 2))
+        img[y0:y1, 0:W_px] = wall_color
+        # Vertical left and right
+        x = 0
+        x0 = max(0, x - wall_th // 2)
+        x1 = min(W_px, x + (wall_th - wall_th // 2))
+        img[0:H_px, x0:x1] = wall_color
+        x = W_px
+        x0 = max(0, x - wall_th // 2)
+        x1 = min(W_px, x + (wall_th - wall_th // 2))
+        img[0:H_px, x0:x1] = wall_color
+        RicochetRobotsEnv._RGB_BG_CACHE[key] = img
+        return img
+
+    def _build_rgb_internal_walls_overlay(self, board: Board, cell_size_override: Optional[int] = None) -> None:
+        cfg = self._render_rgb_cfg
+        cell_size = int(cell_size_override if cell_size_override is not None else cfg["cell_size"])  # type: ignore[index]
+        wall_color = tuple(int(x) for x in cfg["wall_color"])  # type: ignore[index]
+        wall_th = int(cfg["wall_thickness"])  # type: ignore[index]
+        H, W = board.height, board.width
+        H_px, W_px = H * cell_size, W * cell_size
+        overlay = np.zeros((H_px, W_px, 3), dtype=np.uint8)
+        # Draw only interior walls (exclude boundaries at r=0,r=H,c=0,c=W)
+        for r in range(1, H):
+            for c in range(W):
+                if board.h_walls[r, c]:
+                    y = int(r * cell_size)
+                    y0 = max(0, y - wall_th // 2)
+                    y1 = min(H_px, y + (wall_th - wall_th // 2))
+                    x0 = int(c * cell_size)
+                    x1 = int((c + 1) * cell_size)
+                    overlay[y0:y1, x0:x1] = wall_color
+        for r in range(H):
+            for c in range(1, W):
+                if board.v_walls[r, c]:
+                    x = int(c * cell_size)
+                    x0 = max(0, x - wall_th // 2)
+                    x1 = min(W_px, x + (wall_th - wall_th // 2))
+                    y0 = int(r * cell_size)
+                    y1 = int((r + 1) * cell_size)
+                    overlay[y0:y1, x0:x1] = wall_color
+        self._rgb_internal_walls_overlay = overlay
+
+
+def generate_board_from_spec_with_seed(
+    *,
+    height: int,
+    width: int,
+    num_robots: int,
+    edge_t_per_quadrant: int,
+    central_l_per_quadrant: int,
+    seed: int,
+    _rng: Optional[np.random.Generator] = None,
+) -> Board:
+    """Generate a Board deterministically from spec and seed without constructing the env.
+
+    If an RNG is provided, it will be used (and its state advanced deterministically);
+    otherwise, a fresh Generator seeded with 'seed' is created.
+    """
+    h, w = int(height), int(width)
+    assert h == w, "Boards should always be square per specification"
+    rng = _rng if _rng is not None else np.random.default_rng(int(seed))
+
+    # Initialize empty walls then set borders
+    h_walls = np.zeros((h + 1, w), dtype=bool)
+    v_walls = np.zeros((h, w + 1), dtype=bool)
+    h_walls[0, :] = True
+    h_walls[h, :] = True
+    v_walls[:, 0] = True
+    v_walls[:, w] = True
+
+    reserved_cells: Set[Tuple[int, int]] = set()
+    def reserve_cell(cell: Tuple[int, int]) -> None:
+        r, c = cell
+        if 0 <= r < h and 0 <= c < w:
+            reserved_cells.add((r, c))
+
+    # Forbidden central block
+    if h % 2 == 1:
+        mid = h // 2
+        h_walls[mid, mid] = True
+        h_walls[mid + 1, mid] = True
+        v_walls[mid, mid] = True
+        v_walls[mid, mid + 1] = True
+        reserve_cell((mid, mid))
+        central_rows = [mid]
+        central_cols = [mid]
+    else:
+        mid = h // 2
+        h_walls[mid-1, mid - 1] = True
+        h_walls[mid-1, mid] = True
+        h_walls[mid + 1, mid - 1] = True
+        h_walls[mid + 1, mid] = True
+        v_walls[mid - 1, mid-1] = True
+        v_walls[mid, mid-1] = True
+        v_walls[mid - 1, mid + 1] = True
+        v_walls[mid, mid + 1] = True
+        for rr in (mid - 1, mid):
+            for cc in (mid - 1, mid):
+                reserve_cell((rr, cc))
+        central_rows = [mid - 1, mid]
+        central_cols = [mid - 1, mid]
+
+    def ranges_excluding_central(size: int, central_idxs: List[int]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        unique = sorted(set(central_idxs))
+        if len(unique) == 1:
+            mid_idx = unique[0]
+            return (0, mid_idx - 1), (mid_idx + 1, size - 1)
+        else:
+            low_end = unique[0] - 1
+            high_start = unique[1] + 1
+            return (0, low_end), (high_start, size - 1)
+
+    (r0_start, r0_end), (r1_start, r1_end) = ranges_excluding_central(h, central_rows)
+    (c0_start, c0_end), (c1_start, c1_end) = ranges_excluding_central(w, central_cols)
+    quadrants = {
+        "NW": (r0_start, r0_end, c0_start, c0_end),
+        "NE": (r0_start, r0_end, c1_start, c1_end),
+        "SW": (r1_start, r1_end, c0_start, c0_end),
+        "SE": (r1_start, r1_end, c1_start, c1_end),
+    }
+
+    used_interior_h: Set[Tuple[int, int]] = set()
+    used_interior_v: Set[Tuple[int, int]] = set()
+
+    def cell_has_nonboundary_wall(r: int, c: int) -> bool:
+        if r > 0 and h_walls[r, c]:
+            return True
+        if r + 1 < h and h_walls[r + 1, c]:
+            return True
+        if c > 0 and v_walls[r, c]:
+            return True
+        if c + 1 < w and v_walls[r, c + 1]:
+            return True
+        return False
+
+    def neighbors4(r: int, c: int) -> List[Tuple[int, int]]:
+        nbrs: List[Tuple[int, int]] = []
+        if r - 1 >= 0:
+            nbrs.append((r - 1, c))
+        if r + 1 < h:
+            nbrs.append((r + 1, c))
+        if c - 1 >= 0:
+            nbrs.append((r, c - 1))
+        if c + 1 < w:
+            nbrs.append((r, c + 1))
+        return nbrs
+
+    def can_place_h(row: int, col: int) -> bool:
+        if not (1 <= row <= h - 1 and 0 <= col <= w - 1):
+            return False
+        if h_walls[row, col]:
+            return False
+        neighbors = [
+            (row - 1, col), (row + 1, col)
+        ]
+        for nr, nc in neighbors:
+            if 1 <= nr <= h - 1 and 0 <= nc <= w - 1 and h_walls[nr, nc]:
+                return False
+        return True
+
+    def can_place_v(row: int, col: int) -> bool:
+        if not (0 <= row <= h - 1 and 1 <= col <= w - 1):
+            return False
+        if v_walls[row, col]:
+            return False
+        neighbors = [
+            (row, col - 1), (row, col + 1)
+        ]
+        for nr, nc in neighbors:
+            if 0 <= nr <= h - 1 and 1 <= nc <= w - 1 and v_walls[nr, nc]:
+                return False
+        return True
+
+    def place_edge_t_in_quadrant(q_bounds: Tuple[int, int, int, int]) -> bool:
+        rs, re, cs, ce = q_bounds
+        if rs > re or cs > ce:
+            return False
+        choices: List[Tuple[str, Tuple[int, int]]] = []
+        if rs == 0:
+            for c in range(cs + 1, ce + 1):
+                choices.append(("TOP", (0, c)))
+        if re == h - 1:
+            for c in range(cs + 1, ce + 1):
+                choices.append(("BOTTOM", (h - 1, c)))
+        if cs == 0:
+            for r in range(rs + 1, re + 1):
+                choices.append(("LEFT", (r, 0)))
+        if ce == w - 1:
+            for r in range(rs + 1, re + 1):
+                choices.append(("RIGHT", (r, w - 1)))
+        if not choices:
+            return False
+        idxs = np.arange(len(choices))
+        rng.shuffle(idxs)
+        for idx in idxs:
+            side, pos = choices[idx]
+            if side in ("TOP", "BOTTOM"):
+                r0, c = pos
+                if c in (1, w - 1):
+                    continue
+                if can_place_v(r0, c):
+                    adj_cell = (1 if side == "TOP" else h - 2, c - 1)
+                    blocked = any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(adj_cell[0], adj_cell[1]))
+                    if not blocked and (0 <= adj_cell[0] < h and 0 <= adj_cell[1] < w) and adj_cell not in reserved_cells:
+                        v_walls[r0, c] = True
+                        used_interior_v.add((r0, c))
+                        reserve_cell(adj_cell)
+                        return True
+            else:
+                r, c0 = pos
+                if r in (1, h - 1):
+                    continue
+                if can_place_h(r, c0):
+                    adj_cell = (r - 1, 1 if side == "LEFT" else w - 2)
+                    blocked = any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(adj_cell[0], adj_cell[1]))
+                    if not blocked and (0 <= adj_cell[0] < h and 0 <= adj_cell[1] < w) and adj_cell not in reserved_cells:
+                        h_walls[r, c0] = True
+                        used_interior_h.add((r, c0))
+                        reserve_cell(adj_cell)
+                        return True
+        return False
+
+    orientations = ["TL", "TR", "BL", "BR"]
+    central_l_centers: List[Tuple[int, int]] = []
+
+    def place_central_l_in_quadrant(q_bounds: Tuple[int, int, int, int], desired_orientation: str) -> bool:
+        rs, re, cs, ce = q_bounds
+        if rs > re or cs > ce:
+            return False
+        candidates: List[Tuple[int, int]] = []
+        for r in range(rs, re + 1):
+            for c in range(cs, ce + 1):
+                if r == 0 or r == h - 1 or c == 0 or c == w - 1:
+                    continue
+                if (r, c) in reserved_cells:
+                    continue
+                if any(cell_has_nonboundary_wall(rr, cc) for rr, cc in neighbors4(r, c)):
+                    continue
+                candidates.append((r, c))
+        if not candidates:
+            return False
+        idxs = np.arange(len(candidates))
+        rng.shuffle(idxs)
+        for idx in idxs:
+            r, c = candidates[idx]
+            need_h: Optional[Tuple[int, int]] = None
+            need_v: Optional[Tuple[int, int]] = None
+            if desired_orientation == "TL":
+                need_h = (r, c)
+                need_v = (r, c)
+            elif desired_orientation == "TR":
+                need_h = (r, c)
+                need_v = (r, c + 1)
+            elif desired_orientation == "BL":
+                need_h = (r + 1, c)
+                need_v = (r, c)
+            else:  # BR
+                need_h = (r + 1, c)
+                need_v = (r, c + 1)
+            if need_h is None or need_v is None:
+                continue
+            hr, hc = need_h
+            vr, vc = need_v
+            if not can_place_h(hr, hc):
+                continue
+            if not can_place_v(vr, vc):
+                continue
+            if hr in (0, h) or vc in (0, w):
+                continue
+            h_walls[hr, hc] = True
+            v_walls[vr, vc] = True
+            used_interior_h.add((hr, hc))
+            used_interior_v.add((vr, vc))
+            reserve_cell((r, c))
+            central_l_centers.append((r, c))
+            return True
+        return False
+
+    # 1) Edge-T per quadrant
+    for _, bounds in quadrants.items():
+        count = int(edge_t_per_quadrant)
+        placed = 0
+        attempts = 0
+        while placed < count and attempts < count * 10:
+            if place_edge_t_in_quadrant(bounds):
+                placed += 1
+            attempts += 1
+
+    # 2) Central-L per quadrant with even orientation distribution
+    for _, bounds in quadrants.items():
+        count = int(central_l_per_quadrant)
+        if count <= 0:
+            continue
+        orient_list: List[str] = []
+        for i in range(count):
+            orient_list.append(orientations[i % 4])
+        idxs = np.arange(len(orient_list))
+        rng.shuffle(idxs)
+        orient_list = [orient_list[i] for i in idxs]
+        placed = 0
+        attempts = 0
+        i = 0
+        while placed < count and attempts < count * 20 and i < len(orient_list):
+            if place_central_l_in_quadrant(bounds, orient_list[i]):
+                placed += 1
+            i += 1
+            attempts += 1
+
+    # Goal inside central-L
+    central_set = set((r, c) for r in central_rows for c in central_cols)
+    candidates_goal = [rc for rc in central_l_centers if rc not in central_set]
+    if not candidates_goal:
+        candidates_goal = [(r, c) for r in range(h) for c in range(w) if (r, c) not in central_set]
+    idx = int(rng.integers(0, len(candidates_goal)))
+    goal = candidates_goal[idx]
+
+    # Robots
+    free_cells: List[Tuple[int, int]] = []
+    for r in range(h):
+        for c in range(w):
+            if (r, c) in central_set or (r, c) == goal:
+                continue
+            free_cells.append((r, c))
+    rng.shuffle(free_cells)
+    robot_positions: Dict[int, Tuple[int, int]] = {}
+    for rid in range(int(num_robots)):
+        robot_positions[rid] = free_cells.pop()
+    target_robot = int(rng.integers(0, int(num_robots)))
+    return Board(height=h, width=w, h_walls=h_walls, v_walls=v_walls, robot_positions=robot_positions, goal_position=goal, target_robot=target_robot)
 
 
 # Optional helper for registration with gymnasium

@@ -20,10 +20,10 @@ except ImportError:
 
 from .puzzle_bank import (
     PuzzleBank, PuzzleMetadata, SpecKey, SolverKey, 
-    compute_board_hash, count_robots_moved
+    compute_board_hash, compute_layout_hash, count_robots_moved
 )
 from .ricochet_env import RicochetRobotsEnv
-from .solver import solve_bfs
+from .solver import solve_bfs, solve_astar
 
 
 class PuzzleGenerator:
@@ -32,18 +32,18 @@ class PuzzleGenerator:
     def __init__(
         self,
         bank: PuzzleBank,
-        solver_key: Optional[SolverKey] = None,
+        solver_config: Optional[Dict[str, Any]] = None,
         verbose: bool = True
     ):
         """Initialize puzzle generator.
         
         Args:
             bank: Puzzle bank to store results
-            solver_key: Solver configuration
+            solver_config: Solver configuration dictionary
             verbose: Whether to print progress
         """
         self.bank = bank
-        self.solver_key = solver_key or SolverKey()
+        self.solver_config = solver_config or {"solver_type": "bfs", "max_depth": 10, "max_nodes": 100000}
         self.verbose = verbose
     
     def generate_puzzles_for_spec(
@@ -162,16 +162,51 @@ class PuzzleGenerator:
         
         # Compute board hash
         board_hash = compute_board_hash(board)
+        # Compute layout hash (target-agnostic) for multi-round reproducibility
+        layout_hash = compute_layout_hash(board)
+        # Extract the exact board_seed used by the env if exposed; fallback to used episode seed
+        board_seed: Optional[int] = None
+        try:
+            bs = info.get("board_seed") if isinstance(info, dict) else None
+            if bs is not None:
+                board_seed = int(bs)
+            else:
+                es = info.get("episode_seed") if isinstance(info, dict) else None
+                if es is not None:
+                    board_seed = int(es)
+        except Exception:
+            board_seed = None
         
         # Solve puzzle
         solve_start = time.time()
         try:
-            solution = solve_bfs(
-                board,
-                # max_depth=self.solver_key['max_depth'],
-                max_depth=max_depth or self.solver_key['max_depth'],
-                max_nodes=self.solver_key['max_nodes']
-            )
+            solver_type = self.solver_config.get("solver_type", "bfs")
+            max_depth_val = max_depth or self.solver_config['max_depth']
+            max_nodes_val = self.solver_config['max_nodes']
+            
+            if solver_type == "bfs":
+                solution = solve_bfs(
+                    board,
+                    max_depth=max_depth_val,
+                    max_nodes=max_nodes_val
+                )
+            elif solver_type == "astar_zero":
+                solution = solve_astar(
+                    board,
+                    max_depth=max_depth_val,
+                    max_nodes=max_nodes_val,
+                    h_mode="admissible_zero"
+                )
+            elif solver_type == "astar_one":
+                solution = solve_astar(
+                    board,
+                    max_depth=max_depth_val,
+                    max_nodes=max_nodes_val,
+                    h_mode="admissible_one"
+                )
+            else:
+                raise ValueError(f"Unknown solver type: {solver_type}")
+                
             solve_time = (time.time() - solve_start) * 1000  # Convert to ms
         except Exception as e:
             if self.verbose:
@@ -218,15 +253,35 @@ class PuzzleGenerator:
         
         # Determine flags
         solved_within_limits = True  # If we got here, it was solved
-        hit_depth_limit = optimal_length >= self.solver_key['max_depth']
+        hit_depth_limit = optimal_length >= self.solver_config['max_depth']
         hit_node_limit = False  # TODO: Track nodes expanded in solver
+        
+        # Map solver type to algorithm name
+        solver_type = self.solver_config.get("solver_type", "bfs")
+        if solver_type == "bfs":
+            algorithm = "BFS"
+        elif solver_type == "astar_zero":
+            algorithm = "A*_zero"
+        elif solver_type == "astar_one":
+            algorithm = "A*_one"
+        else:
+            algorithm = "BFS"  # fallback
+        
+        # Create solver key with correct algorithm name
+        solver_key = SolverKey(
+            algorithm=algorithm,
+            max_depth=self.solver_config['max_depth'],
+            max_nodes=self.solver_config['max_nodes']
+        )
         
         # Create metadata
         metadata = PuzzleMetadata(
             seed=seed,
             spec_key=spec_key,
-            solver_key=SolverKey(**self.solver_key),
+            solver_key=solver_key,
             board_hash=board_hash,
+            board_seed=board_seed,
+            layout_hash=layout_hash,
             optimal_length=optimal_length,
             robots_moved=robots_moved,
             nodes_expanded=0,  # TODO: Track in solver
@@ -318,7 +373,7 @@ class CurriculumSpecGenerator:
 def run_precomputation(
     bank_dir: str,
     curriculum_specs: Optional[List[Dict[str, Any]]] = None,
-    solver_key: Optional[SolverKey] = None,
+    solver_config: Optional[Dict[str, Any]] = None,
     verbose: bool = True
 ) -> Dict[str, Any]:
     """Run full precomputation pipeline.
@@ -326,7 +381,7 @@ def run_precomputation(
     Args:
         bank_dir: Directory to store puzzle bank
         curriculum_specs: Curriculum specifications to generate
-        solver_key: Solver configuration
+        solver_config: Solver configuration dictionary
         verbose: Whether to print progress
         
     Returns:
@@ -337,7 +392,7 @@ def run_precomputation(
     
     # Initialize bank and generator
     bank = PuzzleBank(bank_dir)
-    generator = PuzzleGenerator(bank, solver_key, verbose)
+    generator = PuzzleGenerator(bank, solver_config, verbose)
     
     overall_stats = {
         "total_requested": 0,
