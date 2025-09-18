@@ -27,8 +27,8 @@ except ImportError:
     pq = None
 from collections import defaultdict
 
-from .ricochet_core import Board, apply_action, reached_goal
-from .ricochet_env import RicochetRobotsEnv, FixedLayout, generate_board_from_spec_with_seed
+from .ricochet_core import Board
+from .ricochet_env import FixedLayout, generate_board_from_spec_with_seed
 
 
 @dataclass(frozen=True)
@@ -214,9 +214,25 @@ class PuzzleBank:
         if self.manifest_path.exists():
             with open(self.manifest_path, 'r', encoding='utf-8') as f:
                 self.manifest = json.load(f)
+            # Backfill new fields for schema v1.1
+            if "version" not in self.manifest or self.manifest.get("version") in {"1.0", 1.0}:
+                # Upgrade to 1.1 while preserving existing data
+                self.manifest["version"] = "1.1"
+            # Ensure partitions dict exists
+            self.manifest.setdefault("partitions", {})
+            # Ensure new per-partition fields
+            for part_key, part_info in self.manifest["partitions"].items():
+                part_info.setdefault("histogram", {
+                    "by_optimal_length_and_robots_moved": {}
+                })
+                part_info.setdefault("fingerprints", {})
+                part_info.setdefault("dedup", {
+                    "method": "none",
+                    "bloom": None
+                })
         else:
             self.manifest = {
-                "version": "1.0",
+                "version": "1.1",
                 "partitions": {},
                 "created_at": time.time()
             }
@@ -304,10 +320,26 @@ class PuzzleBank:
                 self.manifest["partitions"][partition_key] = {
                     "spec_key": asdict(spec_key),
                     "created_at": time.time(),
-                    "puzzle_count": 0
+                    "puzzle_count": 0,
+                    "histogram": {
+                        "by_optimal_length_and_robots_moved": {}
+                    },
+                    "fingerprints": {},
+                    "dedup": {
+                        "method": "none",
+                        "bloom": None
+                    }
                 }
             self.manifest["partitions"][partition_key]["puzzle_count"] += len(spec_puzzles)
             self.manifest["partitions"][partition_key]["last_updated"] = time.time()
+
+            # Increment histograms for (optimal_length, robots_moved)
+            hist = self.manifest["partitions"][partition_key]["histogram"]["by_optimal_length_and_robots_moved"]
+            for puzzle in spec_puzzles:
+                ol = int(getattr(puzzle, "optimal_length", -1))
+                rm = int(getattr(puzzle, "robots_moved", -1))
+                key = f"ol={ol}|rm={rm}"
+                hist[key] = int(hist.get(key, 0)) + 1
         
         self._save_manifest()
     
@@ -453,6 +485,10 @@ class BankSampler:
         # Cache of pre-filtered, shuffled views for fast per-episode sampling
         # key -> { 'df': DataFrame, 'order': np.ndarray[int], 'pos': int, 'rng': np.random.Generator }
         self._criteria_cache: Dict[Tuple[str, int, int, int, int], Dict[str, Any]] = {}
+        self._cache_order: List[Tuple[str, int, int, int, int]] = []
+        self._max_cache_entries: int = 128
+        # Monitoring
+        self._last_stratified_plan: Optional[Dict[str, Any]] = None
 
     def _criteria_key(
         self,
@@ -501,7 +537,13 @@ class BankSampler:
             order = np.arange(len(filtered))
             rng.shuffle(order)
             it = {"df": filtered.reset_index(drop=True), "order": order, "pos": 0, "rng": rng}
+            # Evict LRU if over capacity
             self._criteria_cache[key] = it
+            self._cache_order.append(key)
+            if len(self._criteria_cache) > self._max_cache_entries:
+                old_key = self._cache_order.pop(0)
+                if old_key in self._criteria_cache and old_key != key:
+                    self._criteria_cache.pop(old_key, None)
         return it
     
     def _next_row(self, it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -573,6 +615,126 @@ class BankSampler:
             out.append(PuzzleMetadata.from_dict(data))
         # Future: implement stratified strategy here
         return out
+
+    def sample_puzzles_stratified(
+        self,
+        spec_key: SpecKey,
+        total_count: int,
+        bands: List[Dict[str, Any]],
+        random_seed: Optional[int] = None,
+    ) -> List[PuzzleMetadata]:
+        """Stratified sampling across bands defined by (ol, rm) ranges with weights.
+
+        Args:
+            spec_key: Partition to sample from
+            total_count: Total number of puzzles requested
+            bands: List of dicts with keys:
+                - min_optimal_length, max_optimal_length
+                - min_robots_moved, max_robots_moved
+                - weight (float) optional; defaults to 1.0
+            random_seed: Seed for deterministic allocation and iterators
+
+        Returns:
+            List of PuzzleMetadata sampled approximately according to weights
+        """
+        if total_count <= 0 or len(bands) == 0:
+            return []
+        rng = np.random.default_rng(random_seed)
+        weights = np.array([float(b.get("weight", 1.0)) for b in bands], dtype=float)
+        weights = np.maximum(weights, 0.0)
+        if weights.sum() <= 0:
+            weights = np.ones(len(bands), dtype=float)
+        weights = weights / weights.sum()
+
+        # Initial integral allocation via floor, then distribute remainder by largest fractional parts
+        raw_alloc = weights * int(total_count)
+        base_alloc = np.floor(raw_alloc).astype(int)
+        remainder = int(total_count) - int(base_alloc.sum())
+        frac = raw_alloc - base_alloc
+        if remainder > 0:
+            order = np.argsort(-frac)
+            for idx in order[:remainder]:
+                base_alloc[idx] += 1
+
+        plan_details: List[Dict[str, Any]] = []
+        out: List[PuzzleMetadata] = []
+        actually_sampled = 0
+        band_iters: List[Optional[Dict[str, Any]]] = []
+        allocations: List[int] = []
+        for i, band in enumerate(bands):
+            req = int(base_alloc[i])
+            if req <= 0:
+                band_iters.append(None)
+                allocations.append(0)
+                continue
+            min_ol = band.get("min_optimal_length")
+            max_ol = band.get("max_optimal_length")
+            min_rm = band.get("min_robots_moved")
+            max_rm = band.get("max_robots_moved")
+            # Use separate iterator per band
+            it = self._get_or_build_iterator(
+                spec_key,
+                min_ol,
+                max_ol,
+                min_rm,
+                max_rm,
+                int(rng.integers(0, 2**31 - 1)) if random_seed is None else random_seed,
+            )
+            band_samples: List[PuzzleMetadata] = []
+            if it is not None:
+                for _ in range(req):
+                    data = self._next_row(it)
+                    if data is None:
+                        break
+                    band_samples.append(PuzzleMetadata.from_dict(data))
+            out.extend(band_samples)
+            actually_sampled += len(band_samples)
+            band_iters.append(it)
+            allocations.append(req)
+            plan_details.append({
+                "band": {
+                    "min_optimal_length": min_ol,
+                    "max_optimal_length": max_ol,
+                    "min_robots_moved": min_rm,
+                    "max_robots_moved": max_rm,
+                    "weight": float(band.get("weight", 1.0)),
+                },
+                "requested": req,
+                "sampled": len(band_samples),
+            })
+
+        # Reallocate leftover to bands with remaining availability
+        leftover = int(total_count) - int(actually_sampled)
+        if leftover > 0:
+            for i, it in enumerate(band_iters):
+                if leftover <= 0:
+                    break
+                if it is None:
+                    continue
+                # Try to draw more from this band until exhausted
+                taken = 0
+                while leftover > 0:
+                    data = self._next_row(it)
+                    if data is None:
+                        break
+                    out.append(PuzzleMetadata.from_dict(data))
+                    actually_sampled += 1
+                    taken += 1
+                    leftover -= 1
+                if taken > 0:
+                    plan_details[i]["extra_sampled"] = int(plan_details[i].get("extra_sampled", 0) + taken)
+
+        # Monitoring snapshot for external logging
+        self._last_stratified_plan = {
+            "total_requested": int(total_count),
+            "total_sampled": int(actually_sampled),
+            "bands": plan_details,
+        }
+        return out
+
+    def get_last_stratified_plan(self) -> Optional[Dict[str, Any]]:
+        """Return details of the last stratified sampling plan and outcomes."""
+        return self._last_stratified_plan
 
 
 def compute_board_hash(board: Board) -> bytes:
@@ -654,10 +816,7 @@ def create_fixed_layout_from_metadata(metadata: PuzzleMetadata) -> FixedLayout:
     """
     if metadata.layout_blob is None:
         raise ValueError("Cannot create FixedLayout without layout_blob")
-    
-    # TODO: Implement layout_blob deserialization
-    # For now, we'll need to regenerate from seed and validate hash
-    raise NotImplementedError("Layout blob deserialization not yet implemented")
+    return deserialize_layout_blob(metadata.layout_blob)
 
 
 def create_fixed_layout_from_seed(metadata: PuzzleMetadata) -> FixedLayout:
@@ -699,4 +858,63 @@ def create_fixed_layout_from_seed(metadata: PuzzleMetadata) -> FixedLayout:
         robot_positions=board.robot_positions,
         goal_position=board.goal_position,
         target_robot=board.target_robot
+    )
+
+
+def serialize_layout_to_blob(board: Board) -> bytes:
+    """Serialize a Board layout into a compact binary blob.
+
+    Schema (little-endian):
+    - uint32 height, uint32 width, uint32 num_robots
+    - h_walls bytes ( (H+1)*W, bool packed as uint8 )
+    - v_walls bytes ( H*(W+1), bool packed as uint8 )
+    - for rid in sorted(robots): uint32 rid, uint32 r, uint32 c
+    - uint32 goal_r, uint32 goal_c
+    - uint32 target_robot
+    """
+    buf = bytearray()
+    h = int(board.height)
+    w = int(board.width)
+    buf += struct.pack('<III', h, w, int(board.num_robots))
+    buf += board.h_walls.astype(np.uint8).tobytes()
+    buf += board.v_walls.astype(np.uint8).tobytes()
+    for rid in sorted(board.robot_positions.keys()):
+        r, c = board.robot_positions[rid]
+        buf += struct.pack('<III', int(rid), int(r), int(c))
+    gr, gc = board.goal_position
+    buf += struct.pack('<II', int(gr), int(gc))
+    buf += struct.pack('<I', int(board.target_robot))
+    return bytes(buf)
+
+
+def deserialize_layout_blob(blob: bytes) -> FixedLayout:
+    """Deserialize a layout blob into a FixedLayout."""
+    offset = 0
+    def read(fmt: str):
+        nonlocal offset
+        size = struct.calcsize(fmt)
+        vals = struct.unpack_from(fmt, blob, offset)
+        offset += size
+        return vals
+    h, w, nrobots = read('<III')
+    hw_size = (h + 1) * w
+    vw_size = h * (w + 1)
+    h_walls = np.frombuffer(blob, dtype=np.uint8, count=hw_size, offset=offset).copy().astype(bool).reshape(h + 1, w)
+    offset += hw_size
+    v_walls = np.frombuffer(blob, dtype=np.uint8, count=vw_size, offset=offset).copy().astype(bool).reshape(h, w + 1)
+    offset += vw_size
+    robot_positions: Dict[int, Tuple[int, int]] = {}
+    for _ in range(int(nrobots)):
+        rid, r, c = read('<III')
+        robot_positions[int(rid)] = (int(r), int(c))
+    gr, gc = read('<II')
+    (target_robot,) = read('<I')
+    return FixedLayout(
+        height=int(h),
+        width=int(w),
+        h_walls=h_walls,
+        v_walls=v_walls,
+        robot_positions=robot_positions,
+        goal_position=(int(gr), int(gc)),
+        target_robot=int(target_robot),
     )

@@ -26,6 +26,8 @@ class PuzzleCriteria:
     max_optimal_length: Optional[int] = None
     min_robots_moved: Optional[int] = None
     max_robots_moved: Optional[int] = None
+    # Optional stratified bands: list of dicts with ol/rm ranges and optional weight
+    bands: Optional[List[Dict[str, Any]]] = None
     
     def matches(self, metadata: PuzzleMetadata) -> bool:
         """Check if puzzle metadata matches criteria.
@@ -75,7 +77,8 @@ class CriteriaFilteredEnv(GymEnvBase):
         channels_first: bool = True,
         include_noop: bool = False,
         render_mode: Optional[str] = None,
-        verbose: bool = False
+        verbose: bool = False,
+        allow_fallback: bool = False,
     ):
         """Initialize criteria-filtered environment.
         
@@ -93,6 +96,7 @@ class CriteriaFilteredEnv(GymEnvBase):
         self.channels_first = channels_first
         self.include_noop = include_noop
         self.verbose = verbose
+        self.allow_fallback = allow_fallback
         
         # Initialize sampler
         self.sampler = BankSampler(bank, sampling_strategy="uniform")
@@ -118,21 +122,33 @@ class CriteriaFilteredEnv(GymEnvBase):
     
     def _create_current_env(self) -> None:
         """Create current environment from bank sample."""
-        # Sample puzzle from bank
-        metadata = self.sampler.sample_puzzle(
-            spec_key=self.criteria.spec_key,
-            min_optimal_length=self.criteria.min_optimal_length,
-            max_optimal_length=self.criteria.max_optimal_length,
-            min_robots_moved=self.criteria.min_robots_moved,
-            max_robots_moved=self.criteria.max_robots_moved
-        )
+        # Sample puzzle from bank (optionally stratified)
+        if self.criteria.bands:
+            samples = self.sampler.sample_puzzles_stratified(
+                spec_key=self.criteria.spec_key,
+                total_count=1,
+                bands=self.criteria.bands,
+                random_seed=None,
+            )
+            metadata = samples[0] if samples else None
+        else:
+            metadata = self.sampler.sample_puzzle(
+                spec_key=self.criteria.spec_key,
+                min_optimal_length=self.criteria.min_optimal_length,
+                max_optimal_length=self.criteria.max_optimal_length,
+                min_robots_moved=self.criteria.min_robots_moved,
+                max_robots_moved=self.criteria.max_robots_moved
+            )
         
         if metadata is None:
             if self.verbose:
                 print(f"Warning: No puzzle found matching criteria {self.criteria}")
             self._failed_samples += 1
-            # Fallback: create a simple puzzle
-            self._create_fallback_env()
+            # Fallback only if explicitly allowed
+            if self.allow_fallback:
+                self._create_fallback_env()
+            else:
+                raise RuntimeError("No puzzle found matching criteria and fallback disabled. Please increase bank coverage or relax criteria.")
             return
         
         self._current_metadata = metadata
@@ -154,7 +170,10 @@ class CriteriaFilteredEnv(GymEnvBase):
             if self.verbose:
                 print(f"Error creating environment from metadata: {e}")
             self._failed_samples += 1
-            self._create_fallback_env()
+            if self.allow_fallback:
+                self._create_fallback_env()
+            else:
+                raise
     
     def _create_fallback_env(self) -> None:
         """Create fallback environment when bank sampling fails."""
@@ -209,7 +228,8 @@ class CriteriaFilteredEnv(GymEnvBase):
                 "min_optimal_length": self.criteria.min_optimal_length,
                 "max_optimal_length": self.criteria.max_optimal_length,
                 "min_robots_moved": self.criteria.min_robots_moved,
-                "max_robots_moved": self.criteria.max_robots_moved
+                "max_robots_moved": self.criteria.max_robots_moved,
+                "bands": self.criteria.bands
             },
             "bank_stats": {
                 "total_episodes": self._total_episodes,
@@ -217,6 +237,12 @@ class CriteriaFilteredEnv(GymEnvBase):
                 "failed_samples": self._failed_samples
             }
         })
+
+        # Attach stratified sampling plan if used
+        if self.criteria.bands:
+            plan = self.sampler.get_last_stratified_plan()
+            if plan is not None:
+                info["stratified_plan"] = plan
         
         if self._current_metadata is not None:
             info.update({
@@ -373,13 +399,37 @@ class BankCurriculumManager:
             PuzzleCriteria for current level
         """
         level_spec = self.curriculum_levels[self.current_level]
-        
+        # Build simple bands across discrete optimal lengths within range
+        bands: Optional[List[Dict[str, Any]]] = None
+        if (
+            level_spec.get("min_optimal_length") is not None and
+            level_spec.get("max_optimal_length") is not None
+        ):
+            try:
+                min_ol = int(level_spec.get("min_optimal_length"))
+                max_ol = int(level_spec.get("max_optimal_length"))
+                min_rm = level_spec.get("min_robots_moved")
+                max_rm = level_spec.get("max_robots_moved")
+                bands = [
+                    {
+                        "min_optimal_length": ol,
+                        "max_optimal_length": ol,
+                        "min_robots_moved": min_rm,
+                        "max_robots_moved": max_rm,
+                        "weight": 1.0,
+                    }
+                    for ol in range(min_ol, max_ol + 1)
+                ]
+            except Exception:
+                bands = None
+
         return PuzzleCriteria(
             spec_key=level_spec["spec_key"],
             min_optimal_length=level_spec.get("min_optimal_length"),
             max_optimal_length=level_spec.get("max_optimal_length"),
             min_robots_moved=level_spec.get("min_robots_moved"),
-            max_robots_moved=level_spec.get("max_robots_moved")
+            max_robots_moved=level_spec.get("max_robots_moved"),
+            bands=bands
         )
     
     def record_episode_result(self, success: bool) -> None:

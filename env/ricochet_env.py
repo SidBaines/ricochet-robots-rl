@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple, List, Literal, Set
 import numpy as np
 
 from .ricochet_core import Board, apply_action, reached_goal
+FIXED_PIXEL_SIZE = 128
 
 # Provide a runtime gymnasium binding if available, otherwise a minimal fallback
 try:  # pragma: no cover
@@ -190,7 +191,6 @@ class RicochetRobotsEnv(GymEnvBase):
             # RGB image observation: uses fixed pixel dimensions for consistent observation space
             # This ensures all curriculum levels have the same observation space size
             # Lowered from 128 to 96 to reduce memory/compute; resize handled in _board_to_rgb_obs
-            FIXED_PIXEL_SIZE = 96
             
             if self.channels_first:
                 obs_shape = (3, FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE)
@@ -541,7 +541,6 @@ class RicochetRobotsEnv(GymEnvBase):
                 return nullcontext()
         
         with profile("env_rgb_observation_generation", track_memory=True):
-            FIXED_PIXEL_SIZE = 96
             # Padding around the board within the fixed output
             padding = 4
             available_size = FIXED_PIXEL_SIZE - 2 * padding
@@ -687,7 +686,9 @@ class RicochetRobotsEnv(GymEnvBase):
             if self._rgb_internal_walls_overlay is None:
                 self._build_rgb_internal_walls_overlay(board)
             if self._rgb_internal_walls_overlay is not None:
-                img = np.maximum(img, self._rgb_internal_walls_overlay)
+                overlay = self._rgb_internal_walls_overlay
+                mask = (overlay.sum(axis=2) < 3 * 255)
+                img[mask] = overlay[mask]
 
         # 3) Draw robots as filled circles
         with profile("env_rgb_draw_robots", track_memory=True):
@@ -730,7 +731,9 @@ class RicochetRobotsEnv(GymEnvBase):
         if self._rgb_internal_walls_overlay is None or self._rgb_internal_walls_overlay.shape[:2] != (H_px, W_px):
             self._build_rgb_internal_walls_overlay(board, cell_size_override=cell_size)
         if self._rgb_internal_walls_overlay is not None:
-            img = np.maximum(img, self._rgb_internal_walls_overlay)
+            overlay = self._rgb_internal_walls_overlay
+            mask = (overlay.sum(axis=2) < 3 * 255)
+            img[mask] = overlay[mask]
 
         # Inline draw helpers for robots/target
         def draw_hline(y: int, x0: int, x1: int, color: Tuple[int, int, int], thickness: int) -> None:
@@ -843,7 +846,7 @@ class RicochetRobotsEnv(GymEnvBase):
         wall_th = int(cfg["wall_thickness"])  # type: ignore[index]
         H, W = board.height, board.width
         H_px, W_px = H * cell_size, W * cell_size
-        overlay = np.zeros((H_px, W_px, 3), dtype=np.uint8)
+        overlay = np.ones((H_px, W_px, 3), dtype=np.uint8) * 255
         # Draw only interior walls (exclude boundaries at r=0,r=H,c=0,c=W)
         for r in range(1, H):
             for c in range(W):

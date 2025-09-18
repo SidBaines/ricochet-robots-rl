@@ -10,7 +10,7 @@ This repository trains RL agents for Ricochet Robots and analyzes how they plan 
 - `docs/`: Documentation folder
   - `docs/ProgressNotes/`: Progress notes (task-based)
   - `docs/ComponentSpecifications/`: Specifications (component-based)
-### Code
+### Code
 - `train_agent.py`: Script to run training
 - `generate_curriculum_bank.py`: Script to generate the puzzle bank for use during training 
 - `env/`: Code to create and set up the environments, including curriculum learning environment wrappers and solvers
@@ -20,7 +20,7 @@ This repository trains RL agents for Ricochet Robots and analyzes how they plan 
 - `monitoring/`: Monitoring tools for logging performance during training runs
 - `tests/`: Pytest-based unit and integration tests
 - `curriculum_config_example*.json`: Bank curriculum configs for generating and reading from puzzle bank(s)
-- `initial_visualisation_cells.py`, `initial_testing_cells.py` and ``: Visualisation notebooks for quick testing
+- `initial_visualisation_cells.py`, `initial_testing_cells.py`: Visualisation notebooks for quick testing
 
 
 ## Current status
@@ -53,9 +53,10 @@ Recall that the task we're currently working on, if any, can be found in `WorkIn
 
 ## Installation
 
-*If you are an LLM reading this, you can assume that this has already been done and that the environment can be activated by calling `source rlenv/bin/activate` from the base directory*
+If using the provided virtualenv:
 
 ```bash
+source rlenv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -75,9 +76,12 @@ python train_agent.py --env-mode v1 --timesteps 6000 --n-envs 4
 # Random environment (8x8 grid)
 python train_agent.py --env-mode random --timesteps 100000 --n-envs 8
 
-# Curriculum environment (default, several levels of increasing difficulty on a 16x16 grid, using image observation and a small-cnn for feature extraction)
-python train_agent.py --curriculum --timesteps 10000 --n-envs 4 --obs-mode image --small-cnn
+# Curriculum environment (bank-based; image observation; small-cnn)
+python train_agent.py --curriculum --use_bank_curriculum --timesteps 10000 --n-envs 4 --obs-mode image --small-cnn
 ```
+
+Notes:
+- Bank curriculum disables online fallback by default; ensure your bank has coverage for the requested levels.
 
 ### Model Architectures
 
@@ -104,6 +108,24 @@ Evaluate a trained model:
 ```bash
 python evaluate_agent.py --model-path checkpoints/ppo_model.zip --env-mode v0 --episodes 50
 ```
+
+### Bank Precomputation (band-first controller)
+
+Generate the curriculum bank using the band-first controller. It solves broadly and stops when each level has enough available puzzles according to bank histograms.
+
+```bash
+# Use controller to target 1000 available puzzles per level (approx.)
+python generate_curriculum_bank.py \
+  --use_controller \
+  --target_per_level 1000 \
+  --max_puzzles_global 200000 \
+  --chunk_per_spec 200 \
+  --bank_dir ./puzzle_bank
+```
+
+Notes:
+- The controller relies on manifest histograms and can be re-run to incrementally top-up without duplicating layouts.
+- Default solver is BFS; adjust with `--solver`, `--max_depth`, and `--max_nodes` if needed.
 
 ## Environment Options
 

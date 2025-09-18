@@ -346,7 +346,7 @@ print(f"Episodes at current level: {curriculum_manager.get_episodes_at_level()}"
 
 #%%
 # Explore a specific curriculum level in detail
-TARGET_LEVEL = 2  # Change this to explore different levels (0-4)
+TARGET_LEVEL = 0  # Change this to explore different levels (0-4)
 
 # Create environment factory for the target level
 def create_level_env(level_idx: int):

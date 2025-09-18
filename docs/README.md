@@ -3,7 +3,7 @@ This folder contains detailed specifications for (in `ComponentSpecifications`) 
 
 
 ## Progress Notes Overview
-The folder ProgressNotes now organizes progress by concrete tasks, each with an implementation summary. Reviews will be added separately as `<TASK>_Review.md` files.
+The folder ProgressNotes now organizes progress by concrete tasks, each with an implementation summary. Reviews are added separately as `<TASK>_Review.md` files.
 
 ### Task Index
 - `Environment_Implementation.md`
@@ -11,6 +11,8 @@ The folder ProgressNotes now organizes progress by concrete tasks, each with an 
 - `PuzzleBank_Implementation.md`
 - `TrainingFramework_Implementation.md`
 - `Profiling_Implementation.md`
+- `CurriculumBank_Implementation.md`
+- `CurriculumBank_Review.md`
 
 ### Legacy Notes (kept for context)
 - `decisions_and_rationale.md`
