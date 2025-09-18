@@ -49,7 +49,6 @@ You are one of the agents responsible for one of these steps. You will be given 
 ## Multi-Stage Development Process
 
 The project development follows a five-stage process:
-<!-- This is where we'll describe the project development progress as it is - eg. list steps in the order of development, indicating for each (at very high-level) what state the progress is in -->
 
 1. Environment + solver: implement and test.
 2. Training stack: policies (DRC + baselines), PPO configs, curriculum hooks.
@@ -58,12 +57,11 @@ The project development follows a five-stage process:
 5. Interpretability analyses; consolidate documentation.
 
 ## Documentation
-<!-- This is where we'll describe the documentation -->
 ### Overview
 In the main repository, there is a `README.md` where we store the overall current status of the project, including pointers to further documentation where appropriate.
 
 ### Current task
-Relevant context for the current task will be kept in a WorkInProgress.md file.
+Relevant context for the current task will be kept in a `WorkInProgress.md` file.
 
 ### Previously completed steps
 A folder called ProgressNotes will contain, for each implemented feature, both a concise & detailed summary of the implemented feature and a review of the status of the feature (including any remaining tasks or uncertainties).
@@ -71,8 +69,8 @@ This will be in the format of a `<TASK>_Implementation.md` file, and a `<TASK>_R
 
 
 ## Puzzle Generation Goals
-<!-- This is where we'll discuss the types of puzzles that we want to be able to solve. Initially it will be a single target on a givne board layout; later it might be multiple targets in a row where the target squares are pre-defined but only one is active at a time and once a target is hit the next active target is selected at random (this is more like the real, full Ricochet Robots game) -->
-The generated data must meet several key requirements. The following sentence summarizes them:
+
+The generated data must meet several key requirements, some of which are listed here with furhter details descibed in `docs/ComponentSpecifications/WallSpecifications.md`
 
 Details are described here:
 

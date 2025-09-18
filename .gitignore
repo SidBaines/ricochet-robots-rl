@@ -3,11 +3,5 @@ rlenv/
 checkpoints/
 runs
 .DS_Store
-test_direct_video/
-test_fixed_video/
-test_logs/
-test_logs_video/
-test_monitoring_video/
-test_tb_video/
 tmp/
 wandb/
