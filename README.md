@@ -2,6 +2,22 @@
 
 This repository trains RL agents for Ricochet Robots and analyzes how they plan using mechanistic interpretability.
 
+## Quick start
+#### Install
+```
+python -m venv .env
+source .env
+```
+#### Populate curriculum bank
+```
+python generate_curriculum_bank.py --config configs/curriculum_config_default.json --bank_dir ./puzzle_bank
+```
+#### Run training
+```
+python train_agent.py configs/train_defaults.yaml
+```
+
+
 ## Repository Map
 ### Documentation
 - `WorkInProgress.md`: The current task on which we are working.

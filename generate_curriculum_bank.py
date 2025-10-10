@@ -178,7 +178,7 @@ def main():
     parser.add_argument("--config", help="Path to curriculum config JSON file (optional, uses default if not provided)")
     parser.add_argument("--bank_dir", default="./puzzle_bank", help="Directory to store puzzle bank")
     parser.add_argument("--puzzles_per_level", type=int, default=1000, help="Number of puzzles per level")
-    parser.add_argument("--use_controller", action="store_true", help="Use band-first controller to hit targets per level")
+    # parser.add_argument("--use_controller", action="store_true", help="Use band-first controller to hit targets per level")
     parser.add_argument("--target_per_level", type=int, default=1000, help="Controller target puzzles per level (available)")
     parser.add_argument("--max_puzzles_global", type=int, default=200000, help="Global cap on puzzles attempted/generated")
     parser.add_argument("--chunk_per_spec", type=int, default=200, help="Chunk size per spec per iteration for controller")
@@ -201,7 +201,8 @@ def main():
         bank_dir=args.bank_dir,
         puzzles_per_level=args.puzzles_per_level,
         solver_config=solver_config,
-        use_controller=args.use_controller,
+        # use_controller=args.use_controller,
+        use_controller=True,
         controller_target_per_level=args.target_per_level,
         controller_max_puzzles_global=args.max_puzzles_global,
         controller_chunk_per_spec=args.chunk_per_spec,

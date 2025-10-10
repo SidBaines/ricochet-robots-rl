@@ -3,7 +3,7 @@
 Bank Curriculum Preview
 
 This Jupyter-style script mirrors the bank-based curriculum setup from `train_agent.py`.
-It loads curriculum levels from `curriculum_config_example2.json`, uses the `puzzle_bank`,
+It loads curriculum levels from `configs/curriculum_config_default.json`, uses the `puzzle_bank`,
 and renders a few RGB examples from each level.
 """
 
@@ -21,8 +21,8 @@ from env.puzzle_bank import PuzzleBank, SpecKey
 #%%
 # Configuration
 BANK_DIR = str(Path("./puzzle_bank").resolve())
-CONFIG_PATH = str(Path("./curriculum_config_example2.json").resolve())
-EXAMPLES_PER_LEVEL = 3
+CONFIG_PATH = str(Path("./configs/curriculum_config_default.json").resolve())
+EXAMPLES_PER_LEVEL = 5
 OBS_MODE = "rgb_image"
 CHANNELS_FIRST = True
 

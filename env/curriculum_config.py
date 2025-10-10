@@ -36,114 +36,66 @@ def get_default_curriculum_levels() -> List[CurriculumLevel]:
         # Level 0: Single Robot present, Single Move
         CurriculumLevel(
             level=0,
-            name="Single Robot present, Single Move",
+            name="Multiple robots present, single robot moved, Up to four Moves",
             spec_key=SpecKey(
-                height=16, width=16, num_robots=1,
-                edge_t_per_quadrant=2, central_l_per_quadrant=2
-            ),
-            min_optimal_length=1,
-            max_optimal_length=1,
-            min_robots_moved=1,
-            max_robots_moved=1,
-            description="Single robot with some internal walls, single move solution puzzles",
-            num_puzzles=1000
-        ),
-        
-        # Level 1: Single robot, some walls, more permissive
-        CurriculumLevel(
-            level=1,
-            name="Single Robot present, single robot moved, Up to two Moves",
-            spec_key=SpecKey(
-                height=16, width=16, num_robots=1,
+                height=16, width=16, num_robots=4,
                 edge_t_per_quadrant=2, central_l_per_quadrant=2
             ),
             min_optimal_length=1,
             max_optimal_length=2,
+            min_robots_moved=1,
+            max_robots_moved=1,
+            description="Four robots with some internal walls, Single robot up to two move solution puzzles",
+            num_puzzles=1000
+        ),
+        
+        # Level 1: Multiple robots, some walls, more permissive
+        CurriculumLevel(
+            level=1,
+            name="Multiple robots present, single robot moved, Up to four Moves",
+            spec_key=SpecKey(
+                height=16, width=16, num_robots=4,
+                edge_t_per_quadrant=2, central_l_per_quadrant=2
+            ),
+            min_optimal_length=2,
+            max_optimal_length=4,
             min_robots_moved=1,
             max_robots_moved=1,
             description="Single robot with some internal walls, easy puzzles, <= 2 moves",
             num_puzzles=1000
         ),
         
-        # Level 2: Single robot, more walls, more permissive
+        # Level 2: Multiple robots, more walls, more permissive
         CurriculumLevel(
             level=2,
-            name="Multiple robots present, single robot moved, Up to two Moves",
+            name="Multiple robots present, single robot moved, Up to eight Moves",
             spec_key=SpecKey(
                 height=16, width=16, num_robots=4,
-                edge_t_per_quadrant=1, central_l_per_quadrant=1
+                edge_t_per_quadrant=2, central_l_per_quadrant=2
             ),
-            min_optimal_length=1,
-            max_optimal_length=2,
+            min_optimal_length=3,
+            max_optimal_length=8,
             min_robots_moved=1,
             max_robots_moved=1,
             description="Multiple robots with simple wall configurations, single robot solution puzzles, <= 2 moves",
             num_puzzles=1000
         ),
         
-        # Level 3: Single robot, <= four moves
+        # Level 3: Multiple robots, <= four moves
         CurriculumLevel(
             level=3,
-            name="Multiple robots present, single robot moved, Up to four Moves",
-            spec_key=SpecKey(
-                height=16, width=16, num_robots=4,
-                edge_t_per_quadrant=1, central_l_per_quadrant=1
-            ),
-            min_optimal_length=1,
-            max_optimal_length=4,
-            min_robots_moved=1,
-            max_robots_moved=1,
-            description="Multiple robots with simple wall configurations, single robot solution puzzles, <= 4 moves",
-            num_puzzles=1000
-        ),
-        
-        # Level 4: Single robot, <= eight moves
-        CurriculumLevel(
-            level=4,
-            name="Multiple robots present, single robot moved, Up to eight Moves",
-            spec_key=SpecKey(
-                height=16, width=16, num_robots=4,
-                edge_t_per_quadrant=2, central_l_per_quadrant=2
-            ),
-            min_optimal_length=1,
-            max_optimal_length=8,
-            min_robots_moved=1,
-            max_robots_moved=2,
-            description="Multiple robots with simple wall configurations, single robot solution puzzles, <= 8 moves",
-            num_puzzles=1000
-        ),
-        
-        # Level 5: Three robots, expert level, more permissive
-        CurriculumLevel(
-            level=5,
             name="Multiple robots present, multiple robots moved, Up to four Moves",
             spec_key=SpecKey(
                 height=16, width=16, num_robots=4,
                 edge_t_per_quadrant=2, central_l_per_quadrant=2
             ),
             min_optimal_length=1,
-            max_optimal_length=4,  # More permissive
-            min_robots_moved=1,
-            max_robots_moved=2,
+            max_optimal_length=4,
+            min_robots_moved=2,
+            max_robots_moved=3,
             description="Multiple robots with simple wall configurations, multiple robot solution puzzles, <= 4 moves",
             num_puzzles=1000
         ),
-
-        # Level 6: Multiple robots, <= 5 moves
-        CurriculumLevel(
-            level=6,
-            name="Multiple robots present, multiple robots moved, Up to five Moves",
-            spec_key=SpecKey(
-                height=16, width=16, num_robots=4,
-                edge_t_per_quadrant=2, central_l_per_quadrant=2
-            ),
-            min_optimal_length=1,
-            max_optimal_length=5,
-            min_robots_moved=1,
-            max_robots_moved=2,
-            description="Multiple robots with simple wall configurations, multiple robot solution puzzles, <= 5 moves",
-            num_puzzles=1000
-        )
     ]
 
 

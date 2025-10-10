@@ -1,5 +1,6 @@
 algo: ppo
-bank_dir: ./puzzle_bank
+# bank_dir: ./puzzle_bank
+bank_dir: ./.tmp2
 batch_size: 256
 clip_end: 0.1
 clip_range: 0.2

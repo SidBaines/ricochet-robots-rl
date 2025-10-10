@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple, List, Literal, Set
 import numpy as np
 
 from .ricochet_core import Board, apply_action, reached_goal
-FIXED_PIXEL_SIZE = 128
+FIXED_PIXEL_SIZE = 128 # This needs to be board size * the default cell size, otherwise we get errors caused by a mismatch between the obs/render (with the fixed cache size) TODO fix this: observe the error by changing this or the defult cell size, and then running the bank_curriculum_preview.py
 
 # Provide a runtime gymnasium binding if available, otherwise a minimal fallback
 try:  # pragma: no cover
@@ -125,7 +125,7 @@ class RicochetRobotsEnv(GymEnvBase):
             raise ValueError(f"Unsupported render_mode {self.render_mode}. Supported: {self.metadata['render_modes']}")
         # RGB render defaults
         self._render_rgb_cfg: Dict[str, object] = {
-            "cell_size": 20,
+            "cell_size": 7,
             "grid_color": (200, 200, 200),
             "grid_thickness": 1,
             "wall_color": (0, 0, 0),

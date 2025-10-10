@@ -2,7 +2,7 @@
     "levels": [
       {
         "level": 0,
-        "name": "Multiple robots present, single robot moved, Up to two Moves",
+        "name": "Multiple robots present, single robot moved, 1-2 Moves",
         "spec_key": {
           "height": 16,
           "width": 16,
@@ -18,7 +18,7 @@
       },
       {
         "level": 1,
-        "name": "Multiple robots present, single robot moved, Up to four Moves",
+        "name": "Multiple robots present, single robot moved, 2-4 Moves",
         "spec_key": {
           "height": 16,
           "width": 16,
@@ -34,7 +34,7 @@
       },
       {
         "level": 2,
-        "name": "Multiple robots present, single robot moved, Up to eight Moves",
+        "name": "Multiple robots present, single robot moved, 3-8 Moves",
         "spec_key": {
           "height": 16,
           "width": 16,
@@ -50,7 +50,7 @@
       },
       {
         "level": 3,
-        "name": "Multiple robots present, multiple robots moved, Up to four Moves",
+        "name": "Multiple robots present, multiple robots moved, 1-4",
         "spec_key": {
           "height": 16,
           "width": 16,
