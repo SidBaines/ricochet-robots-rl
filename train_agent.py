@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Callable
+from typing import Callable, Any, Dict
 import json
 import math
 import copy
+import yaml
 
 from env import RicochetRobotsEnv, fixed_layout_v0_one_move, fixed_layouts_v1_four_targets
 from env.curriculum import (
@@ -23,6 +24,164 @@ try:
 except ImportError:
     DRCRecurrentPolicy = None  # type: ignore
 
+
+def build_training_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train PPO on Ricochet Robots")
+    # Env selection
+    parser.add_argument("--env-mode", choices=["random", "v0", "v1"], default="random")
+    parser.add_argument("--height", type=int, default=8)
+    parser.add_argument("--width", type=int, default=8)
+    parser.add_argument("--num-robots", type=int, default=2)
+    parser.add_argument("--include-noop", action="store_true")
+    parser.add_argument("--step-penalty", type=float, default=-0.01)
+    parser.add_argument("--goal-reward", type=float, default=1.0)
+    parser.add_argument("--noop-penalty", type=float, default=-0.01)
+    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ensure-solvable", action="store_true")
+    parser.add_argument("--solver-max-depth", type=int, default=30)
+    parser.add_argument("--solver-max-nodes", type=int, default=20000)
+    parser.add_argument("--obs-mode", choices=["image", "symbolic", "rgb_image"], default="image")
+
+    # Profiling options
+    parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling of training pipeline")
+    parser.add_argument("--profiling-report", type=str, default="profiling_report.json", help="Path to save profiling report")
+    parser.add_argument("--profiling-summary-freq", type=int, default=10000, help="Frequency of profiling summary prints (timesteps)")
+
+    # Curriculum learning options
+    parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning")
+    parser.add_argument("--use_bank_curriculum", action="store_true", help="Use precomputed bank-based curriculum instead of online filtering")
+    parser.add_argument("--bank_dir", type=str, default="./puzzle_bank", help="Directory of the precomputed puzzle bank")
+    parser.add_argument("--curriculum-config", type=str, help="Path to custom curriculum configuration JSON file")
+    parser.add_argument("--curriculum-initial-level", type=int, default=0, help="Initial curriculum level (0-4)")
+    parser.add_argument("--curriculum-verbose", action="store_true", default=True, help="Print curriculum progression messages")
+    parser.add_argument("--curriculum-success-threshold", type=float, default=0.95, help="Success rate threshold for curriculum advancement")
+    parser.add_argument("--curriculum-min-episodes", type=int, default=100, help="Minimum episodes per curriculum level")
+    parser.add_argument("--curriculum-window-size", type=int, default=200, help="Success rate window size for curriculum advancement")
+    parser.add_argument("--curriculum-check-freq", type=int, default=50, help="Frequency of curriculum advancement checks (episodes)")
+
+    # Algo
+    parser.add_argument("--algo", choices=["ppo"], default="ppo")
+    parser.add_argument("--timesteps", type=int, default=100000)
+    parser.add_argument("--n-envs", type=int, default=8)
+    parser.add_argument("--n-steps", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--n-epochs", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr-end", type=float, default=0.0, help="Final LR for schedule")
+    parser.add_argument("--lr-schedule", choices=["none", "linear", "cosine"], default="none")
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--clip-range", type=float, default=0.2)
+    parser.add_argument("--clip-end", type=float, default=0.1, help="Final clip range for schedule")
+    parser.add_argument("--clip-schedule", choices=["none", "linear", "cosine"], default="none")
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--ent-coef", type=float, default=0.01)
+    # Normalize advantage toggles
+    parser.add_argument("--normalize-advantage", dest="normalize_advantage", action="store_true")
+    parser.add_argument("--no-normalize-advantage", dest="normalize_advantage", action="store_false")
+    parser.set_defaults(normalize_advantage=True)
+    parser.add_argument("--device", default="auto", help="Device to use for training (auto, cpu, mps, cuda)")
+
+    # Config and profiles
+    parser.add_argument("--profile", choices=["none", "research_plan", "quick_debug", "baseline_sb3"], default="none")
+
+    # VecNormalize options
+    parser.add_argument("--vecnorm", action="store_true", help="Enable VecNormalize wrapper")
+    parser.add_argument("--vecnorm-norm-obs", dest="vecnorm_norm_obs", action="store_true")
+    parser.add_argument("--no-vecnorm-norm-obs", dest="vecnorm_norm_obs", action="store_false")
+    parser.set_defaults(vecnorm_norm_obs=True)
+    parser.add_argument("--vecnorm-norm-reward", dest="vecnorm_norm_reward", action="store_true")
+    parser.add_argument("--no-vecnorm-norm-reward", dest="vecnorm_norm_reward", action="store_false")
+    parser.set_defaults(vecnorm_norm_reward=False)
+    parser.add_argument("--vecnorm-clip-obs", type=float, default=10.0)
+    parser.add_argument("--vecnorm-clip-reward", type=float, default=10.0)
+
+    # Logging / checkpoints
+    parser.add_argument("--log-dir", default="runs/ppo")
+    parser.add_argument("--save-path", default="checkpoints/ppo_model")
+    parser.add_argument("--save-freq", type=int, default=5000, help="Timesteps between checkpoints (0=disable)")
+    parser.add_argument("--eval-freq", type=int, default=1000, help="Timesteps between evals (0=disable)")
+    parser.add_argument("--eval-episodes", type=int, default=20)
+    parser.add_argument("--load-path", type=str, default=None, help="Path to a saved model .zip to resume training from")
+    # Monitoring / logging toggles
+    parser.add_argument("--monitor-tensorboard", dest="monitor_tensorboard", action="store_true")
+    parser.add_argument("--no-monitor-tensorboard", dest="monitor_tensorboard", action="store_false")
+    parser.set_defaults(monitor_tensorboard=True)
+    parser.add_argument("--monitor-wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
+    parser.add_argument("--eval-fixedset", type=str, default=None, help="Path to fixed test set JSON")
+    parser.add_argument("--solver-cache", type=str, default="eval/solver_cache.json")
+    parser.add_argument("--traj-record-freq", type=int, default=2000)
+    parser.add_argument("--traj-record-episodes", type=int, default=10)
+    # Model options
+    parser.add_argument("--small-cnn", action="store_true", help="Use custom SmallCNN feature extractor for image obs")
+    parser.add_argument("--convlstm", action="store_true", help="Use sb3-contrib CnnLstmPolicy (baseline recurrent)")
+    parser.add_argument("--drc", action="store_true", help="Use sb3-contrib RecurrentPPO with recurrent policy (DRC settings)")
+    parser.add_argument("--resnet", action="store_true", help="Use ResNet baseline (feed-forward) as a comparison to DRC")
+    parser.add_argument("--features-dim", type=int, default=128, help="DRC projection/features dimension before heads")
+    parser.add_argument("--conv-channels", type=int, default=32, help="Encoder conv output channels (E_t channels)")
+    parser.add_argument("--lstm-channels", type=int, default=64, help="ConvLSTM hidden channels (C)")
+    parser.add_argument("--lstm-layers", type=int, default=2, help="Number of ConvLSTM layers (L)")
+    parser.add_argument("--lstm-repeats", type=int, default=1, help="Repeats (R) per env step inside DRC")
+
+    return parser
+
+
+def load_config_file(config_path: str) -> Dict[str, Any]:
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected top-level mapping in config, got {type(data).__name__}")
+    return data
+
+
+def apply_profile_presets(args_dict: Dict[str, Any], profile: str, defaults: Dict[str, Any]) -> None:
+    if profile == "research_plan":
+        if args_dict.get("timesteps") == defaults.get("timesteps"):
+            args_dict["timesteps"] = 5_000_000
+        args_dict["clip_range"] = 0.2
+        args_dict["clip_end"] = 0.05
+        args_dict["clip_schedule"] = "linear"
+        args_dict["gae_lambda"] = 0.95
+        args_dict["vf_coef"] = 0.5
+        args_dict["max_grad_norm"] = 0.5
+        args_dict["lr"] = 3e-4
+        args_dict["lr_end"] = 3e-5
+        args_dict["lr_schedule"] = "linear"
+        args_dict["normalize_advantage"] = True
+        if not args_dict.get("vecnorm", False):
+            args_dict["vecnorm"] = False
+            args_dict["vecnorm_norm_obs"] = True
+            args_dict["vecnorm_norm_reward"] = False
+    elif profile == "quick_debug":
+        args_dict["timesteps"] = 50_000
+        args_dict["lr"] = 1e-3
+        args_dict["lr_end"] = 1e-3
+        args_dict["lr_schedule"] = "none"
+        args_dict["clip_range"] = 0.2
+        args_dict["clip_end"] = 0.2
+        args_dict["clip_schedule"] = "none"
+        args_dict["vf_coef"] = 0.5
+        args_dict["max_grad_norm"] = 0.5
+        args_dict["normalize_advantage"] = True
+        args_dict["vecnorm"] = False
+    elif profile == "baseline_sb3":
+        args_dict["lr"] = 3e-4
+        args_dict["lr_schedule"] = "none"
+        args_dict["clip_range"] = 0.2
+        args_dict["clip_schedule"] = "none"
+        args_dict["gae_lambda"] = 0.95
+        args_dict["vf_coef"] = 0.5
+        args_dict["max_grad_norm"] = 0.5
+        args_dict["normalize_advantage"] = True
+        args_dict["vecnorm"] = False
 
 def make_env_factory(args: argparse.Namespace) -> Callable[[], RicochetRobotsEnv]:
     """Return a thunk to create an environment instance based on CLI args."""
@@ -186,176 +345,43 @@ def make_bank_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train PPO on Ricochet Robots")
-    # Env selection
-    parser.add_argument("--env-mode", choices=["random", "v0", "v1"], default="random")
-    parser.add_argument("--height", type=int, default=8)
-    parser.add_argument("--width", type=int, default=8)
-    parser.add_argument("--num-robots", type=int, default=2)
-    parser.add_argument("--include-noop", action="store_true")
-    parser.add_argument("--step-penalty", type=float, default=-0.01)
-    parser.add_argument("--goal-reward", type=float, default=1.0)
-    parser.add_argument("--noop-penalty", type=float, default=-0.01)
-    parser.add_argument("--max-steps", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--ensure-solvable", action="store_true")
-    parser.add_argument("--solver-max-depth", type=int, default=30)
-    parser.add_argument("--solver-max-nodes", type=int, default=20000)
-    parser.add_argument("--obs-mode", choices=["image", "symbolic", "rgb_image"], default="image")
-    
-    # Profiling options
-    parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling of training pipeline")
-    parser.add_argument("--profiling-report", type=str, default="profiling_report.json", help="Path to save profiling report")
-    parser.add_argument("--profiling-summary-freq", type=int, default=10000, help="Frequency of profiling summary prints (timesteps)")
-    
-    # Curriculum learning options
-    parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning")
-    parser.add_argument("--use_bank_curriculum", action="store_true", help="Use precomputed bank-based curriculum instead of online filtering")
-    parser.add_argument("--bank_dir", type=str, default="./puzzle_bank", help="Directory of the precomputed puzzle bank")
-    parser.add_argument("--curriculum-config", type=str, help="Path to custom curriculum configuration JSON file")
-    parser.add_argument("--curriculum-initial-level", type=int, default=0, help="Initial curriculum level (0-4)")
-    parser.add_argument("--curriculum-verbose", action="store_true", default=True, help="Print curriculum progression messages")
-    parser.add_argument("--curriculum-success-threshold", type=float, default=0.95, help="Success rate threshold for curriculum advancement")
-    parser.add_argument("--curriculum-min-episodes", type=int, default=100, help="Minimum episodes per curriculum level")
-    parser.add_argument("--curriculum-window-size", type=int, default=200, help="Success rate window size for curriculum advancement")
-    parser.add_argument("--curriculum-check-freq", type=int, default=50, help="Frequency of curriculum advancement checks (episodes)")
+    cli_parser = argparse.ArgumentParser(description="Train PPO on Ricochet Robots")
+    cli_parser.add_argument("config_path", help="Path to YAML configuration file")
+    cli_args = cli_parser.parse_args()
 
-    # Algo
-    parser.add_argument("--algo", choices=["ppo"], default="ppo")
-    parser.add_argument("--timesteps", type=int, default=100000)
-    parser.add_argument("--n-envs", type=int, default=8)
-    parser.add_argument("--n-steps", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--n-epochs", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--lr-end", type=float, default=0.0, help="Final LR for schedule")
-    parser.add_argument("--lr-schedule", choices=["none", "linear", "cosine"], default="none")
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--clip-range", type=float, default=0.2)
-    parser.add_argument("--clip-end", type=float, default=0.1, help="Final clip range for schedule")
-    parser.add_argument("--clip-schedule", choices=["none", "linear", "cosine"], default="none")
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--vf-coef", type=float, default=0.5)
-    parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--ent-coef", type=float, default=0.01)
-    # Normalize advantage toggles
-    parser.add_argument("--normalize-advantage", dest="normalize_advantage", action="store_true")
-    parser.add_argument("--no-normalize-advantage", dest="normalize_advantage", action="store_false")
-    parser.set_defaults(normalize_advantage=True)
-    parser.add_argument("--device", default="auto", help="Device to use for training (auto, cpu, mps, cuda)")
+    config_path = cli_args.config_path
+    config_data = load_config_file(config_path)
 
-    # Config and profiles
-    parser.add_argument("--config", type=str, help="Path to hyperparameters JSON config")
-    parser.add_argument("--profile", choices=["none", "research_plan", "quick_debug", "baseline_sb3"], default="none")
+    training_parser = build_training_parser()
+    defaults_namespace = training_parser.parse_args([])
+    defaults = vars(defaults_namespace).copy()
 
-    # VecNormalize options
-    parser.add_argument("--vecnorm", action="store_true", help="Enable VecNormalize wrapper")
-    parser.add_argument("--vecnorm-norm-obs", dest="vecnorm_norm_obs", action="store_true")
-    parser.add_argument("--no-vecnorm-norm-obs", dest="vecnorm_norm_obs", action="store_false")
-    parser.set_defaults(vecnorm_norm_obs=True)
-    parser.add_argument("--vecnorm-norm-reward", dest="vecnorm_norm_reward", action="store_true")
-    parser.add_argument("--no-vecnorm-norm-reward", dest="vecnorm_norm_reward", action="store_false")
-    parser.set_defaults(vecnorm_norm_reward=False)
-    parser.add_argument("--vecnorm-clip-obs", type=float, default=10.0)
-    parser.add_argument("--vecnorm-clip-reward", type=float, default=10.0)
+    valid_keys = {
+        action.dest
+        for action in training_parser._actions
+        if action.dest not in (argparse.SUPPRESS, None)
+    }
+    valid_keys.discard("help")
 
-    # Logging / checkpoints
-    parser.add_argument("--log-dir", default="runs/ppo")
-    parser.add_argument("--save-path", default="checkpoints/ppo_model")
-    parser.add_argument("--save-freq", type=int, default=5000, help="Timesteps between checkpoints (0=disable)")
-    parser.add_argument("--eval-freq", type=int, default=1000, help="Timesteps between evals (0=disable)")
-    parser.add_argument("--eval-episodes", type=int, default=20)
-    parser.add_argument("--load-path", type=str, default=None, help="Path to a saved model .zip to resume training from")
-    # Monitoring / logging toggles
-    parser.add_argument("--monitor-tensorboard", dest="monitor_tensorboard", action="store_true")
-    parser.add_argument("--no-monitor-tensorboard", dest="monitor_tensorboard", action="store_false")
-    parser.set_defaults(monitor_tensorboard=True)
-    parser.add_argument("--monitor-wandb", action="store_true")
-    parser.add_argument("--wandb-project", type=str, default=None)
-    parser.add_argument("--wandb-entity", type=str, default=None)
-    parser.add_argument("--wandb-run-name", type=str, default=None)
-    parser.add_argument("--wandb-tags", type=str, nargs="*", default=None)
-    parser.add_argument("--eval-fixedset", type=str, default=None, help="Path to fixed test set JSON")
-    parser.add_argument("--solver-cache", type=str, default="eval/solver_cache.json")
-    parser.add_argument("--traj-record-freq", type=int, default=2000)
-    parser.add_argument("--traj-record-episodes", type=int, default=10)
-    # Model options
-    parser.add_argument("--small-cnn", action="store_true", help="Use custom SmallCNN feature extractor for image obs")
-    parser.add_argument("--convlstm", action="store_true", help="Use sb3-contrib CnnLstmPolicy (baseline recurrent)")
-    parser.add_argument("--drc", action="store_true", help="Use sb3-contrib RecurrentPPO with recurrent policy (DRC settings)")
-    parser.add_argument("--resnet", action="store_true", help="Use ResNet baseline (feed-forward) as a comparison to DRC")
-    parser.add_argument("--features-dim", type=int, default=128, help="DRC projection/features dimension before heads")
-    parser.add_argument("--conv-channels", type=int, default=32, help="Encoder conv output channels (E_t channels)")
-    parser.add_argument("--lstm-channels", type=int, default=64, help="ConvLSTM hidden channels (C)")
-    parser.add_argument("--lstm-layers", type=int, default=2, help="Number of ConvLSTM layers (L)")
-    parser.add_argument("--lstm-repeats", type=int, default=1, help="Repeats (R) per env step inside DRC")
+    unknown_keys = set(config_data) - valid_keys
+    if unknown_keys:
+        raise ValueError(f"Unknown configuration keys: {', '.join(sorted(unknown_keys))}")
 
-    args = parser.parse_args()
-    # Capture parser defaults to preserve CLI precedence over config overlay
-    _defaults = parser.parse_args([])
+    profile_value = config_data.get("profile", defaults.get("profile", "none"))
+    args_dict: Dict[str, Any] = defaults.copy()
+    args_dict["profile"] = profile_value
 
-    # Apply profile presets (can be overridden by config/CLI later)
-    if args.profile != "none":
-        if args.profile == "research_plan":
-            # Long-run, plan-aligned defaults
-            args.timesteps = 5_000_000 if args.timesteps == 100000 else args.timesteps
-            args.clip_range = 0.2
-            args.clip_end = 0.05
-            args.clip_schedule = "linear"
-            args.gae_lambda = 0.95
-            args.vf_coef = 0.5
-            args.max_grad_norm = 0.5
-            args.lr = 3e-4
-            args.lr_end = 3e-5
-            args.lr_schedule = "linear"
-            args.normalize_advantage = True
-            # Sparse reward: avoid reward normalization by default
-            if not hasattr(args, 'vecnorm') or not args.vecnorm:
-                args.vecnorm = False
-                args.vecnorm_norm_obs = True
-                args.vecnorm_norm_reward = False
-        elif args.profile == "quick_debug":
-            args.timesteps = 50_000
-            args.lr = 1e-3
-            args.lr_end = 1e-3
-            args.lr_schedule = "none"
-            args.clip_range = 0.2
-            args.clip_end = 0.2
-            args.clip_schedule = "none"
-            args.vf_coef = 0.5
-            args.max_grad_norm = 0.5
-            args.normalize_advantage = True
-            args.vecnorm = False
-        elif args.profile == "baseline_sb3":
-            # Mirror common SB3-ish defaults while keeping our script params
-            args.lr = 3e-4
-            args.lr_schedule = "none"
-            args.clip_range = 0.2
-            args.clip_schedule = "none"
-            args.gae_lambda = 0.95
-            args.vf_coef = 0.5
-            args.max_grad_norm = 0.5
-            args.normalize_advantage = True
-            args.vecnorm = False
+    apply_profile_presets(args_dict, profile_value, defaults)
 
-    # Load config JSON and overlay into args (CLI wins if explicitly set differently)
-    if args.config:
-        try:
-            with open(args.config, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-            # Flat key overlay: only set attributes present in args
-            for k, v in cfg.items():
-                if hasattr(args, k):
-                    # Only apply config value if the current arg equals the parser default
-                    # This ensures explicit CLI values are not overridden by config
-                    try:
-                        if getattr(args, k) == getattr(_defaults, k):
-                            setattr(args, k, v)
-                    except AttributeError:
-                        # If key not in defaults namespace, fall back to applying it
-                        setattr(args, k, v)
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"Warning: Failed to load config {args.config}: {e}")
+    for key, value in config_data.items():
+        if key == "profile":
+            continue
+        args_dict[key] = value
+
+    training_parser.set_defaults(**args_dict)
+    args = training_parser.parse_args([])
+    args.config_path = config_path
+    print(f"Loaded configuration from {config_path}")
 
     # Initialize profiling if enabled
     if args.enable_profiling:

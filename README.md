@@ -64,42 +64,33 @@ pip install -r requirements.txt
 
 ### Training
 
-Train a PPO agent on milestone environments:
+Launch training by pointing the script at a YAML configuration:
 
 ```bash
-# v0: Single-move task (4x4 grid) to check that training works
-python train_agent.py --env-mode v0 --timesteps 2000 --n-envs 4
+# Run with the default settings from configs/train_defaults.yaml
+python train_agent.py configs/train_defaults.yaml
 
-# v1: Four-direction task (5x5 grids) to check that slightly more difficult training works
-python train_agent.py --env-mode v1 --timesteps 6000 --n-envs 4
-
-# Random environment (8x8 grid)
-python train_agent.py --env-mode random --timesteps 100000 --n-envs 8
-
-# Curriculum environment (bank-based; image observation; small-cnn)
-python train_agent.py --curriculum --use_bank_curriculum --timesteps 10000 --n-envs 4 --obs-mode image --small-cnn
+# Copy, edit, and run a custom configuration
+cp configs/train_defaults.yaml my_run.yaml
+${EDITOR:-nano} my_run.yaml
+python train_agent.py my_run.yaml
 ```
 
 Notes:
-- Bank curriculum disables online fallback by default; ensure your bank has coverage for the requested levels.
+- All previous CLI flags are now top-level YAML keys; `configs/train_defaults.yaml`
+  documents the defaults for every option.
+- Bank curriculum disables online fallback by default; ensure your bank has
+  coverage for the requested levels or relax the criteria in your config.
 
 ### Model Architectures
 
-Choose different policy architectures:
+Tweak these keys in your YAML config to switch policies:
 
-```bash
-# Default MLP for small grids
-python train_agent.py --env-mode v0 --obs-mode image
-
-# Custom small CNN for larger grids
-python train_agent.py --env-mode random --small-cnn --obs-mode image
-
-# ConvLSTM (DRC-lite) for recurrent planning
-python train_agent.py --env-mode random --convlstm --obs-mode image --lstm-layers 2 --lstm-repeats 1
-
-# Symbolic observations with MLP
-python train_agent.py --env-mode random --obs-mode symbolic
-```
+- `obs_mode`: `symbolic`, `image`, or `rgb_image`
+- `small_cnn`: `true` to use the compact CNN extractor for larger grids
+- `convlstm`: `true` to enable the sb3-contrib CnnLstmPolicy baseline
+- `drc`: `true` to enable the recurrent DRC policy (requires sb3-contrib)
+- `resnet`: `true` to swap in the ResNet feature extractor baseline
 
 ### Evaluation
 

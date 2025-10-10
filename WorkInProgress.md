@@ -1,255 +1,39 @@
 # Work in progress
-Contains a description, detailed specifications, discussion, notes, questions and answers etc. all related to the current task
+Contains a description, detailed specifications, discussion, notes, questions and answers, and any progress notes etc. all related to the current task. You should update this file whenever you have made changes or progress on a task, and list next step and what remains.
 
 ## Current task
-Redesign the curriculum environment generation and storage to improve generation speed, reduce wasted compute and future-proof for relevant later changes.
+We've implemented stage 2 of the development process, and we're in the process of checking it. At the moment, we're working to fix the following behaviour:
+If we run a short training run with relatively frequent logging/eval/etc (you can do this yourself), we can see that the various success rates don't match up. We need to understand this and either fix this, or label to make it clear in the reporting why.
 
-## Plan 
-### Scope and intent (quick summary)
-- **Goal**: Make the bank-based curriculum the primary path; keep online generation only for smoke tests. Achieve faster precompute, zero online solving during training, robust sampling, and schema/versioning for future changes.
+First, you should investigate this issue, reading any code and running any commands you need in order to understand the issue. Don't make any chnages to the codebase yet. Make your comments in this file, and make a plan for what you'll do to address this issue.
+## Investigation notes (2025-02-05)
+- Reviewed training pipeline in `train_agent.py` and `env/curriculum.py` to understand how each success metric is produced. Key buckets today are SB3's `rollout/success_rate` (running mean of recent training episodes) and the eval callback's `eval/success_rate` (deterministic policy over `--eval-episodes` episodes). Curriculum success uses the manager's sliding window (`success_rate_window_size`), but that pathway currently crashes before producing logs (see below).
+- Ran a short reproducible training job on the easy `v0` layout: `MPLCONFIGDIR=/tmp/matplotlib rlenv/bin/python train_agent.py --env-mode v0 --obs-mode symbolic --timesteps 400 --n-envs 1 --n-steps 64 --batch-size 32 --eval-freq 80 --eval-episodes 5 --log-dir runs/debug_success_v0 --save-path checkpoints/debug_success_v0 --device cpu --traj-record-freq 0`. The tensorboard dump shows `rollout/success_rate` hovering around 0.98 while `eval/success_rate` stays at 1.0, confirming the mismatch on a tiny run.
+- Attempted to reproduce the curriculum/bank runs. The bank curriculum fails immediately because the first level in `curriculum_config_example2.json` has no matching puzzles (`CriteriaFilteredEnv` raises "No puzzle found matching criteria"). The online curriculum path crashes with `AttributeError: 'CurriculumManager' object has no attribute 'get_stats'` inside the `CurriculumCallback` – the manager exposes `get_curriculum_stats()` instead. This prevents us from observing curriculum success-rate logs at all right now.
+- Verified that our custom monitoring hub never emits `train/success_rate` because nothing calls `hub.on_rollout_end(...)`, so `EpisodeStatsCollector` never receives the episode outcomes. Today, the only success-rate traces that reliably land in TensorBoard are the SB3 defaults and the eval callback.
 
-### Current state (from code scan)
-- Two curriculum paths exist:
-  - **Online filtered env**: `OptimalLengthFilteredEnv` within `CurriculumWrapper` regenerates until constraints met (risk: slow, loops, online solver calls).
-  - **Bank-based**: `PuzzleBank` + `BankSampler` + `CriteriaFilteredEnv` via `BankCurriculumManager` (preferred; cached DataFrames, Parquet partitions by `SpecKey`).
-- Precompute scripts: `generate_curriculum_bank.py` uses `PuzzleGenerator` from `env/precompute_pipeline.py` and shared specs in `env/curriculum_config.py`.
-- Gaps/risks noticed:
-  - `layout_blob` deserialization is not implemented; recovery relies on regen-by-seed + hash match.
-  - Potential generator drift vs stored `board_hash`/`layout_hash` without explicit `generator_rules_version` discipline.
-  - Criteria naming: `criteria['max_depth']` is passed to solver as max search depth; ensure not confused with optimal_length fields.
-  - Bank sampling cache growth and memory usage; no eviction policy.
+## Current understanding of the mismatch
+- `rollout/success_rate` averages the stochastic training episodes collected during PPO updates. It reflects the exploration policy and a rolling buffer (SB3 default size 100).
+- `eval/success_rate` runs the deterministic policy on a separate env every `--eval-freq` steps and averages just `--eval-episodes` episodes. Especially on short runs, this can differ notably from training stats both because of determinism and because the sample size is tiny.
+- Intended curriculum/bank success metrics would average over the manager's sliding window at the current level, but the callback bug prevents them from being logged. Even once fixed, they'll track a different slice of experience (per-level window, reset on advancement).
 
-### Proposed phases
-1) Requirements & targets
-   - Lock target curriculum levels and bounds (optimal length, robots moved) for v1.1.
-   - Decide minimum viable bank size per level and overall generation time budget.
-   - Make bank-based curriculum default in training scripts and README.
+## Open issues spotted while reproducing
+- `CurriculumCallback` references `curriculum_manager.get_stats()` but `CurriculumManager` only defines `get_curriculum_stats()`. Bank manager has `get_stats()`, so the callback works there; for online curriculum it crashes.
+- Bank curriculum level 0 criteria (from `curriculum_config_example2.json`) have no matching entries in the checked-in puzzle bank, so the very first reset raises.
+- Monitoring hub success collector is effectively dead code because nothing forwards rollout summaries to it.
 
-2) Generation speedups (precompute)
-   - Add parallel/multiprocess batching to `PuzzleGenerator.generate_puzzles_for_spec` with process-safe appends to Parquet (chunk files then merge).
-   - Early rejection: light-weight heuristic before full solve (e.g., bounding-box distance lower bound) to skip hopeless boards.
-   - Deduplicate by `layout_hash` during generation to avoid repeated layouts with different seeds.
-   - Track and store solver nodes expanded; expose to criteria later.
+## Next steps / plan
+1. Patch the curriculum callback (and any related monitoring hooks) so both curriculum flavors surface their success stats without crashing; that also unblocks reproducing the mismatch in the intended Stage 2 setup.
+2. Audit how many success metrics we expose after the callback fix, and decide whether to align their naming/scaling (e.g., differentiate "training (stochastic)" vs "eval (deterministic)" vs "curriculum window" either by renaming tags or by logging explanatory text once per run).
+3. Once metrics are distinguishable, verify on a short run that all success traces are consistent with their definitions; if discrepancies remain (beyond expected stochastic vs deterministic drift), dig into the respective collectors (SB3 buffers vs curriculum manager vs bank stats) to close the gap.
 
-3) Storage/schema hardening
-   - Manifest v1.1: add schema version, generator hash, solver config fingerprint, counts per difficulty band.
-   - Enforce `pyarrow` Parquet path; add basic indices (via sorting + metadata) on `optimal_length`, `robots_moved`.
-   - Optional: split large partitions into shards (e.g., `...parquet/part-*.parquet`) for append-friendly writes.
+## Implementation notes (2025-02-05)
+- Added a backwards-compatible `CurriculumManager.get_stats()` shim and updated both curriculum callbacks to probe whichever stats helper is present. Online curriculum no longer throws and now logs its windowed success rate just like the bank path.
+- Extended the monitoring hub bridge: `_HubEpisodeMetrics` now aggregates per-episode successes/lengths/returns, forwards them via `hub.on_rollout_end`, and emits a one-time text note clarifying how `rollout/success_rate`, `train/success_rate_window`, and `eval/success_rate` differ. `EpisodeStatsCollector` logs the windowed metric under a more explicit `train/success_rate_window` tag (while keeping the legacy name for continuity).
+- Smoke-tested with a quick symbolic curriculum run to ensure everything stays wired together and the new logs appear: `MPLCONFIGDIR=/tmp/matplotlib rlenv/bin/python train_agent.py --curriculum --obs-mode symbolic --ensure-solvable --solver-max-depth 20 --solver-max-nodes 5000 --timesteps 64 --n-envs 1 --n-steps 32 --batch-size 32 --eval-freq 64 --eval-episodes 2 --curriculum-min-episodes 2 --curriculum-window-size 4 --curriculum-check-freq 2 --curriculum-success-threshold 0.5 --log-dir runs/debug_curriculum_symbolic --save-path checkpoints/debug_curriculum_symbolic --device cpu --traj-record-freq 0 --curriculum-verbose`.
+- Migrated `train_agent.py` to require a single YAML config argument (backed by a `build_training_parser()` helper). Converted the generated config into parser defaults, added validation for unknown keys, and aliased the default CLI values into `configs/train_defaults.yaml`.
+- Added `PyYAML` to the requirements, updated the README quick-start instructions, and smoke-tested the new workflow with `MPLCONFIGDIR=/tmp/matplotlib rlenv/bin/python train_agent.py tmp/train_smoke.yaml` (64-timestep symbolic run).
 
-4) Sampling and curriculum
-   - Use `BankSampler` everywhere in `CriteriaFilteredEnv`; add graceful fallback if a level is underfilled (nearest-band backoff, with logging).
-   - Add iterator eviction policy (LRU by criteria key, cap memory).
-   - Curriculum advancement remains success-rate based; ensure `BankCurriculumManager.get_stats()` is surfaced in logs.
-
-5) Validation and tests
-   - Determinism: regen-from-seed -> `board_hash` and `layout_hash` equality tests.
-   - Query filters: unit tests for `PuzzleBank.query_puzzles` and `BankSampler.sample_puzzles` across bounds.
-   - End-to-end: precompute a tiny bank; train for N episodes; ensure zero online solve calls; curriculum advances.
-
-6) Migration & tooling
-   - Write a migration script to re-tag existing partitions with v1.1 manifest fields; verify hashes; compute missing stats.
-   - Backup current bank directories and provide verification report.
-
-7) Monitoring & ergonomics
-   - Add concise CLI progress and final summaries; optionally wandb/TensorBoard counters for sampled difficulty bands.
-   - Docs: update `README.md` quickstart and `docs/ProgressNotes` once implemented.
-
-### Open questions / decisions needed
-- Target bank size per level and acceptable precompute duration on current machine?
-  - Answer: target 1000 per level for now - but note that this means 1000 actually solving this criteria; currently we track how many we try and then only a fraciton of this satisfy criteria. Ideally precompute takes less than 10 mins per level, but this may not be achievable.
-- Keep both BFS and A* variants in bank or standardize on one? If both, how to encode in `SolverKey` for sampling?
-  - Keep option to switch if we want, but default to whichever is faster. They should be producing the same minimum  solves (note that the actual solve found might not be the same, since different solves of same length can exist).
-- Minimum/maximum `robots_moved` constraints we actually want during early curriculum?
-  - In early curriculum, we will want max 1 robot moved, switch to allowing 2+ after a couple of levels.
-- Do we require `layout_blob` serialization now, or is seed+hash regeneration sufficient for the next milestones?
-  - I'm unsure on this, but I'm expecting seed+hash is good enough. Feel free to investigate this yourself if you think it's likely to be important for what you choose to do next.
-- Memory cap for sampler cache (MB) and eviction policy preferences?
-  - We have 16GB ram on CPU to work with, but note that some of this will be taken up by other processes.
-- Any near-term changes to generator rules that require bumping `generator_rules_version`?
-  - No
-
-### Notes and risks
-- Generator drift can invalidate stored hashes; strict versioning and manifest fingerprints mitigate this.
-- Parallel Parquet writes can corrupt files if not sharded; prefer shard-per-worker then consolidated manifest.
-- Overly strict criteria can starve levels; implement backoff and report.
-- Large pandas DataFrames in cache can cause RAM spikes; cap and monitor.
-
-### Next actions (initial)
-- Align on level spec targets and bank size per level.
-- Prototype small parallel generation on 1–2 specs; measure puzzles/sec and success rate.
-- Add starvation backoff in `CriteriaFilteredEnv`/`BankSampler` and log warnings when underfilled.
-- Draft manifest v1.1 fields and plan migration script.
-
-## User Questions
-- I think at the moment we generate N puzzles for each level and try to solve them, and only store puzzles of interest. I think this leads to a lot of wasted compute. I am wondering if it's somehow better to do something like:
-  1) Just solve a load of puzzles, storing the metadata about each one, inculding optimal solve length, number of robots moved in optimal solve, hashes, all the rest of the meta data... They could be stored in whatever format is most useful, but I am wondering if storing by (optimal solve length, num robots moved) pair as a key is useful
-  2) Keep track of (or maybe it's easy enough just to count, periodically) how many puzzles exist for each (optimal solve length, num robots moved) pair
-  3) Periodically check, for each level in our curricula, whether there are sufficient puzzles which satisfy the criteria, by summing over the permissable (optimal solve length, num robots moved) pairs.
-  4) Stop once *either* each level has sufficient puzzles satisfying the criteria *or* a maximum puzzle generation count is met.
-  5) Ideally have the option to continue adding to an (already generated) puzzle bank, by skipping seeds which have already been calculated for
-Please think about this, and let me know if you think it's possible/works well, or if you have improvements to suggest or think that an alternative method (including just continuing with your suggested implementation) is better. Feel free to push back against me on this, I want to come up with the best strategy so I would appreciate your honest input on how best to move forward.
-
-### Answer / proposed approach
-- Short answer: Yes—this “band-first” strategy is good and should reduce waste. We should solve-and-record broadly, then allocate to curriculum levels from an indexed pool rather than pre-filtering per level.
-
-- Concretely:
-  - Store all solved puzzles with full metadata (already supported by `PuzzleMetadata`), plus a per-partition histogram keyed by `(optimal_length, robots_moved)` and optionally by coarse wall density bins. Persist histogram into the manifest for O(1) availability.
-  - Maintain a `seen_seeds` (or `seen_layout_hashes`) set per `SpecKey` in the manifest to support incremental runs and dedup across sessions. Prefer dedup by `layout_hash` to avoid trivial target-robot variations.
-  - Generation stopping rule: run in chunks, after each chunk recompute coverage per curriculum level by summing across admissible bands; stop when all levels ≥ target counts or a global max budget is hit.
-  - Selection for training: implement a quota-based sampler per level that draws proportionally from its admissible bands to prevent mode collapse (stratified within level constraints).
-
-- Improvements to make it robust:
-  - Sharded Parquet writes (per worker) and post-run consolidation (or leave sharded) to avoid writer contention.
-  - Lightweight pre-solve filters (e.g., Manhattan lower bound to goal) to skip obviously-too-long boards and lift effective hit-rate.
-  - Track solver nodes expanded and time to allow future cost-aware generation (prioritize specs/bands with best hit-rate per second).
-  - Starvation backoff: if a level is underfilled, temporarily widen its admissible bands within a guardrail and record that deviation.
-
-- Why this beats level-by-level pre-filtering:
-  - Converts many hard rejections into useful inventory for other levels; reuses compute broadly.
-  - Enables global stopping criteria and incremental topping-up without re-solving duplicates.
-
-### Implementation notes (minimal changes needed)
-- Add manifest fields: per-partition band histogram, `seen_layout_hashes` bloom or rolling shard, generator/solver fingerprints.
-- Extend `PuzzleGenerator` to periodically flush histograms and seen-sets; add an outer controller loop to evaluate stop criteria.
-- Extend `BankSampler` to accept per-level band quotas and to consult histograms for availability.
-
-### Trade-offs / risks
-- Histograms and seen-sets can grow; use compact structures (counts, approximate bloom) and shard by partition.
-- Stratification slightly complicates the sampler but yields smoother training.
-- If generator rules change, histograms become incomparable—guard with version pins already proposed.
-
-### Additional questions (for alignment)
-- Are we okay with approximate dedup (bloom on `layout_hash`) to bound memory, or do we prefer exact sets with periodic compaction?
-  - I think approximation is okay
-- Should we include a coarse wall-complexity bin in histograms now, or defer until we see coverage gaps?
-  - I think include it for future-proofing but for now we'll be using 2-per quadrant for both the edge-T and central-L squares by default.
-- For starvation backoff, what max widening factor of `(optimal_length, robots_moved)` bands is acceptable before we’d rather keep generating?
-  - Actually I think initially we'll set this to 'none' (ie, always prefer generating rather than widening)
-
-## Progress
-- 2025-09-18: Wrote initial plan, answered alignment questions, and designed band-first generation strategy. Preparing manifest v1.1 changes (histograms, dedup fields) and sampler adjustments.
-- 2025-09-18: Implemented manifest v1.1 upgrade path and per-partition histograms `(optimal_length, robots_moved)` in `env/puzzle_bank.py`; backfilled defaults on load and incremented counts in `add_puzzles`. Lint check passed.
-- 2025-09-18: Added controller outline `run_band_first_precompute_controller` and `compute_level_coverage_from_histograms` in `env/precompute_pipeline.py` to drive chunked generation using manifest histograms. Lint check passed.
-- 2025-09-18: Exposed controller via CLI in `generate_curriculum_bank.py` with flags `--use_controller`, `--target_per_level`, `--max_puzzles_global`, and `--chunk_per_spec`. Lint check passed.
-- 2025-09-18: Added stratified sampling API `sample_puzzles_stratified` with monitoring in `BankSampler` (env/puzzle_bank.py) to support per-band quotas and capture outcomes.
-- 2025-09-18: Integrated stratified quotas into `CriteriaFilteredEnv` and `BankCurriculumManager` (auto-banding per optimal length) and attached sampling plan to `info` for monitoring.
-- 2025-09-18: Fixed None handling for `info` from `env.reset()` in `PuzzleGenerator` to prevent `'NoneType' object has no attribute 'get'` errors during precompute runs.
-- 2025-09-18: Ensured the controller respects custom curriculum configs by passing parsed levels through; default `train_agent.py` supports bank curriculum with `--curriculum --use_bank_curriculum` and a precomputed bank.
-
-## Next steps
-- Implement manifest v1.1 structure in `env/puzzle_bank.py` (histograms, fingerprints, dedup scaffolding).
-- Wire `add_puzzles` to increment histograms and persist.
-- Sketch precompute controller loop for chunked generation + stop criteria (no parallel yet).
-- Add logging of coverage per curriculum level using histograms.
-- Expose controller via CLI (optional new script entrypoint or extend `generate_curriculum_bank.py`).
-- Add sampler quotas/backoff logic (stratified within level constraints) and monitoring hooks.
-- Integrate stratified quotas into `CriteriaFilteredEnv`/`BankCurriculumManager` and surface monitoring via logs.
-- Add unit tests for new sampler method and controller coverage calculation; update README with CLI usage for controller.
-
-## Review #1
-
-- Concerns
-  - Bank reproducibility depends on regeneration-from-seed; `layout_blob` deserialization is unimplemented (`create_fixed_layout_from_metadata` raises NotImplementedError). Any generator drift breaks replay despite stored hashes. Suggest prioritizing a compact, versioned layout serialization and round-trip tests.
-  - Hash discipline: `SpecKey.generator_rules_version` defaults to "1.0" but there’s no enforcement that code changes bump it. Mismatch between stored `board_hash`/`layout_hash` and regenerated boards will silently fall back to exceptions only at runtime. Add an explicit generator fingerprint in manifest and assert on load.
-  - Solver metadata gaps: `nodes_expanded` and node-limit hits are not tracked in `PuzzleGenerator` (always 0/False). This weakens difficulty diagnostics and bank QA. The solvers already support metadata variants; wire them in.
-  - Criteria confusion: `precompute_pipeline.PuzzleGenerator.generate_puzzles_for_spec` treats `criteria['max_depth']` as a solver cutoff while curriculum criteria elsewhere refer to optimal_length and robots_moved. Risk of conflation in future changes; rename to `solver_max_depth_override` and keep types distinct.
-  - Sampler cache growth: `BankSampler._criteria_cache` is unbounded and never evicted; long runs with varying bands/criteria can grow memory. Add LRU with max entries and metrics.
-  - Manifest histograms: counts updated only via `add_puzzles`; no validation against file contents. If external edits occur or duplicates are appended, histograms can drift. Consider recompute/verify utility and duplicate prevention (e.g., unique `(spec_key, board_hash)` index or dedup pass).
-  - Stratified sampling coverage: allocation by weights doesn’t check availability before planning, so many bands may underfill silently. Expose deficit and optionally reallocate leftover to other bands to keep `total_sampled` close to `total_count`.
-  - Fallback path in `CriteriaFilteredEnv`: on failed sample, it creates a fresh random solvable env, which violates “no online solving during training”. At minimum, log and count separately; ideally, never fallback in training mode and instead surface a clear error/metric to fix bank coverage.
-  - RGB obs consistency: `RicochetRobotsEnv` sets fixed pixel size 96 for rgb_image but comments reference 128 in places; ensure all constants are consistent and documented. Also verify channels_first path for rgb returns the exact Box shape.
-  - Reward/termination semantics: step uses `step_penalty`, optional `noop_penalty`, and goal reward, but no per-move optimality shaping. That’s fine, but ensure tests cover truncation (`TimeLimit.truncated`) and that success is only set when not truncated (some wrappers rely on this, and `CriteriaFilteredEnv` assumes it).
-
-- Questions/uncertainties
-  - Should bank usage in training hard-fail when criteria underfill rather than fallback to online env? If not, what’s the desired policy for deficit reallocation among admissible bands?
-  - Target coverage per level: README suggests 1000; do we want adaptive targets based on observed hit-rates per spec to balance total compute?
-  - Multiple solvers: keep BFS default, but do we anticipate changing heuristics (e.g., `admissible_one`) during generation? If yes, we need solver fingerprints in manifest and possibly separate partitions or fields.
-  - Curriculum advancement: current `BankCurriculumManager` uses windowed success rate. Do we also want an optimality-gap threshold to avoid advancing on sloppy solves when metadata is available?
-  - Dedup granularity: prefer `layout_hash` or full `board_hash`? If we allow multi-round use of layouts with different target robots, layout-level dedup seems preferable; confirm.
-
-- Suggested improvements/fixes (high priority)
-  - Implement layout serialization/deserialization: define a minimal binary schema (dims, walls, robots, goal, target) with version header; store in `layout_blob` and validate round-trip against hashes. Add tests.
-  - Wire metadata-rich solving in precompute: use `solve_bfs_with_metadata`/`solve_astar_with_metadata` to populate `nodes_expanded`, and set `hit_node_limit`/`hit_depth_limit` correctly.
-  - Rename/clarify `criteria` usage in precompute controller: use explicit `solver_max_depth_override`; keep curriculum filters separate and enforced only at allocation/coverage.
-  - Add LRU cache and limits to `BankSampler` iterators; expose cache size metrics and an API to clear per spec.
-  - Enhance stratified sampler: compute availability per band from cached filtered views; reallocate unfilled quota to bands with surplus; record deficits in `plan` for monitoring.
-  - Add a `verify_manifest` CLI to recompute histograms from Parquet, detect duplicates, and optionally repair manifest.
-  - Make `CriteriaFilteredEnv`’s fallback optional and default to disabled in training; when disabled, raise with a helpful message including coverage stats from manifest.
-  - Standardize RGB constants and document in `README.md`; add a unit test that asserts observation space shape and dtype for both orders.
-
-- Nice-to-have / future work
-  - Store per-partition Bloom filter for `layout_hash` to avoid regenerating duplicates during long runs; rotate shards to bound size.
-  - Record solver time and nodes in manifest aggregates to guide spec prioritization in the controller (puzzles/sec, hit-rate per spec/band).
-  - Add quota-based curriculum level sampler that draws proportionally from admissible bands and respects per-band caps to avoid mode collapse.
-  - Provide a tiny demo bank in repo for tests/integration to decouple CI from heavy precompute.
-
-- Evidence from tests vs code
-  - Tests cover stratified weight allocation and histogram updates; current sampler meets allocation but doesn’t reallocate deficits (acceptable but noted).
-  - Precompute controller coverage test only asserts non-negative coverage; expand tests to check exact counts and spec matching with mixed entries.
-  - Env solvability tests validate `optimal_length` and solver limits; consistent with implementation.
-
-### Progress
-- Layout serialization/deserialization: Implemented compact binary layout blob and round-trip creation via `serialize_layout_to_blob` and `deserialize_layout_blob`. `create_fixed_layout_from_metadata` now uses the blob. Precompute stores `layout_blob` in `PuzzleMetadata`.
-- Solver metadata wiring: Switched precompute to use `solve_bfs_with_metadata`/`solve_astar_with_metadata`, recording `nodes_expanded`, `depth`, and computing `hit_node_limit` accurately.
-- Precompute controller arg clarity: Renamed internal override to `solver_max_depth_override` and updated controller to pass this key.
-- Bank sampler cache: Added LRU eviction to `_criteria_cache` (max 128 entries) and tracked order.
-- Stratified sampling: Added leftover reallocation to bands with remaining availability; plan now reports any `extra_sampled` per band.
-- Criteria fallback: Added `allow_fallback` flag to `CriteriaFilteredEnv` (default False); when disabled and sampling fails, it raises with guidance instead of silently generating online.
-- RGB rendering fix: Internal walls now render correctly via mask overwrite; background/overlay compositing corrected.
-
-## Review #2
-
-- Concerns
-  - Manifest histogram fidelity: counts are incremented on write but never validated against the Parquet contents. If files are edited externally or duplicated entries are appended, coverage used by the controller can drift. Add a verification utility and consider guarding `add_puzzles` with uniqueness on `(spec_key, board_hash)`.
-  - Controller stopping signal quality: `compute_level_coverage_from_histograms` sums raw histogram counts within bands but does not subtract puzzles already “reserved” for other levels or cap by per-level quotas. For overlapping bands/specs across levels, this can double-count availability, causing premature stop. We should either enforce non-overlapping specs per level or track per-level quotas in the manifest and compute effective residual coverage.
-  - Controller max-depth override: the loop uses the maximum of remaining levels’ `max_optimal_length` as `solver_max_depth_override` for all specs in the round. This may inflate solve cost on easy specs. Prefer per-spec depth caps derived from that spec’s contributing levels to reduce wasted solving.
-  - Criteria confusion remains in CLI path: `generate_curriculum_bank.py` still sets `criteria['max_depth']` alongside min/max optimal length. This mixes solver cutoff with curriculum constraints. Recommend renaming to `solver_max_depth_override` everywhere and not setting curriculum filters in generation when using the controller.
-  - Fallback in `CriteriaFilteredEnv`: behavior is safe (disabled by default), but training scripts could unknowingly enable it. Ensure training path explicitly sets `allow_fallback=False` and logs a hard error when sampling fails, with manifest coverage diagnostics.
-  - Sampler cache memory: LRU eviction exists, but there is no explicit memory cap nor metrics. Long runs with many levels/specs could still accumulate large filtered DataFrames. Add approximate byte-size tracking and expose sampler cache metrics via the monitoring hub.
-  - Layout blob completeness/versioning: Binary blob includes target robot; good for exact replay. If we ever want to reuse layouts with different targets, we’ll need a separate target-agnostic layout blob or a header field indicating whether target is included. Also add a version byte in the blob header to guard against schema changes.
-  - Tests are light on controller correctness: current test asserts non-negative coverage only. There are no tests ensuring the controller actually increases coverage toward targets or respects global budget. Add small end-to-end tests with tiny banks to validate convergence and stop conditions.
-
-- Questions / uncertainties
-  - Do we intend levels to have disjoint specs, or can multiple levels share the same `SpecKey` with overlapping bands? If overlapping, should controller coverage be computed with band-level disjoint accounting to avoid double-counting?
-  - Is seed reuse across specs acceptable if partition keys differ only by `generator_rules_version`? If not, manifest should track `seen_layout_hashes` per partition to avoid duplicate compute across versions.
-  - Should `BankCurriculumManager` gate advancement on both success rate and a maximum allowed optimality gap percentile when metadata is present?
-
-- Suggested improvements / fixes
-  - Add `verify_manifest` tool: recompute histograms from Parquet for a partition, detect duplicates by `(board_hash)` and option to repair manifest counts; run in CI for the demo bank.
-  - Improve controller allocation: compute per-spec target contributions derived from which levels the spec supports; prioritize generating for specs with the largest shortfall-to-time ratio; use per-spec depth overrides.
-  - Strengthen CLI separation: when `--use_controller` is set, skip curriculum filtering in generation entirely; only use solver overrides. Reserve filtering strictly for training-time sampling.
-  - Sampler metrics: expose `criteria_cache_entries`, approximate cached-DF rows and bytes, and last stratified plan deficits via `monitoring/hub.py` to assist in diagnosing starvation.
-  - Blob versioning: prepend a small header (e.g., magic + version) to `layout_blob`; add round-trip tests and mismatch error messages.
-  - Add a tiny seeded demo bank under `puzzle_bank.bak` (few entries per band) and wire tests to use it for deterministic CI without heavy generation.
-
-- Evidence (from code/tests)
-  - Histograms are updated in `PuzzleBank.add_puzzles`; controller reads them for coverage. No manifest verification path found.
-  - `BankSampler.sample_puzzles_stratified` implements weight-based allocation and leftover reallocation; plan reports `requested`, `sampled`, and `extra_sampled`. Tests cover allocation weights and underfilled bands but not leftover redistribution magnitude.
-  - `CriteriaFilteredEnv` sets `allow_fallback=False` by default and raises when sampling fails; good. Training harness must pass this through explicitly.
-  - Layout serialization/deserialization functions exist and are used in precompute; tests do not cover round-trip hash validation yet.
-
-### Stratified sampling summary and expected behavior (requested)
-
-- What stratified sampling does
-  - Stratified sampling splits the admissible criteria into band slices defined by ranges on `optimal_length` (OL) and `robots_moved` (RM). Each band receives a weight. We first allocate an integer quota to each band proportional to its weight (floor + largest fractional remainder), then draw from a cached iterator built for that band. If a band underfills (runs out of items), the sampler reallocates leftover quota greedily to bands that still have availability. The final `plan` reports requested, sampled, and any `extra_sampled` per band.
-
-- Concrete example: request 1000 puzzles with OL in [3, 5] and RM in [2, 3]
-  - Natural banding used by `BankCurriculumManager` (auto discrete OL bands, uniform weights):
-    - Band A: OL=3, RM in [2,3]
-    - Band B: OL=4, RM in [2,3]
-    - Band C: OL=5, RM in [2,3]
-    - With equal weights, initial allocation is roughly 333/333/334 across A/B/C (floor + remainder).
-  - Sampling mechanics:
-    - For each band, we draw from entries matching that OL and RM∈{2,3} in the same `SpecKey` partition.
-    - If all three bands have ample supply (≥ requested), the outcome will be very close to A≈333, B≈333, C≈334, with small variations only from the integer rounding of 1000.
-    - If a band underfills (not enough items), its deficit is greedily reallocated to other bands with remaining availability until total sampled reaches 1000.
-
-- Behavior under different bank compositions (assume each (OL,RM) pairing has at least 1000 entries overall)
-  - Balanced bank (roughly equal counts for (3,2), (3,3), (4,2), (4,3), (5,2), (5,3)):
-    - Each band (by OL) will have similar availability. Expect near-uniform sampling across A/B/C as above: ~333/~333/~334. Within each band, the RM mix is whatever exists in the filtered rows; since RM is not further banded here, the proportion between RM=2 and RM=3 will mirror their ratio in the band’s filtered pool.
-  - Imbalanced bank (some (OL,RM) pairings much more common than others, but all ≥1000 overall):
-    - With equal weights and the same three OL bands, the sampler still targets ~333/~333/~334 by OL. Because RM is not separately weighted, the within-band draw will reflect the band’s internal mix of RM=2 vs RM=3. If you need explicit balance across RM as well, define six bands: (OL=3,RM=2), (OL=3,RM=3), … (OL=5,RM=3), with equal or custom weights to enforce a desired 6-way distribution (e.g., ~166 each for 1000 total).
-    - If you keep three OL-only bands but the OL=5 inventory were meaningfully thinner (contrary to the assumption), the sampler would reallocate leftover to OL=4 then OL=3 until 1000 is reached.
-
-- Recommendation
-  - For explicit control when bank composition is skewed, band on both OL and RM (six bands) and set weights to enforce the target proportions; otherwise, the default OL-only bands will let RM proportions drift according to availability within each OL slice.
+## What remains / follow-ups
+- Bank curriculum still fails at level 0 because the shipped puzzle bank lacks entries that match the first criteria band; we either need to relax those criteria or regenerate the bank if we want automated tests over the bank path.
+- Stage this change set for review once we confirm the updated logging resolves the original dashboard confusion across a longer training window.
