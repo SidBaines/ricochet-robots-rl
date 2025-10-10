@@ -656,7 +656,12 @@ def main() -> None:
             def _on_step(self) -> bool:
                 # Log curriculum stats if available
                 if self.curriculum_manager is not None:
-                    stats = self.curriculum_manager.get_stats()
+                    stats_fn = getattr(self.curriculum_manager, "get_stats", None)
+                    if stats_fn is None:
+                        stats_fn = getattr(self.curriculum_manager, "get_curriculum_stats", None)
+                    if stats_fn is None:
+                        return True
+                    stats = stats_fn()
                     
                     # Log to console every 1000 steps
                     if self.verbose > 0 and self.num_timesteps % 1000 == 0:
@@ -693,7 +698,12 @@ def main() -> None:
                         self._last_logged_stats = 0
                     def _on_step(self) -> bool:
                         lvl = self.manager.get_current_level()
-                        stats = self.manager.get_stats()
+                        stats_fn = getattr(self.manager, "get_stats", None)
+                        if stats_fn is None:
+                            stats_fn = getattr(self.manager, "get_curriculum_stats", None)
+                        if stats_fn is None:
+                            return True
+                        stats = stats_fn()
                         
                         # Log curriculum stats every 100 steps for more frequent updates
                         if self.num_timesteps - self._last_logged_stats >= 100:
@@ -748,13 +758,46 @@ def main() -> None:
             class _HubEpisodeMetrics(BaseCallback):
                 def __init__(self, verbose=0):
                     super().__init__(verbose)
+                    self._rollout_successes: list[int] = []
+                    self._rollout_lengths: list[int] = []
+                    self._rollout_returns: list[float] = []
+                    self._episode_returns: dict[int, float] = {}
+                    self._episode_lengths: dict[int, int] = {}
+                    self._note_emitted = False
                 def _on_step(self) -> bool:
                     try:
                         infos = self.locals.get('infos', [])  # type: ignore[assignment]
                     except Exception:
                         infos = []
+                    rewards = self.locals.get('rewards', [])  # type: ignore[assignment]
+                    dones = self.locals.get('dones', [])  # type: ignore[assignment]
+                    if hasattr(rewards, 'tolist'):
+                        rewards_seq = rewards.tolist()
+                    else:
+                        rewards_seq = list(rewards) if isinstance(rewards, (list, tuple)) else []
+                    if hasattr(dones, 'tolist'):
+                        dones_seq = dones.tolist()
+                    else:
+                        dones_seq = list(dones) if isinstance(dones, (list, tuple)) else []
+
+                    # Emit a one-time note explaining success metrics to the monitoring streams.
+                    if not self._note_emitted:
+                        try:
+                            hub.log_text(
+                                "train/success_rate_note",
+                                "train/success_rate (windowed) reflects the MonitoringHub rolling window; "
+                                "SB3's rollout/success_rate remains the stochastic training view, and eval/success_rate "
+                                "comes from deterministic eval episodes.",
+                                self.num_timesteps,
+                            )
+                        except Exception:
+                            pass
+                        self._note_emitted = True
                     # SB3 provides a list of info dicts for each parallel env
-                    for info in infos or []:
+                    for idx, info in enumerate(infos or []):
+                        if len(rewards_seq) > idx:
+                            self._episode_returns[idx] = self._episode_returns.get(idx, 0.0) + float(rewards_seq[idx])
+                        self._episode_lengths[idx] = self._episode_lengths.get(idx, 0) + 1
                         if not isinstance(info, dict):
                             continue
                         # Only log on episode end when env attaches the metric
@@ -773,7 +816,34 @@ def main() -> None:
                                 hub.log_scalar('train/optimal_length', float(info['optimal_length']), self.num_timesteps)
                             except Exception:
                                 pass
+                        episode_info = info.get('episode') if isinstance(info, dict) else None
+                        done_flag = bool(len(dones_seq) > idx and dones_seq[idx])
+                        if episode_info is not None or done_flag:
+                            length = int((episode_info or {}).get('l', self._episode_lengths.get(idx, 0)))
+                            ret = float((episode_info or {}).get('r', self._episode_returns.get(idx, 0.0)))
+                            success = 1 if bool(info.get('is_success', False)) else 0
+                            self._rollout_successes.append(success)
+                            self._rollout_lengths.append(length)
+                            self._rollout_returns.append(ret)
+                            self._episode_returns[idx] = 0.0
+                            self._episode_lengths[idx] = 0
                     return True
+                def _on_rollout_end(self) -> None:
+                    if self._rollout_successes or self._rollout_lengths or self._rollout_returns:
+                        try:
+                            hub.on_rollout_end({
+                                'global_step': self.num_timesteps,
+                                'rollout_successes': self._rollout_successes,
+                                'rollout_lengths': self._rollout_lengths,
+                                'rollout_returns': self._rollout_returns,
+                            })
+                        except Exception:
+                            pass
+                    self._rollout_successes.clear()
+                    self._rollout_lengths.clear()
+                    self._rollout_returns.clear()
+                    self._episode_returns.clear()
+                    self._episode_lengths.clear()
             callbacks.append(_HubEpisodeMetrics(verbose=0))
         
         # Always-on hub callback for periodic trajectory logging (independent of eval_fixedset)
@@ -1007,5 +1077,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

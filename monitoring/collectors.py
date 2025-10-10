@@ -43,7 +43,11 @@ class EpisodeStatsCollector(BaseCollector):
             self.return_window.append(float(r))
         step = context.get("global_step")
         if len(self.success_window) > 0:
-            hub.log_scalar("train/success_rate", sum(self.success_window) / len(self.success_window), step)
+            rate = sum(self.success_window) / len(self.success_window)
+            hub.log_scalar("train/success_rate_window", rate, step)
+            # Retain legacy tag for anyone already scraping it, but prefer the
+            # explicit windowed name to differentiate from SB3's rollout metric.
+            hub.log_scalar("train/success_rate", rate, step)
         if len(self.length_window) > 0:
             hub.log_scalar("train/episode_length/mean", sum(self.length_window) / len(self.length_window), step)
         if len(self.return_window) > 0:
@@ -98,5 +102,4 @@ class CurriculumProgressCollector(BaseCollector):
                 hub.log_scalar("curriculum/episodes_at_level", float(stats["episodes_at_level"]), step)
             if "total_episodes" in stats:
                 hub.log_scalar("curriculum/total_episodes", float(stats["total_episodes"]), step)
-
 

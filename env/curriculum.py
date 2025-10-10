@@ -246,6 +246,11 @@ class CurriculumManager:
             'window_size': len(self.success_rate_window),
         }
 
+    # Backwards-compatibility shim for call sites expecting BankCurriculumManager API
+    def get_stats(self) -> Dict[str, Any]:
+        """Alias for :meth:`get_curriculum_stats` used by older logging hooks."""
+        return self.get_curriculum_stats()
+
 
 class CurriculumWrapper(GymEnvBase):
     """
