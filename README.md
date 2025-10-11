@@ -108,6 +108,37 @@ Tweak these keys in your YAML config to switch policies:
 - `drc`: `true` to enable the recurrent DRC policy (requires sb3-contrib)
 - `resnet`: `true` to swap in the ResNet feature extractor baseline
 
+### Resume or Warmstart Training
+
+Use the new initialisation controls to decide how a run should start:
+
+- `init_mode: fresh` (default) starts from a randomly initialised policy.
+- `init_mode: resume` loads a full checkpoint (including optimiser/LR schedule) and, by default, trains until `resume_target_total_timesteps` or `timesteps` is reached. Set `resume_additional_timesteps: true` to treat `timesteps` as additional steps instead.
+- `init_mode: warmstart` instantiates a fresh optimiser/schedule but loads policy weights from `warmstart_params_path` for fine-tuning.
+
+VecNormalize stats can be restored via `resume_vecnormalize_path`, `warmstart_vecnormalize_path`, or `vecnorm_load_path`.
+
+When you prefer a structured block in YAML, you can also supply an `initialization` section:
+
+```yaml
+initialization:
+  mode: resume
+  resume:
+    checkpoint_path: checkpoints/latest_model.zip
+    target_total_timesteps: 1_000_000  # optional; defaults to `timesteps`
+    vecnormalize_path: runs/ppo/vecnormalize.pkl
+```
+
+If you need a warmstart instead:
+
+```yaml
+initialization:
+  mode: warmstart
+  warmstart:
+    params_path: checkpoints/pretrained_policy.zip
+    vecnormalize_path: runs/ppo/vecnormalize.pkl  # optional
+```
+
 ### Evaluation
 
 Evaluate a trained model:
@@ -157,6 +188,8 @@ Notes:
 - `--save-path`: Model save path
 - `--save-freq`: Checkpoint frequency (timesteps)
 - `--eval-freq`: Evaluation frequency (timesteps)
+- `--init-mode` / `initialization`: Controls (fresh | resume | warmstart) model initialisation and associated artefacts
+- `--resume-additional-timesteps`: Treat `--timesteps` as additional steps when resuming (otherwise interpreted as a total target)
 
 ## Testing
 

@@ -105,7 +105,24 @@ def build_training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-freq", type=int, default=5000, help="Timesteps between checkpoints (0=disable)")
     parser.add_argument("--eval-freq", type=int, default=1000, help="Timesteps between evals (0=disable)")
     parser.add_argument("--eval-episodes", type=int, default=20)
-    parser.add_argument("--load-path", type=str, default=None, help="Path to a saved model .zip to resume training from")
+    parser.add_argument("--init-mode", choices=["fresh", "resume", "warmstart"], default="fresh",
+                        help="Initialisation strategy: 'fresh' creates a new model, 'resume' continues from a full checkpoint, 'warmstart' loads weights but resets optimiser state")
+    parser.add_argument("--resume-checkpoint-path", type=str, default=None,
+                        help="Checkpoint .zip to load when init_mode=resume")
+    parser.add_argument("--resume-vecnormalize-path", type=str, default=None,
+                        help="VecNormalize statistics file to load when resuming (optional)")
+    parser.add_argument("--resume-target-total-timesteps", type=int, default=None,
+                        help="Target total timestep count when resuming; remaining steps will be computed against the checkpoint")
+    parser.add_argument("--resume-additional-timesteps", action="store_true",
+                        help="Interpret --timesteps as additional steps when resuming instead of a total target")
+    parser.add_argument("--warmstart-params-path", type=str, default=None,
+                        help="Checkpoint .zip providing policy parameters for warmstart initialisation")
+    parser.add_argument("--warmstart-vecnormalize-path", type=str, default=None,
+                        help="VecNormalize statistics file to load alongside warmstart parameters (optional)")
+    parser.add_argument("--vecnorm-load-path", type=str, default=None,
+                        help="Explicit VecNormalize statistics file to load (overrides default discovery)")
+    parser.add_argument("--load-path", type=str, default=None,
+                        help="[Deprecated] Equivalent to setting init_mode=resume and resume_checkpoint_path to this value")
     # Monitoring / logging toggles
     parser.add_argument("--monitor-tensorboard", dest="monitor_tensorboard", action="store_true")
     parser.add_argument("--no-monitor-tensorboard", dest="monitor_tensorboard", action="store_false")
@@ -183,6 +200,63 @@ def apply_profile_presets(args_dict: Dict[str, Any], profile: str, defaults: Dic
         args_dict["max_grad_norm"] = 0.5
         args_dict["normalize_advantage"] = True
         args_dict["vecnorm"] = False
+
+
+def apply_initialization_overrides(args: argparse.Namespace, init_block: Any) -> None:
+    """Apply structured initialization configuration overrides onto parsed args."""
+    if init_block is None:
+        return
+    if not isinstance(init_block, dict):
+        raise ValueError("'initialization' config must be a mapping")
+
+    valid_modes = {"fresh", "resume", "warmstart"}
+
+    def _clean_optional_path(value: Any, field_name: str) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string path or null")
+        stripped = value.strip()
+        return stripped or None
+
+    mode_value = init_block.get("mode", args.init_mode)
+    if mode_value not in valid_modes:
+        raise ValueError(f"initialization.mode must be one of {sorted(valid_modes)}")
+    args.init_mode = mode_value
+
+    generalized_vecnorm = init_block.get("vecnormalize_path")
+    if generalized_vecnorm is not None:
+        args.vecnorm_load_path = _clean_optional_path(generalized_vecnorm, "initialization.vecnormalize_path")
+
+    resume_cfg = init_block.get("resume")
+    if resume_cfg is not None:
+        if not isinstance(resume_cfg, dict):
+            raise ValueError("initialization.resume must be a mapping")
+        if "checkpoint_path" in resume_cfg:
+            args.resume_checkpoint_path = _clean_optional_path(resume_cfg["checkpoint_path"], "initialization.resume.checkpoint_path")
+        if "vecnormalize_path" in resume_cfg:
+            args.resume_vecnormalize_path = _clean_optional_path(resume_cfg["vecnormalize_path"], "initialization.resume.vecnormalize_path")
+        if "target_total_timesteps" in resume_cfg:
+            value = resume_cfg["target_total_timesteps"]
+            if value is None:
+                args.resume_target_total_timesteps = None
+            elif isinstance(value, numbers.Integral):
+                if value < 0:
+                    raise ValueError("initialization.resume.target_total_timesteps must be non-negative")
+                args.resume_target_total_timesteps = int(value)
+            else:
+                raise ValueError("initialization.resume.target_total_timesteps must be an integer or null")
+        if "additional_timesteps" in resume_cfg:
+            args.resume_additional_timesteps = bool(resume_cfg["additional_timesteps"])
+
+    warmstart_cfg = init_block.get("warmstart")
+    if warmstart_cfg is not None:
+        if not isinstance(warmstart_cfg, dict):
+            raise ValueError("initialization.warmstart must be a mapping")
+        if "params_path" in warmstart_cfg:
+            args.warmstart_params_path = _clean_optional_path(warmstart_cfg["params_path"], "initialization.warmstart.params_path")
+        if "vecnormalize_path" in warmstart_cfg:
+            args.warmstart_vecnormalize_path = _clean_optional_path(warmstart_cfg["vecnormalize_path"], "initialization.warmstart.vecnormalize_path")
 
 def make_env_factory(args: argparse.Namespace) -> Callable[[], RicochetRobotsEnv]:
     """Return a thunk to create an environment instance based on CLI args."""
@@ -352,6 +426,7 @@ def main() -> None:
 
     config_path = cli_args.config_path
     config_data = load_config_file(config_path)
+    init_config_block = config_data.pop("initialization", None)
 
     training_parser = build_training_parser()
     defaults_namespace = training_parser.parse_args([])
@@ -384,6 +459,26 @@ def main() -> None:
     args.config_path = config_path
     print(f"Loaded configuration from {config_path}")
 
+    # Apply structured initialization overrides and handle deprecated --load-path usage
+    apply_initialization_overrides(args, init_config_block)
+
+    if args.load_path:
+        coerced_path = args.load_path.strip()
+        if coerced_path:
+            if args.init_mode == "fresh" and args.resume_checkpoint_path is None and args.warmstart_params_path is None:
+                args.init_mode = "resume"
+                args.resume_checkpoint_path = coerced_path
+                print("Note: --load-path is deprecated. Using init_mode=resume with the provided checkpoint.")
+            elif args.init_mode != "resume":
+                print("Warning: --load-path provided but ignored because init_mode is not 'resume'.")
+        args.load_path = None
+
+    # Ensure optional fields exist on args Namespace even if not provided via CLI/defaults
+    for attr in ("resume_checkpoint_path", "resume_vecnormalize_path", "resume_target_total_timesteps",
+                 "warmstart_params_path", "warmstart_vecnormalize_path", "vecnorm_load_path"):
+        if not hasattr(args, attr):
+            setattr(args, attr, None)
+
     # Initialize profiling if enabled
     if args.enable_profiling:
         try:
@@ -394,6 +489,13 @@ def main() -> None:
         except ImportError:
             print("Warning: Profiling requested but profiling module not available")
             args.enable_profiling = False
+
+    if args.init_mode == "resume" and not args.resume_checkpoint_path:
+        raise ValueError("init_mode='resume' requires resume_checkpoint_path to be set")
+    if args.init_mode == "warmstart" and not args.warmstart_params_path:
+        raise ValueError("init_mode='warmstart' requires warmstart_params_path to be set")
+    if args.init_mode == "resume" and args.resume_additional_timesteps and args.resume_target_total_timesteps is not None:
+        print("Note: resume_additional_timesteps is True; resume_target_total_timesteps will be ignored.")
 
     # Enforce mutual exclusivity for recurrent modes
     if sum([int(args.convlstm), int(args.drc), int(args.resnet)]) > 1:
@@ -471,27 +573,64 @@ def main() -> None:
     except ImportError:
         _VecNormalize = None  # type: ignore
     vecnorm_used = False
+    vecnorm_loaded_from: str | None = None
     if args.vecnorm and _VecNormalize is not None:
-        # Prefer loading existing VecNormalize stats if present, else create a fresh wrapper
-        try:
-            vecnorm_path = os.path.join(args.log_dir, "vecnormalize.pkl")
-            if os.path.exists(vecnorm_path):
-                vec_env = _VecNormalize.load(vecnorm_path, venv=vec_env)
+        candidate_paths: list[tuple[str, str]] = []
+        seen_paths: set[str] = set()
+
+        def _push_path(label: str, path: str | None) -> None:
+            if path is None:
+                return
+            normalized = path.strip()
+            if not normalized or normalized in seen_paths:
+                return
+            seen_paths.add(normalized)
+            candidate_paths.append((label, normalized))
+
+        if args.init_mode == "resume":
+            _push_path("resume", args.resume_vecnormalize_path)
+        elif args.init_mode == "warmstart":
+            _push_path("warmstart", args.warmstart_vecnormalize_path)
+        _push_path("override", args.vecnorm_load_path)
+        default_vecnorm_path = os.path.join(args.log_dir, "vecnormalize.pkl")
+        _push_path("default", default_vecnorm_path)
+
+        mandatory_path = args.resume_vecnormalize_path if args.init_mode == "resume" else None
+        if mandatory_path is not None:
+            mandatory_path = mandatory_path.strip()
+            if mandatory_path and not os.path.exists(mandatory_path):
+                raise FileNotFoundError(f"VecNormalize stats required for resume were not found at {mandatory_path}")
+
+        last_error: Exception | None = None
+        for label, candidate in candidate_paths:
+            if not os.path.exists(candidate):
+                continue
+            try:
+                vec_env = _VecNormalize.load(candidate, venv=vec_env)
                 vec_env.training = True  # type: ignore[attr-defined]
                 vecnorm_used = True
-            else:
-                vec_env = _VecNormalize(
-                    vec_env,
-                    training=True,
-                    norm_obs=args.vecnorm_norm_obs,
-                    norm_reward=args.vecnorm_norm_reward,
-                    clip_obs=args.vecnorm_clip_obs,
-                    clip_reward=args.vecnorm_clip_reward,
+                vecnorm_loaded_from = candidate
+                print(f"Loaded VecNormalize statistics from {candidate} ({label})")
+                break
+            except Exception as exc:  # pragma: no cover - defensive logging only
+                last_error = exc
+                continue
+
+        if not vecnorm_used:
+            if mandatory_path is not None:
+                raise RuntimeError(
+                    "VecNormalize statistics could not be loaded from the required resume path."
+                    + (f" Last error: {last_error}" if last_error is not None else "")
                 )
-                vecnorm_used = True
-        except Exception:
-            # Fallback: proceed without VecNormalize if loading/creation fails
-            vecnorm_used = False
+            vec_env = _VecNormalize(
+                vec_env,
+                training=True,
+                norm_obs=args.vecnorm_norm_obs,
+                norm_reward=args.vecnorm_norm_reward,
+                clip_obs=args.vecnorm_clip_obs,
+                clip_reward=args.vecnorm_clip_reward,
+            )
+            vecnorm_used = True
 
     # Choose policy: for tiny grids (<8), prefer MlpPolicy to avoid NatureCNN kernel issues
     tiny_grid = False
@@ -591,16 +730,20 @@ def main() -> None:
     clip_value: Callable[[float], float] | float = _make_schedule(args.clip_schedule, args.clip_range, args.clip_end)
 
     # Initialize or load algorithm
-    if args.load_path is not None and len(str(args.load_path)) > 0:
-        # Resume from checkpoint
+    model = None  # type: ignore[assignment]
+    resume_mode = args.init_mode == "resume"
+    warmstart_mode = args.init_mode == "warmstart"
+
+    if resume_mode:
+        checkpoint_path = args.resume_checkpoint_path or ""
         try:
             if (args.convlstm or args.drc) and RecurrentPPO is not None:
-                model = RecurrentPPO.load(args.load_path, env=vec_env, device=args.device)  # type: ignore[assignment]
+                model = RecurrentPPO.load(checkpoint_path, env=vec_env, device=args.device)  # type: ignore[assignment]
             else:
-                model = PPO.load(args.load_path, env=vec_env, device=args.device)  # type: ignore[assignment]
-            print(f"Loaded model from {args.load_path} and attached env; continuing training")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model from {args.load_path}: {e}")
+                model = PPO.load(checkpoint_path, env=vec_env, device=args.device)  # type: ignore[assignment]
+            print(f"Loaded model from {checkpoint_path} and attached env for resuming")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load model from {checkpoint_path}: {exc}")
     else:
         if args.convlstm or args.drc:
             # Use sb3-contrib RecurrentPPO for recurrent training
@@ -643,6 +786,44 @@ def main() -> None:
                 device=args.device,
                 verbose=1,
             )
+
+        if warmstart_mode:
+            params_path = args.warmstart_params_path or ""
+            try:
+                model.set_parameters(params_path, exact_match=True, device=args.device)
+            except Exception as exc:
+                try:
+                    model.set_parameters(params_path, exact_match=False, device=args.device)
+                except Exception as exc2:
+                    raise RuntimeError(f"Failed to warmstart from {params_path}: {exc2}") from exc
+            print(f"Loaded policy parameters from {params_path} for warmstart initialisation")
+
+    if model is None:
+        raise RuntimeError("Model initialisation failed")
+
+    reset_num_timesteps = True
+    learn_timesteps = max(0, int(args.timesteps))
+    if resume_mode:
+        reset_num_timesteps = False
+        current_timesteps = int(getattr(model, "num_timesteps", 0))
+        if args.resume_additional_timesteps:
+            learn_timesteps = max(0, int(args.timesteps))
+            print(f"Resuming for an additional {learn_timesteps} timesteps (current: {current_timesteps})")
+        else:
+            target_total = args.resume_target_total_timesteps
+            if target_total is None:
+                target_total = int(args.timesteps)
+            if target_total < 0:
+                raise ValueError("resume_target_total_timesteps must be non-negative")
+            remaining = max(0, int(target_total) - current_timesteps)
+            learn_timesteps = remaining
+            print(
+                f"Resuming towards target total {target_total} timesteps. "
+                f"Already trained: {current_timesteps}. Remaining: {learn_timesteps}."
+            )
+    elif warmstart_mode:
+        # Warmstart keeps optimiser fresh but uses pre-trained weights
+        print(f"Warmstart initialisation complete; training for {learn_timesteps} timesteps from scratch schedule")
 
     # Callbacks: periodic checkpoint and eval success-rate logging + monitoring hub
     callbacks = []
@@ -1173,15 +1354,21 @@ def main() -> None:
         pass
 
     # Wrap training with profiling
-    if args.enable_profiling:
-        try:
-            from profiling import profile
-            with profile("training_total", track_memory=True):
-                model.learn(total_timesteps=args.timesteps, callback=callbacks if callbacks else None)
-        except ImportError:
-            model.learn(total_timesteps=args.timesteps, callback=callbacks if callbacks else None)
+    learn_kwargs = dict(total_timesteps=learn_timesteps, callback=callbacks if callbacks else None,
+                        reset_num_timesteps=reset_num_timesteps)
+
+    if learn_timesteps > 0:
+        if args.enable_profiling:
+            try:
+                from profiling import profile
+                with profile("training_total", track_memory=True):
+                    model.learn(**learn_kwargs)
+            except ImportError:
+                model.learn(**learn_kwargs)
+        else:
+            model.learn(**learn_kwargs)
     else:
-        model.learn(total_timesteps=args.timesteps, callback=callbacks if callbacks else None)
+        print("No training timesteps requested; skipping model.learn().")
     
     model.save(args.save_path)
     # Save VecNormalize statistics if used

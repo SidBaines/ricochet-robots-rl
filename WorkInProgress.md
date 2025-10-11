@@ -3,18 +3,35 @@ Contains a description, detailed specifications, discussion, notes, questions an
 
 ## Current task
 We've implemented stage 2 of the development process, and we're in the process of checking it. At the moment, we're focussing on getting the training code to work properly.
-In particular, I amnoticing that the logging isn't quite working as I'd hoped:
-1) Wandb doesnt ever seem to get anything logged to evals other than trajectories. I'd like the rest of the eval metrics to be logged there too
-2) The trajectories that are logged don't appear to be good. They are appearing as images which show a gradient from black at the top to blue at the bottom. I don't know what is happening but I'd like you to investigate and try and make sure we're logging videos of rollouts (ideally we keep a set of centralised rendering/visualisation tools; I think this already exists)
+In particular, I want to make sure that if a training run is paused (or even just ends), we can continue the training. 
+I want to be able to do this in two different ways (on top of the default):
+- Start training again, with randomly initialised model (default)
+- Continue training, from same step/with same parameters, at same level, etc.
+- Restart training (ie start from level 0/learning rate etc.), but by loading in a pre-trained model
+This should be configurable in the run yaml file, with a flag indicating which mode we run in and then different blocks indicating the relevant params for the chosen case.
+In the 'continue training' case, this should keep track of the learning rate & any other relevant params (I think there are methods in pytorch to do this? Or maybe I'm thinking of Hugging Face? Basically, use module if it makes sense/is convenient to do so)
 
-## Progress 2025-09-17
-- Reviewed the WandB integration and discovered that SB3's `EvalCallback` results were never forwarded to the monitoring hub, so WandB only saw the manual trajectory artifacts.
-- Added a logger writer (`_HubEvalMetricWriter`) that forwards any `eval/` scalars emitted by SB3 into the monitoring hub so WandB and TensorBoard record the deterministic evaluation metrics alongside the trajectory media.
-- Reworked `TrajectoryRecorder` to prefer the shared matplotlib-based renderer when capturing frames (with a safe fallback to env renders) so rollout videos come from the central visualisation pipeline instead of raw env captures that produced the blue gradient artifacts.
-- Updated the periodic training/eval trajectory callbacks to reuse the renderer, and verified the modified modules compile cleanly (`python -m compileall monitoring/evaluators.py train_agent.py`).
-- Added a lightweight callback bridge that reads `EvalCallback`'s stored statistics and forwards mean reward/length (and success rate when available) straight to the monitoring hub so WandB always receives the deterministic eval scalars even if the SB3 logger integration changes.
+## 2025-09-11
+- Reviewed `train_agent.py` flow: currently only supports fresh training or loading a checkpoint via `--load_path`, always calling `model.learn(..., reset_num_timesteps=True)` implicitly. No explicit handling of resume vs warm-start modes.
+- Checked `configs/train_defaults.yaml` to understand existing configuration surface. No fields yet for resume modes.
+- Initial thought: introduce a `training_mode` flag with options like `fresh`, `resume`, `warmstart`, plus nested config for each. Need to ensure SB3 scheduler/state is preserved for resume (combine `model.load` with `reset_num_timesteps=False`) and reinitialised for warmstart (likely instantiate fresh model then call `set_parameters`).
 
-## Next steps
-- Run a short training/eval cycle with `--monitor-wandb` to confirm eval scalars now appear in the WandB run and the logged videos show the rendered board.
-- If the WandB run still misses metrics, inspect the logger output to ensure the new writer executes (add temporary debug logging if needed).
-- Tweak renderer cell size or FPS if the new videos need visual adjustments once confirmed in WandB.
+- Implemented new initialisation pipeline:
+  - Added CLI/config args (`init_mode`, `resume_*`, `warmstart_*`, `vecnorm_load_path`) and `initialization` YAML block parsing helper (`apply_initialization_overrides`).
+  - Replaced `--load-path` handling with structured resume/warmstart flows, including validation and informative prints.
+  - Enhanced VecNormalize loading to honour explicit paths and fail fast when a resume-specific stats file is missing.
+  - Computed `learn_timesteps`/`reset_num_timesteps` based on mode (additional vs target total semantics) and wired into training loop.
+  - Added warmstart parameter loading via `model.set_parameters` while keeping optimiser fresh.
+- Updated `README.md` with resume/warmstart guidance and example `initialization` blocks.
+
+### Testing
+- `python -m compileall train_agent.py` (quick syntax validation)
+
+### Uncertainties / Questions
+- Need to confirm whether VecNormalize stats should also be restored during resume/warmstart. Likely yes for resume; warmstart might optionally load.
+- Check existing checkpoint layout—does `CheckpointCallback` already drop `.zip` plus `.pkl` for VecNormalize? Need to validate to ensure we can locate resumable assets reliably.
+- Should we expose additional convenience helpers for computing remaining timesteps (e.g. auto-detect from checkpoint metadata) beyond the current target-total vs additional toggle?
+
+### Next steps
+- Verify on a small dry-run that resume + warmstart behave as expected once a checkpoint is available (requires saved checkpoint to test end-to-end).
+- Confirm whether we should persist any metadata about the init mode in saved config/logs (for auditability).
