@@ -89,7 +89,7 @@ def get_default_curriculum_levels() -> List[CurriculumLevel]:
                 height=16, width=16, num_robots=4,
                 edge_t_per_quadrant=2, central_l_per_quadrant=2
             ),
-            min_optimal_length=1,
+            min_optimal_length=2,
             max_optimal_length=4,
             min_robots_moved=2,
             max_robots_moved=3,

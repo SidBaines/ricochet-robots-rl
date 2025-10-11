@@ -129,6 +129,7 @@ class CriteriaFilteredEnv(GymEnvBase):
                 total_count=1,
                 bands=self.criteria.bands,
                 random_seed=None,
+                warn_on_empty_band=self.verbose,
             )
             metadata = samples[0] if samples else None
         else:

@@ -59,7 +59,7 @@
           "central_l_per_quadrant": 2,
           "generator_rules_version": "1.0"
         },
-        "min_optimal_length": 1,
+        "min_optimal_length": 2,
         "max_optimal_length": 4,
         "min_robots_moved": 2,
         "max_robots_moved": 3

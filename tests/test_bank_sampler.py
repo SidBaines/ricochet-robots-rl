@@ -87,3 +87,32 @@ def test_stratified_respects_bounds_and_manifest_histogram_updates():
         assert plan["bands"][1]["sampled"] == 0
 
 
+def test_stratified_falls_back_to_other_bands_when_requested_band_empty():
+    with tempfile.TemporaryDirectory() as tmp:
+        bank = PuzzleBank(tmp)
+        spec = SpecKey(height=16, width=16, num_robots=4, edge_t_per_quadrant=2, central_l_per_quadrant=2)
+
+        # Populate only the first band's bounds
+        puzzles = [
+            _make_metadata(spec, seed=6000 + i, optimal_length=1, robots_moved=1)
+            for i in range(5)
+        ]
+        bank.add_puzzles(puzzles)
+
+        sampler = BankSampler(bank)
+        bands = [
+            {"min_optimal_length": 1, "max_optimal_length": 1, "min_robots_moved": 1, "max_robots_moved": 1, "weight": 0.0},
+            {"min_optimal_length": 2, "max_optimal_length": 2, "min_robots_moved": 1, "max_robots_moved": 1, "weight": 1.0},
+        ]
+
+        samples = sampler.sample_puzzles_stratified(spec_key=spec, total_count=1, bands=bands, random_seed=13)
+        assert len(samples) == 1
+
+        plan = sampler.get_last_stratified_plan()
+        assert plan is not None
+        # Second band is empty but was requested
+        assert plan["bands"][1]["requested"] == 1
+        assert plan["bands"][1]["sampled"] == 0
+        # First band should report the redistributed draw
+        assert plan["bands"][0].get("extra_sampled") == 1
+

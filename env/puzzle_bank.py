@@ -622,6 +622,7 @@ class BankSampler:
         total_count: int,
         bands: List[Dict[str, Any]],
         random_seed: Optional[int] = None,
+        warn_on_empty_band: bool = False,
     ) -> List[PuzzleMetadata]:
         """Stratified sampling across bands defined by (ol, rm) ranges with weights.
 
@@ -633,6 +634,7 @@ class BankSampler:
                 - min_robots_moved, max_robots_moved
                 - weight (float) optional; defaults to 1.0
             random_seed: Seed for deterministic allocation and iterators
+            warn_on_empty_band: Emit warnings when a requested band has no samples
 
         Returns:
             List of PuzzleMetadata sampled approximately according to weights
@@ -652,34 +654,69 @@ class BankSampler:
         remainder = int(total_count) - int(base_alloc.sum())
         frac = raw_alloc - base_alloc
         if remainder > 0:
-            order = np.argsort(-frac)
-            for idx in order[:remainder]:
-                base_alloc[idx] += 1
+            frac = np.maximum(frac, 0.0)
+            prob = frac.copy()
+            total_frac = prob.sum()
+            if total_frac <= 0:
+                prob = weights.copy()
+            if prob.sum() <= 0:  # fallback to uniform if weights also zero
+                prob = np.ones_like(prob, dtype=float)
+            prob = prob / prob.sum()
+            choices = rng.choice(len(bands), size=remainder, replace=True, p=prob)
+            for idx in choices:
+                base_alloc[int(idx)] += 1
+
+        band_configs: List[Dict[str, Any]] = []
+        band_seeds: List[int] = []
+        for band in bands:
+            band_configs.append({
+                "min_optimal_length": band.get("min_optimal_length"),
+                "max_optimal_length": band.get("max_optimal_length"),
+                "min_robots_moved": band.get("min_robots_moved"),
+                "max_robots_moved": band.get("max_robots_moved"),
+                "weight": float(band.get("weight", 1.0)),
+            })
+            # Precompute the iterator seed so fallback sampling remains deterministic
+            if random_seed is None:
+                band_seeds.append(int(rng.integers(0, 2**31 - 1)))
+            else:
+                band_seeds.append(int(random_seed))
 
         plan_details: List[Dict[str, Any]] = []
         out: List[PuzzleMetadata] = []
         actually_sampled = 0
-        band_iters: List[Optional[Dict[str, Any]]] = []
+        band_iters: List[Optional[Dict[str, Any]]] = [None] * len(band_configs)
         allocations: List[int] = []
-        for i, band in enumerate(bands):
+        attempted: List[bool] = [False] * len(band_configs)
+
+        for i, band_cfg in enumerate(band_configs):
             req = int(base_alloc[i])
+            allocations.append(req)
+            plan_entry: Dict[str, Any] = {
+                "band": {
+                    "min_optimal_length": band_cfg["min_optimal_length"],
+                    "max_optimal_length": band_cfg["max_optimal_length"],
+                    "min_robots_moved": band_cfg["min_robots_moved"],
+                    "max_robots_moved": band_cfg["max_robots_moved"],
+                    "weight": band_cfg["weight"],
+                },
+                "requested": req,
+                "sampled": 0,
+            }
+            plan_details.append(plan_entry)
             if req <= 0:
-                band_iters.append(None)
-                allocations.append(0)
                 continue
-            min_ol = band.get("min_optimal_length")
-            max_ol = band.get("max_optimal_length")
-            min_rm = band.get("min_robots_moved")
-            max_rm = band.get("max_robots_moved")
-            # Use separate iterator per band
+
+            attempted[i] = True
             it = self._get_or_build_iterator(
                 spec_key,
-                min_ol,
-                max_ol,
-                min_rm,
-                max_rm,
-                int(rng.integers(0, 2**31 - 1)) if random_seed is None else random_seed,
+                band_cfg["min_optimal_length"],
+                band_cfg["max_optimal_length"],
+                band_cfg["min_robots_moved"],
+                band_cfg["max_robots_moved"],
+                band_seeds[i],
             )
+            band_iters[i] = it
             band_samples: List[PuzzleMetadata] = []
             if it is not None:
                 for _ in range(req):
@@ -687,31 +724,34 @@ class BankSampler:
                     if data is None:
                         break
                     band_samples.append(PuzzleMetadata.from_dict(data))
+            plan_entry["sampled"] = len(band_samples)
             out.extend(band_samples)
             actually_sampled += len(band_samples)
-            band_iters.append(it)
-            allocations.append(req)
-            plan_details.append({
-                "band": {
-                    "min_optimal_length": min_ol,
-                    "max_optimal_length": max_ol,
-                    "min_robots_moved": min_rm,
-                    "max_robots_moved": max_rm,
-                    "weight": float(band.get("weight", 1.0)),
-                },
-                "requested": req,
-                "sampled": len(band_samples),
-            })
+            shortfall = max(0, req - len(band_samples))
+            if shortfall > 0:
+                plan_entry["shortfall"] = shortfall
 
         # Reallocate leftover to bands with remaining availability
         leftover = int(total_count) - int(actually_sampled)
         if leftover > 0:
-            for i, it in enumerate(band_iters):
+            indices = rng.permutation(len(band_iters))
+            for idx in indices:
                 if leftover <= 0:
                     break
+                if band_iters[idx] is None and not attempted[idx]:
+                    attempted[idx] = True
+                    it = self._get_or_build_iterator(
+                        spec_key,
+                        band_configs[idx]["min_optimal_length"],
+                        band_configs[idx]["max_optimal_length"],
+                        band_configs[idx]["min_robots_moved"],
+                        band_configs[idx]["max_robots_moved"],
+                        band_seeds[idx],
+                    )
+                    band_iters[idx] = it
+                it = band_iters[idx]
                 if it is None:
                     continue
-                # Try to draw more from this band until exhausted
                 taken = 0
                 while leftover > 0:
                     data = self._next_row(it)
@@ -719,10 +759,24 @@ class BankSampler:
                         break
                     out.append(PuzzleMetadata.from_dict(data))
                     actually_sampled += 1
-                    taken += 1
                     leftover -= 1
+                    taken += 1
                 if taken > 0:
-                    plan_details[i]["extra_sampled"] = int(plan_details[i].get("extra_sampled", 0) + taken)
+                    plan_details[idx]["extra_sampled"] = int(plan_details[idx].get("extra_sampled", 0) + taken)
+
+        if warn_on_empty_band:
+            import warnings
+
+            for i, plan_entry in enumerate(plan_details):
+                if allocations[i] > 0 and plan_entry.get("sampled", 0) == 0:
+                    warnings.warn(
+                        (
+                            "No puzzles available for stratified band "
+                            f"{plan_entry['band']}; redistributed allocation to other bands."
+                        ),
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
 
         # Monitoring snapshot for external logging
         self._last_stratified_plan = {
@@ -730,6 +784,9 @@ class BankSampler:
             "total_sampled": int(actually_sampled),
             "bands": plan_details,
         }
+        if out:
+            order = rng.permutation(len(out))
+            out = [out[int(i)] for i in order]
         return out
 
     def get_last_stratified_plan(self) -> Optional[Dict[str, Any]]:
