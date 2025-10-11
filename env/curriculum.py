@@ -655,7 +655,8 @@ class BankCurriculumWrapper(GymEnvBase):
             channels_first=self.channels_first,
             include_noop=self.include_noop,
             render_mode=self.render_mode,
-            verbose=self.verbose
+            verbose=self.verbose,
+            max_steps=criteria.max_optimal_length
         )
     
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):

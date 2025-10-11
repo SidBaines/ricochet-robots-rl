@@ -79,6 +79,7 @@ class CriteriaFilteredEnv(GymEnvBase):
         render_mode: Optional[str] = None,
         verbose: bool = False,
         allow_fallback: bool = False,
+        max_steps: Optional[int] = None,
     ):
         """Initialize criteria-filtered environment.
         
@@ -97,6 +98,7 @@ class CriteriaFilteredEnv(GymEnvBase):
         self.include_noop = include_noop
         self.verbose = verbose
         self.allow_fallback = allow_fallback
+        self.max_steps = max_steps
         
         # Initialize sampler
         self.sampler = BankSampler(bank, sampling_strategy="uniform")
@@ -164,7 +166,8 @@ class CriteriaFilteredEnv(GymEnvBase):
                 obs_mode=self.obs_mode,
                 channels_first=self.channels_first,
                 include_noop=self.include_noop,
-                render_mode=self.render_mode
+                render_mode=self.render_mode,
+                # max_steps=self.max_steps
             )
             
         except Exception as e:
@@ -192,7 +195,8 @@ class CriteriaFilteredEnv(GymEnvBase):
             obs_mode=self.obs_mode,
             channels_first=self.channels_first,
             include_noop=self.include_noop,
-            render_mode=self.render_mode
+            render_mode=self.render_mode,
+            # max_steps=self.max_steps
         )
         
         self._current_metadata = None

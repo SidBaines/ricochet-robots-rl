@@ -83,7 +83,8 @@ def make_env_for_level(level_index: int):
 
 #%% load model checkpoint
 # MODEL_PATH = os.path.abspath("checkpoints/convlstm-ppo-model-16chan-l2start_320000_steps.zip")
-MODEL_PATH = os.path.abspath("checkpoints/convlstm-ppo-model-16chan-l2start_200000_steps.zip")
+# MODEL_PATH = os.path.abspath("checkpoints/convlstm-ppo-model-16chan-l2start_200000_steps.zip")
+MODEL_PATH = os.path.abspath("checkpoints/ppo_model.zip")
 model = PPO.load(MODEL_PATH, device="cpu")
 
 # Infer model's action space to align env settings

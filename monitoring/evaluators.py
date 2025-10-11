@@ -139,9 +139,59 @@ class OptimalityGapEvaluator:
 
 
 class TrajectoryRecorder:
-    def __init__(self, episodes: int = 5, capture_render: bool = False) -> None:
+    def __init__(self, episodes: int = 5, capture_render: bool = False, renderer: Optional[Any] = None) -> None:
         self.episodes = int(episodes)
         self.capture_render = bool(capture_render)
+        self._renderer = renderer
+        self._default_renderer: Optional[Any] = None
+        self._default_renderer_failed = False
+
+    def _get_renderer(self) -> Optional[Any]:
+        if self._renderer is not None:
+            return self._renderer
+        if self._default_renderer_failed:
+            return None
+        if self._default_renderer is None:
+            try:
+                from env.visuals.mpl_renderer import MatplotlibBoardRenderer  # Local import to avoid mandatory dependency
+                self._default_renderer = MatplotlibBoardRenderer(cell_size=24)
+            except Exception:
+                self._default_renderer_failed = True
+                return None
+        return self._default_renderer
+
+    def _capture_frame(self, env: Any) -> Optional[Any]:
+        renderer = self._get_renderer()
+        frame: Optional[Any] = None
+        if renderer is not None:
+            getter = getattr(env, "get_board", None)
+            if callable(getter):
+                try:
+                    board = getter()
+                    if hasattr(board, "clone"):
+                        board = board.clone()
+                    frame = renderer.draw_rgb(board)
+                except Exception:
+                    frame = None
+        if frame is None:
+            try:
+                frame = env.render()
+            except Exception:
+                frame = None
+        if frame is None:
+            return None
+        if hasattr(frame, "numpy"):
+            frame = frame.numpy()
+        try:
+            import numpy as _np
+            arr = _np.asarray(frame)
+            if arr.ndim < 2:
+                return None
+            if arr.dtype != _np.uint8:
+                arr = _np.clip(arr, 0, 255).astype(_np.uint8)
+            return arr
+        except Exception:
+            return None
 
     def record(self, make_env_fn, model) -> List[Dict[str, Any]]:
         trajectories: List[Dict[str, Any]] = []
@@ -153,22 +203,16 @@ class TrajectoryRecorder:
             steps: List[Dict[str, Any]] = []
             frames: List[Any] = []  # type: ignore
             if self.capture_render:
-                try:
-                    frame0 = env.render()
-                    if frame0 is not None:
-                        frames.append(frame0)
-                except Exception:
-                    pass
+                initial = self._capture_frame(env)
+                if initial is not None:
+                    frames.append(initial)
             while not (done or trunc):
                 action, _ = model.predict(obs, deterministic=True)
                 next_obs, reward, done, trunc, info = env.step(int(action))
                 if self.capture_render:
-                    try:
-                        f = env.render()
-                        if f is not None:
-                            frames.append(f)
-                    except Exception:
-                        pass
+                    captured = self._capture_frame(env)
+                    if captured is not None:
+                        frames.append(captured)
                 steps.append({
                     "action": int(action),
                     "reward": float(reward),
@@ -233,4 +277,3 @@ def rollout_episode_with_recurrent_support(env_factory: Callable[[], Any], model
     result = {"is_success": info.get("is_success", False), "length": steps}
     env.close()
     return result
-

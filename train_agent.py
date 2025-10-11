@@ -5,6 +5,7 @@ import os
 from typing import Callable, Any, Dict
 import json
 import math
+import numbers
 import copy
 import yaml
 
@@ -670,7 +671,53 @@ def main() -> None:
     try:
         from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
         from stable_baselines3.common.env_util import make_vec_env as _make
-        
+        try:
+            from stable_baselines3.common.logger import KVWriter  # type: ignore[attr-defined]
+        except ImportError:
+            KVWriter = None  # type: ignore
+
+        if hub is not None and KVWriter is not None and hasattr(model, "logger"):
+            class _HubEvalMetricWriter(KVWriter):
+                def __init__(self, hub_ref):
+                    self._hub = hub_ref
+
+                def write(self, key_values, step: int = 0) -> None:
+                    step_value = None
+                    if isinstance(step, numbers.Number):
+                        try:
+                            step_float = float(step)
+                            if math.isfinite(step_float):
+                                step_value = int(step_float)
+                        except (TypeError, ValueError, OverflowError):
+                            step_value = None
+                    for key, value in key_values.items():
+                        if not isinstance(key, str) or not key.startswith("eval/"):
+                            continue
+                        if isinstance(value, numbers.Number):
+                            scalar = float(value)
+                        else:
+                            try:
+                                scalar = float(value)
+                            except (TypeError, ValueError):
+                                continue
+                        if not math.isfinite(scalar):
+                            continue
+                        try:
+                            self._hub.log_scalar(key, scalar, step_value)
+                        except Exception:
+                            pass
+
+                def write_sequence(self, sequence, step: int = 0) -> None:
+                    return None
+
+                def close(self) -> None:
+                    return None
+
+            try:
+                model.logger.output_formats.append(_HubEvalMetricWriter(hub))
+            except Exception:
+                pass
+
         # Custom callback for curriculum learning
         class CurriculumCallback(BaseCallback):
             def __init__(self, curriculum_manager, verbose=0):
@@ -879,6 +926,12 @@ def main() -> None:
                 def __init__(self, verbose=0):
                     super().__init__(verbose)
                     self._last_traj_dump = 0
+                    self._renderer = None
+                    try:
+                        from env.visuals.mpl_renderer import MatplotlibBoardRenderer
+                        self._renderer = MatplotlibBoardRenderer(cell_size=28)
+                    except Exception:
+                        self._renderer = None
                 def _on_step(self) -> bool:
                     # Throttle logging by traj_record_freq
                     if (self.num_timesteps - self._last_traj_dump) >= args.traj_record_freq:
@@ -889,10 +942,10 @@ def main() -> None:
                                 if hasattr(e, 'render_mode'):
                                     e.render_mode = 'rgb'
                             except Exception:
-                                pass
+                                    pass
                             return e
                         try:
-                            rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True)
+                            rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True, renderer=self._renderer)
                             trajectories = rec.record(_make_renderable_env, self.model)
                             # Compact text summary per episode
                             summaries = []
@@ -978,6 +1031,59 @@ def main() -> None:
                                    log_path=args.log_dir, eval_freq=args.eval_freq,
                                    n_eval_episodes=args.eval_episodes, deterministic=True, render=False)
             callbacks.append(eval_cb)
+            if hub is not None:
+                class _HubEvalMetricsForward(BaseCallback):
+                    def __init__(self, eval_callback, verbose=0):
+                        super().__init__(verbose)
+                        self._eval_callback = eval_callback
+                        self._last_logged_eval = len(getattr(eval_callback, "evaluations_results", []) or [])
+
+                    def _on_step(self) -> bool:
+                        results = getattr(self._eval_callback, "evaluations_results", None)
+                        if results is None:
+                            return True
+                        current = len(results)
+                        if current <= self._last_logged_eval:
+                            return True
+                        try:
+                            import numpy as _np
+                        except ImportError:
+                            self._last_logged_eval = current
+                            return True
+
+                        rewards = results[-1]
+                        if isinstance(rewards, (list, tuple, _np.ndarray)) and len(rewards) > 0:
+                            try:
+                                mean_reward = float(_np.mean(rewards))
+                                hub.log_scalar("eval/mean_reward", mean_reward, self.num_timesteps)
+                            except Exception:
+                                pass
+                        lengths_seq = getattr(self._eval_callback, "evaluations_length", None)
+                        if isinstance(lengths_seq, list) and len(lengths_seq) >= current:
+                            lengths = lengths_seq[-1]
+                            if isinstance(lengths, (list, tuple, _np.ndarray)) and len(lengths) > 0:
+                                try:
+                                    mean_len = float(_np.mean(lengths))
+                                except Exception:
+                                    mean_len = None
+                                if mean_len is not None:
+                                    try:
+                                        hub.log_scalar("eval/mean_ep_length", mean_len, self.num_timesteps)
+                                    except Exception:
+                                        pass
+                        successes_seq = getattr(self._eval_callback, "evaluations_successes", None)
+                        if isinstance(successes_seq, list) and len(successes_seq) >= current:
+                            successes = successes_seq[-1]
+                            if isinstance(successes, (list, tuple, _np.ndarray)) and len(successes) > 0:
+                                try:
+                                    success_rate = float(_np.mean(successes))
+                                    hub.log_scalar("eval/success_rate", success_rate, self.num_timesteps)
+                                except Exception:
+                                    pass
+                        self._last_logged_eval = current
+                        return True
+
+                callbacks.append(_HubEvalMetricsForward(eval_cb, verbose=0))
             # Add fixed-set evaluation with solver-aware optimality gap via monitoring hub if configured
             if hub is not None and args.eval_fixedset is not None:
                 try:
@@ -1004,6 +1110,12 @@ def main() -> None:
                         def __init__(self, verbose=0):
                             super().__init__(verbose)
                             self._last_traj_dump = 0
+                            self._renderer = None
+                            try:
+                                from env.visuals.mpl_renderer import MatplotlibBoardRenderer
+                                self._renderer = MatplotlibBoardRenderer(cell_size=28)
+                            except Exception:
+                                self._renderer = None
                         def _on_step(self) -> bool:
                             if self.num_timesteps % args.eval_freq == 0:
                                 fixed_eval.evaluate(hub, _make_env_from_layout, self.model, step=self.num_timesteps)
@@ -1020,7 +1132,7 @@ def main() -> None:
                                     except Exception:
                                         pass
                                     return e
-                                rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True)
+                                rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True, renderer=self._renderer)
                                 # Use a fresh non-curriculum single-env factory mirroring current args
                                 rec_env_factory = _make_renderable_env
                                 trajectories = rec.record(rec_env_factory, self.model)
