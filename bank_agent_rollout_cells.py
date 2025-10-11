@@ -29,7 +29,8 @@ from env.visuals.episode_recorder import EpisodeRecorder
 
 #%%
 # Configuration (edit these paths/values to match your setup)
-CHECKPOINT_PATH = Path("./checkpoints/ppo_model.zip").resolve()
+# CHECKPOINT_PATH = Path("./checkpoints/ppo_model.zip").resolve()
+CHECKPOINT_PATH = Path("./checkpoints/resnet_example.zip").resolve()
 TRAIN_CONFIG_PATH = Path("./configs/train_defaults.yaml").resolve()
 CURRICULUM_CONFIG_PATH = Path("./configs/curriculum_config_default.json").resolve()
 
