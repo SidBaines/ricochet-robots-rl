@@ -2,6 +2,24 @@
 
 This repository trains reinforcement learning agents to solve Ricochet Robots while providing tooling for curriculum generation, monitoring, profiling, and mechanistic interpretability analyses.
 
+## Demo
+<!-- Currently, ResNet based models are trained to do sensible things sometimes... -->
+<!-- !['Sensible things'](examples/rollout_gifs/sensible.gif) -->
+<!-- **but** not always... -->
+<!-- !['Unsensible things'](examples/rollout_gifs/unsensible.gif) -->
+
+Current status: ResNet-based models are trained to do sensible things sometimes, but also do very un-sensible things sometimes:
+
+Sensible             |  Not sensible
+:-------------------------:|:-------------------------:
+![](examples/rollout_gifs/sensible.gif)  |  ![](examples/rollout_gifs/unsensible.gif)
+
+<!-- Currently, ResNet based models are trained to do sensible things sometimes (left) but not always (right)
+<p float="left">
+  <img src="examples/rollout_gifs/sensible.gif" width="200" />
+  <img src="examples/rollout_gifs/unsensible.gif" width="200" /> 
+</p> -->
+
 ## Quick Start
 
 ### 1. Set up a Python environment and install dependencies

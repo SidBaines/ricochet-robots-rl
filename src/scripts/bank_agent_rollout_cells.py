@@ -26,10 +26,12 @@ ARTIFACTS_ROOT = PROJECT_ROOT / "artifacts"
 
 import json
 import importlib
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 import matplotlib.pyplot as plt
+import numpy as np
 
 from src.env.puzzle_bank import PuzzleBank, SpecKey
 from src.env.curriculum import create_bank_curriculum_manager, BankCurriculumWrapper
@@ -325,46 +327,48 @@ except Exception as exc:
     print(f"Plotly not available: {exc}")
 
 
-def plot_episode_interactive(level_index: int, episode_index: int = 0) -> None:
-    if make_subplots is None or go is None:
-        raise RuntimeError("Plotly is not installed; pip install plotly to enable interactive viewer")
-    level_data = rollouts.get(level_index)
-    if level_data is None:
-        raise KeyError(f"No rollout data for level {level_index}")
-    frames = level_data["frames"][episode_index]
-    trace = level_data["traces"][episode_index]
-    rewards = [step.reward for step in trace.steps]
-    cumulative = []
-    total = 0.0
-    for r in rewards:
-        total += r
-        cumulative.append(total)
-    fig = make_subplots(rows=1, cols=2, column_widths=[0.7, 0.3], specs=[[{"type": "image"}, {"type": "scatter"}]])
-    start_frame = frames[0]
-    fig.add_trace(go.Image(z=start_frame), row=1, col=1)
-    fig.add_trace(go.Scatter(x=list(range(len(cumulative))), y=cumulative, mode="lines+markers", name="reward"), row=1, col=2)
-    fig.update_layout(title=f"Level {level_index} Episode {episode_index}")
-    frames_payload = []
-    for step_idx, frame in enumerate(frames):
-        frames_payload.append(go.Frame(data=[go.Image(z=frame), go.Scatter(x=list(range(step_idx + 1)), y=cumulative[: step_idx + 1], mode="lines+markers")], name=f"step_{step_idx}"))
-    fig.frames = frames_payload
-    fig.update_layout(
-        updatemenus=[{
-            "type": "buttons",
-            "showactive": False,
-            "buttons": [
-                {"label": "▶", "method": "animate", "args": [None, {"frame": {"duration": 200, "redraw": True}, "fromcurrent": True}]},
-                {"label": "⏸", "method": "animate", "args": [[None], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}]}
-            ]
-        }]
-    )
-    fig.show()
+def _axis_range(series: List[float]) -> Tuple[float, float]:
+    finite = [val for val in series if val is not None and not math.isnan(val)]
+    if not finite:
+        return (-1.0, 1.0)
+    min_v = min(finite)
+    max_v = max(finite)
+    if math.isclose(min_v, max_v):
+        pad = max(1.0, abs(min_v) * 0.1 or 1.0)
+        return (min_v - pad, max_v + pad)
+    pad = (max_v - min_v) * 0.1
+    return (min_v - pad, max_v + pad)
 
-# Example usage (uncomment in a notebook):
-plot_episode_interactive(level_index=0, episode_index=0)
+
+def _format_step_label(step_idx: int, total_steps: int, pause: bool = False) -> str:
+    step_num = min(step_idx, total_steps)
+    label = f"Step {step_num}/{total_steps}"
+    if pause:
+        label += " · reset"
+    return label
+
+
+def _step_annotations(step_idx: int, total_steps: int, pause: bool = False) -> List[Dict[str, Any]]:
+    return [
+        dict(
+            text=_format_step_label(step_idx, total_steps, pause=pause),
+            x=0.5,
+            xref="paper",
+            y=1.08,
+            yref="paper",
+            showarrow=False,
+            font=dict(size=12, color="#ffffff"),
+            align="center",
+            bgcolor="rgba(0,0,0,0.6)",
+            borderpad=4,
+        )
+    ]
+
 
 #%%
 def plot_episode_interactive(level_index: int, episode_index: int = 0):
+    if make_subplots is None or go is None:
+        raise RuntimeError("Plotly is not available in this environment")
     level_data = rollouts.get(level_index)
     if level_data is None:
         raise KeyError(f"No rollout data for level {level_index}")
@@ -372,29 +376,44 @@ def plot_episode_interactive(level_index: int, episode_index: int = 0):
     trace = level_data["traces"][episode_index]
     rewards = [step.reward for step in trace.steps]
     actions = [step.action for step in trace.steps]
+    total_steps = len(trace.steps)
+    state_values = list(getattr(trace, "values", []))
     title = f"Level {level_index} Episode {episode_index}"
-    # Prepare values as running (cumulative) reward for a smoother chart
-    values = []
+    # Prepare cumulative rewards for a smoother chart
+    cumulative_rewards: List[float] = []
     total = 0.0
     for r in rewards:
         total += float(r)
-        values.append(total)
+        cumulative_rewards.append(total)
 
-    # Build figure with image on the left and line+markers on the right
-    fig = make_subplots(rows=1, cols=2, column_widths=[0.7, 0.3], specs=[[{"type": "image"}, {"type": "scatter"}]])
+    if len(state_values) != len(frames):
+        state_values = [float("nan")] * len(frames)
+
+    # Build figure with image, cumulative reward, and value estimate panels
+    fig = make_subplots(
+        rows=1,
+        cols=3,
+        column_widths=[0.55, 0.225, 0.225],
+        specs=[[{"type": "image"}, {"type": "scatter"}, {"type": "scatter"}]],
+    )
     if len(frames) == 0:
         raise ValueError("No frames to plot")
     fig.add_trace(go.Image(z=frames[0]), row=1, col=1)
-    fig.add_trace(go.Scatter(x=[0], y=[values[0] if values else 0.0], mode='lines+markers'), row=1, col=2)
+    initial_reward = cumulative_rewards[0] if cumulative_rewards else 0.0
+    initial_value = state_values[0] if state_values else float("nan")
+    fig.add_trace(go.Scatter(x=[0], y=[initial_reward], mode="lines+markers"), row=1, col=2)
+    fig.add_trace(go.Scatter(x=[0], y=[initial_value], mode="lines+markers"), row=1, col=3)
 
     # Axis titles and initial y-range with padding
-    y_min = min(values) if values else 0.0
-    y_max = max(values) if values else 0.0
-    pad = (y_max - y_min) * 0.1 if (y_max - y_min) > 0 else 1.0
+    reward_range = _axis_range(cumulative_rewards[:1])
+    value_range = _axis_range(state_values[:1])
     fig.update_layout(
         title=title,
         xaxis2=dict(title="Step"),
-        yaxis2=dict(title="Cumulative reward", range=[y_min - pad, y_max + pad]),
+        yaxis2=dict(title="Cumulative reward", range=list(reward_range)),
+        xaxis3=dict(title="Step"),
+        yaxis3=dict(title="Value estimate", range=list(value_range)),
+        annotations=_step_annotations(0, total_steps),
     )
 
     # Updatemenus and slider
@@ -418,15 +437,21 @@ def plot_episode_interactive(level_index: int, episode_index: int = 0):
     steps = []
     fig_frames = []
     for i in range(len(frames)):
-        curr_vals = values[:i+1] if values else [0.0]
-        y_min = min(curr_vals)
-        y_max = max(curr_vals)
-        pad = (y_max - y_min) * 0.1 if (y_max - y_min) > 0 else 1.0
-        frame_layout = go.Layout(title_text=f"Step {i}{', Action: ' + str(actions[i]) if i < len(actions) else ''}", yaxis2=dict(range=[y_min - pad, y_max + pad]))
+        reward_points = cumulative_rewards[: min(i + 1, len(cumulative_rewards))]
+        value_points = state_values[: i + 1]
+        reward_range = _axis_range(reward_points)
+        value_range = _axis_range(value_points)
+        frame_layout = go.Layout(
+            title_text=f"Step {i}{', Action: ' + str(actions[i]) if i < len(actions) else ''}",
+            yaxis2=dict(range=list(reward_range)),
+            yaxis3=dict(range=list(value_range)),
+            annotations=_step_annotations(i, total_steps),
+        )
         frame = go.Frame(
             data=[
                 go.Image(z=frames[i]),
-                go.Scatter(x=list(range(i+1)), y=curr_vals, mode='lines+markers')
+                go.Scatter(x=list(range(len(reward_points))), y=reward_points, mode="lines+markers"),
+                go.Scatter(x=list(range(len(value_points))), y=value_points, mode="lines+markers"),
             ],
             layout=frame_layout,
             name=str(i)
@@ -466,5 +491,151 @@ for level_index in range(len(levels)):
     if found:
         break
 plot_episode_interactive(level_index=level_index, episode_index=episode_index)
+
+# %%
+# Save episodes as GIFs for deeper inspection
+def save_episode_gifs(
+    level_index: int,
+    episode_index: int = 0,
+    output_dir: Optional[Path] = None,
+    fps: int = 4,
+    pause_seconds: float = 0.75,
+) -> Dict[str, Optional[Path]]:
+    """Export the requested rollout as matplotlib and Plotly GIF animations."""
+
+    level_data = rollouts.get(level_index)
+    if level_data is None:
+        raise KeyError(f"No rollout data for level {level_index}")
+    if episode_index >= len(level_data["frames"]):
+        raise IndexError(f"Episode index {episode_index} out of range for level {level_index}")
+
+    frames = level_data["frames"][episode_index]
+    if not frames:
+        raise ValueError("No frames available for the requested episode")
+
+    trace = level_data["traces"][episode_index]
+    actions = [step.action for step in trace.steps]
+    rewards = [step.reward for step in trace.steps]
+    cumulative_rewards: List[float] = []
+    total = 0.0
+    for r in rewards:
+        total += float(r)
+        cumulative_rewards.append(total)
+    state_values = list(getattr(trace, "values", []))
+    if len(state_values) != len(frames):
+        state_values = [float("nan")] * len(frames)
+    total_steps = len(trace.steps)
+
+    output_path = Path(output_dir) if output_dir is not None else (ARTIFACTS_ROOT / "rollout_gifs")
+    output_path.mkdir(parents=True, exist_ok=True)
+    level_name = level_data["spec"].get("name", f"level_{level_index}")
+    safe_level = "".join(char if char.isalnum() or char in "-_" else "_" for char in level_name)
+    base_name = f"level{level_index:02d}_{safe_level}_episode{episode_index:02d}"
+
+    # Matplotlib-style GIF using recorded RGB frames
+    mpl_path = output_path / f"{base_name}_mpl.gif"
+    pause_frames = int(round(max(0.0, pause_seconds) * fps))
+    try:
+        import imageio.v2 as imageio  # type: ignore
+        try:
+            from PIL import Image, ImageDraw, ImageFont  # type: ignore
+
+            font = ImageFont.load_default()
+            # Try a larger TrueType font for clearer, bigger annotation text
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", 22)
+            except Exception:
+                try:
+                    font = ImageFont.truetype("Arial.ttf", 22)
+                except Exception:
+                    pass
+
+            def annotate_step(frame_array: np.ndarray, step_idx: int, pause: bool = False) -> np.ndarray:
+                base_image = Image.fromarray(frame_array)
+                draw_probe = ImageDraw.Draw(base_image)
+                label = _format_step_label(step_idx, total_steps, pause=pause)
+                try:
+                    bbox = draw_probe.textbbox((0, 0), label, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                except AttributeError:
+                    # Fallback for older Pillow: use textsize to measure text
+                    text_w, text_h = draw_probe.textsize(label, font=font)
+                padding = 4
+                margin_top = text_h + (padding * 2) + 8
+                new_image = Image.new("RGB", (base_image.width, base_image.height + margin_top), color=(0, 0, 0))
+                # paste original frame below the top annotation band
+                new_image.paste(base_image, (0, margin_top))
+                draw = ImageDraw.Draw(new_image)
+                # Center text horizontally within the new image width
+                x0 = max(0, (new_image.width - text_w) // 2)
+                y0 = padding
+                # optional background box behind text for readability, already black band
+                # Draw text in the top band
+                draw.text((x0, y0), label, fill=(255, 255, 255), font=font)
+                return np.asarray(new_image)
+
+        except Exception as pillow_exc:  # pragma: no cover - optional dependency
+            print(f"Warning: step overlay skipped (Pillow unavailable: {pillow_exc})")
+
+            def annotate_step(frame_array: np.ndarray, step_idx: int, pause: bool = False) -> np.ndarray:
+                return np.asarray(frame_array)
+
+        annotated_frames = [annotate_step(np.asarray(frame), idx, pause=False) for idx, frame in enumerate(frames)]
+        pause_frame = annotate_step(np.asarray(frames[-1]), total_steps, pause=True)
+
+        with imageio.get_writer(mpl_path, mode="I", fps=fps, loop=0) as writer:
+            for annotated in annotated_frames:
+                writer.append_data(annotated)
+            for _ in range(pause_frames):
+                writer.append_data(pause_frame)
+    except Exception as exc:
+        print(f"Warning: failed to save matplotlib GIF: {exc}")
+        mpl_path = None
+
+    # Plotly GIF reusing the interactive figure definition
+    plotly_path: Optional[Path] = output_path / f"{base_name}_plotly.gif"
+    try:
+        fig = plot_episode_interactive(level_index, episode_index)
+        gif_fig = go.Figure(fig)
+        gif_frames = list(gif_fig.frames)
+        plotly_pause_frames = max(1, pause_frames) if pause_seconds > 0 else 0
+        if gif_frames and plotly_pause_frames > 0:
+            reward_range = _axis_range(cumulative_rewards)
+            value_range = _axis_range(state_values)
+            pause_data = [
+                go.Image(z=frames[-1]),
+                go.Scatter(x=list(range(len(cumulative_rewards))), y=cumulative_rewards, mode="lines+markers"),
+                go.Scatter(x=list(range(len(state_values))), y=state_values, mode="lines+markers"),
+            ]
+            pause_layout = go.Layout(
+                title_text=f"Step {total_steps}",
+                yaxis2=dict(range=list(reward_range)),
+                yaxis3=dict(range=list(value_range)),
+                annotations=_step_annotations(total_steps, total_steps, pause=True),
+            )
+            for pause_idx in range(plotly_pause_frames):
+                gif_frames.append(
+                    go.Frame(
+                        data=pause_data,
+                        layout=pause_layout,
+                        name=f"pause_{pause_idx}",
+                    )
+                )
+            gif_fig.frames = tuple(gif_frames)
+
+        gif_fig.write_image(
+            str(plotly_path),
+            format="gif",
+        )
+    except Exception as exc:
+        print(f"Warning: failed to save Plotly GIF: {exc}")
+        plotly_path = None
+
+    return {"matplotlib": mpl_path, "plotly": plotly_path}
+
+
+# Example usage:
+save_episode_gifs(level_index=0, episode_index=0)
 
 # %%

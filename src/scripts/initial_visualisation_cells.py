@@ -25,7 +25,7 @@ PPO = sb3.PPO
 
 #%% load curriculum config and bank
 BANK_DIR = (ARTIFACTS_ROOT / "puzzle_bank").resolve()
-CFG_PATH = (PROJECT_ROOT / "curriculum_config_example2.json").resolve()
+CFG_PATH = (PROJECT_ROOT / "configs/curriculum_config_default.json").resolve()
 
 with open(CFG_PATH, 'r', encoding='utf-8') as f:
     cfg = json.load(f)
@@ -84,7 +84,7 @@ def make_env_for_level(level_index: int):
     return BankCurriculumWrapper(
         bank=bank,
         curriculum_manager=local_manager,
-        obs_mode="rgb_image",
+        obs_mode="image",
         channels_first=True,
         include_noop=bool(inferred_include_noop if inferred_include_noop is not None else True),
         render_mode=None,
@@ -94,7 +94,7 @@ def make_env_for_level(level_index: int):
 #%% load model checkpoint
 # MODEL_PATH = (ARTIFACTS_ROOT / "checkpoints" / "convlstm-ppo-model-16chan-l2start_320000_steps.zip").resolve()
 # MODEL_PATH = (ARTIFACTS_ROOT / "checkpoints" / "convlstm-ppo-model-16chan-l2start_200000_steps.zip").resolve()
-MODEL_PATH = (ARTIFACTS_ROOT / "checkpoints" / "ppo_model.zip").resolve()
+MODEL_PATH = (ARTIFACTS_ROOT / "checkpoints" / "resnet_example.zip").resolve()
 model = PPO.load(MODEL_PATH, device="cpu")
 
 # Infer model's action space to align env settings
