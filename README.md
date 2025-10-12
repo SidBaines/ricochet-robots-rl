@@ -1,228 +1,110 @@
 # Ricochet Robots RL Project
 
-This repository trains RL agents for Ricochet Robots and analyzes how they plan using mechanistic interpretability.
+This repository trains reinforcement learning agents to solve Ricochet Robots while providing tooling for curriculum generation, monitoring, profiling, and mechanistic interpretability analyses.
 
-## Quick start
-#### Install
-```
-python -m venv .env
-source .env
-```
-#### Populate curriculum bank
-```
-python generate_curriculum_bank.py --config configs/curriculum_config_default.json --bank_dir ./puzzle_bank
-```
-#### Run training
-```
-python train_agent.py configs/train_defaults.yaml
-```
+## Quick Start
 
-
-## Repository Map
-### Documentation
-- `WorkInProgress.md`: The current task on which we are working.
-- `README.md`: This file
-- `ResearchPlan.md`: Original research plan
-- `docs/`: Documentation folder
-  - `docs/ProgressNotes/`: Progress notes (task-based)
-  - `docs/ComponentSpecifications/`: Specifications (component-based)
-### Code
-- `train_agent.py`: Script to run training
-- `generate_curriculum_bank.py`: Script to generate the puzzle bank for use during training 
-- `env/`: Code to create and set up the environments, including curriculum learning environment wrappers and solvers
-  - `env/visuals`: Visualisation helpers for rendering nice, human-readable demonstrations
-- `models/`: Code to define custom models and policies
-- `profiling/`: Profiling tools for checking memory/computational cost of different components
-- `monitoring/`: Monitoring tools for logging performance during training runs
-- `tests/`: Pytest-based unit and integration tests
-- `curriculum_config_example*.json`: Bank curriculum configs for generating and reading from puzzle bank(s)
-- `initial_visualisation_cells.py`, `initial_testing_cells.py`: Visualisation notebooks for quick testing
-
-
-## Current status
-
-This section gives a high-level overview of the current status of the various stages of the project. The steps are laid out in rough chronological order, but they need not be executed in exactly this order.
-More details on any given step, if they are present, will be in `docs/ProgressNotes`.
-Recall that the task we're currently working on, if any, can be found in `WorkInProgress.md`.
-
-1) Environment & Generator (complete)
-   - Canonical edge-wall mechanics, sliding dynamics, Gymnasium API; deterministic seeding; ASCII/RGB rendering; optional no-op action.
-
-2) Solver & Bank Precomputation (complete)
-   - BFS/A* solvers for optimal lengths; offline puzzle bank with metadata (optimal_length, robots_moved, etc.); fast curriculum sampling without online solving.
-
-3) Training Framework (complete)
-   - SB3 PPO with vectorized envs, CLI, logging, checkpoints; policies: MLP (symbolic/tiny), SmallCNN (image), ConvLSTM (DRC-lite prototype).
-
-4) Curriculum Training & Evaluation (in progress)
-   - Run staged curricula on fixed-size RGB observations; evaluate success rate and optimality gap vs solver on held-out sets; produce rollouts/videos.
-
-5) Mechanistic Interpretability Suite (planned)
-   - Activation capture, linear probes, saliency/attribution, feature visualization, activation patching; summarize findings on plan representations and causal features.
-
-6) Profiling & Monitoring (complete)
-   - Lightweight profiler across env rendering/model forward; monitoring hooks and TensorBoard metrics to track throughput and resource use.
-
-7) Documentation & Repo Hygiene (in progress)
-   - Consolidate progress notes under docs, keep `WorkInProgress.md` current, and ensure README examples and references stay aligned with code.
-
-
-## Installation
-
-If using the provided virtualenv:
-
+### 1. Set up a Python environment and install dependencies
 ```bash
+python -m venv rlenv
 source rlenv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Quick Start
-
-### Training
-
-Launch training by pointing the script at a YAML configuration:
-
+### 2. Pre-compute a curriculum puzzle bank
+The training defaults expect an on-disk bank housed under `artifacts/puzzle_bank`.
 ```bash
-# Run with the default settings from configs/train_defaults.yaml
-python train_agent.py configs/train_defaults.yaml
-
-# Copy, edit, and run a custom configuration
-cp configs/train_defaults.yaml my_run.yaml
-${EDITOR:-nano} my_run.yaml
-python train_agent.py my_run.yaml
+python src/scripts/generate_curriculum_bank.py \
+  --config configs/curriculum_config_default.json \
+  --bank_dir artifacts/puzzle_bank
 ```
 
-Notes:
-- All previous CLI flags are now top-level YAML keys; `configs/train_defaults.yaml`
-  documents the defaults for every option.
-- Bank curriculum disables online fallback by default; ensure your bank has
-  coverage for the requested levels or relax the criteria in your config.
+### 3. Launch training from a YAML configuration (optional)
+```bash
+python src/scripts/train_agent.py configs/train_defaults.yaml
+```
+Copy `configs/train_defaults.yaml`, tweak any keys you need (all CLI options map directly to YAML fields), and pass the new file to the same command for customised runs.
 
-### Model Architectures
+### 4. Observe a models' gameplay
+Notebook-style scripts with `#%%` cells live in `src/scripts/`; `bank_agent_rollout_cells.py` is particularly useful for loading a model.
+A (badly-performing) pre-trained model exists in `examples/`.
 
-Tweak these keys in your YAML config to switch policies:
+## Repository Layout
+- `src/`
+  - `src/env/`: Environment core, solvers, curriculum helpers, and visuals
+  - `src/models/`: Custom policy implementations (CNN, ConvLSTM/DRC, ResNet extractors)
+  - `src/monitoring/`: Logging backends and collectors for metrics/rollouts
+  - `src/profiling/`: Lightweight profiling utilities
+  - `src/scripts/`: Executable entry points (training, evaluation, bank tooling, visualisers)
+  - `src/tests/`: Pytest-based unit and integration tests
+- `configs/`: YAML configurations for training profiles and baselines
+- `docs/`: Research plans, progress notes, and prompt documentation
+- `examples/`: Reference assets such as sample checkpoints/configs
+- `artifacts/`: Output directory for generated banks, checkpoints, logs, runs, and wandb exports (created/populated at runtime)
+- `WorkInProgress.md`: Rolling log of the active development task
 
-- `obs_mode`: `symbolic`, `image`, or `rgb_image`
-- `small_cnn`: `true` to use the compact CNN extractor for larger grids
-- `convlstm`: `true` to enable the sb3-contrib CnnLstmPolicy baseline
-- `drc`: `true` to enable the recurrent DRC policy (requires sb3-contrib)
-- `resnet`: `true` to swap in the ResNet feature extractor baseline
+## Key Scripts & Pipelines
+- `src/scripts/train_agent.py`: Main training entry point; consumes a YAML config
+- `src/scripts/evaluate_agent.py`: Evaluate PPO checkpoints on fixed layouts or random boards
+- `src/scripts/generate_curriculum_bank.py`: Build/refresh the curriculum puzzle bank (band-first controller)
+- `src/scripts/precompute_bank.py`: Lower-level precomputation driver for bespoke experiments
+- `src/scripts/bank_agent_rollout_cells.py`: Jupyter-style curriculum rollout visualiser
+- `src/scripts/initial_testing_cells.py`: Smoke-test utilities for the environment and solver
 
-### Resume or Warmstart Training
+## Configuration & Training Notes
+- Every CLI option in `build_training_parser()` is mirrored as a YAML key. Check `configs/train_defaults.yaml` and `configs/resnet_rgb.yaml` for annotated examples.
+- `bank_dir`, `log_dir`, and `save_path` defaults now point into `artifacts/` to keep generated data out of the source tree.
+- Device selection defaults to `auto`; M-series Macs will pick `mps` when available.
+- Recurrent policies (`--convlstm`, `--drc`) and `--resnet` are mutually exclusive. Set only one of the flags (or none for the default SmallCNN).
 
-Use the new initialisation controls to decide how a run should start:
-
-- `init_mode: fresh` (default) starts from a randomly initialised policy.
-- `init_mode: resume` loads a full checkpoint (including optimiser/LR schedule) and, by default, trains until `resume_target_total_timesteps` or `timesteps` is reached. Set `resume_additional_timesteps: true` to treat `timesteps` as additional steps instead.
-- `init_mode: warmstart` instantiates a fresh optimiser/schedule but loads policy weights from `warmstart_params_path` for fine-tuning.
-
-VecNormalize stats can be restored via `resume_vecnormalize_path`, `warmstart_vecnormalize_path`, or `vecnorm_load_path`.
-
-When you prefer a structured block in YAML, you can also supply an `initialization` section:
-
+### Resume and Warmstart
+Control run initialisation via YAML:
 ```yaml
 initialization:
   mode: resume
   resume:
-    checkpoint_path: checkpoints/latest_model.zip
-    target_total_timesteps: 1_000_000  # optional; defaults to `timesteps`
-    vecnormalize_path: runs/ppo/vecnormalize.pkl
+    checkpoint_path: artifacts/checkpoints/ppo_model.zip
+    target_total_timesteps: 1_000_000
+    vecnormalize_path: artifacts/runs/ppo/vecnormalize.pkl
 ```
+For warmstarts swap `mode: warmstart` and provide `params_path`/`vecnormalize_path` instead. The legacy `load_path` is coerced to `init_mode: resume` for backwards compatibility.
 
-If you need a warmstart instead:
-
-```yaml
-initialization:
-  mode: warmstart
-  warmstart:
-    params_path: checkpoints/pretrained_policy.zip
-    vecnormalize_path: runs/ppo/vecnormalize.pkl  # optional
-```
-
-### Evaluation
-
-Evaluate a trained model:
-
+## Puzzle Bank Generation & Maintenance
+Top up or rebuild the bank with:
 ```bash
-python evaluate_agent.py --model-path checkpoints/ppo_model.zip --env-mode v0 --episodes 50
-```
-
-### Bank Precomputation (band-first controller)
-
-Generate the curriculum bank using the band-first controller. It solves broadly and stops when each level has enough available puzzles according to bank histograms.
-
-```bash
-# Use controller to target 1000 available puzzles per level (approx.)
-python generate_curriculum_bank.py \
-  --use_controller \
+python src/scripts/generate_curriculum_bank.py \
+  --config configs/curriculum_config_default.json \
+  --bank_dir artifacts/puzzle_bank \
   --target_per_level 1000 \
   --max_puzzles_global 200000 \
-  --chunk_per_spec 200 \
-  --bank_dir ./puzzle_bank
+  --chunk_per_spec 200
 ```
-
-Notes:
-- The controller relies on manifest histograms and can be re-run to incrementally top-up without duplicating layouts.
-- Default solver is BFS; adjust with `--solver`, `--max_depth`, and `--max_nodes` if needed.
-
-## Environment Options
-
-- `--env-mode`: `random`, `v0`, `v1` (milestone layouts)
-- `--height`, `--width`: Grid dimensions (default 8x8)
-- `--num-robots`: Number of robots (default 2)
-- `--include-noop`: Enable no-op actions for "thinking"
-- `--obs-mode`: `image` or `symbolic` observations
-- `--ensure-solvable`: Only generate solvable puzzles (slower)
-
-## Training Options
-
-- `--timesteps`: Total training steps
-- `--n-envs`: Number of parallel environments
-- `--lr`: Learning rate (default 3e-4)
-- `--n-steps`: Rollout length (default 128)
-- `--batch-size`: Minibatch size (default 256)
-
-## Logging and Checkpoints
-
-- `--log-dir`: TensorBoard log directory
-- `--save-path`: Model save path
-- `--save-freq`: Checkpoint frequency (timesteps)
-- `--eval-freq`: Evaluation frequency (timesteps)
-- `--init-mode` / `initialization`: Controls (fresh | resume | warmstart) model initialisation and associated artefacts
-- `--resume-additional-timesteps`: Treat `--timesteps` as additional steps when resuming (otherwise interpreted as a total target)
+The controller consults manifest histograms, making it safe to rerun incrementally without duplicating layouts. Adjust `--solver`, `--max_depth`, and `--max_nodes` to trade off coverage vs computation.
 
 ## Testing
-
-Run the test suite:
-
+Use pytest from the project root (ensure `pytest` is installed in your environment):
 ```bash
-pytest tests/ -v
+python -m pytest
 ```
 
-## Visualisation
+## Visualisation & Rendering
+Offline renderers live under `src/env/visuals/`:
+- `mpl_renderer.py`: Matplotlib-based raster renderer for quick previews
+- `plotly_renderer.py`: Plotly renderer with Kaleido export for high-quality frames
 
-Two offline renderers are available:
+For curated rollouts, open `src/scripts/initial_visualisation_cells.py`. It loads curriculum configs, banks from `artifacts/puzzle_bank`, and checkpoints from `artifacts/checkpoints/` to record or display trajectories with the renderers above.
 
-- Matplotlib-style raster renderer: `env/visuals/mpl_renderer.py`
-- Plotly renderer (PNG export via kaleido): `env/visuals/plotly_renderer.py`
+## Current Status Overview
+1. **Environment & Generator (complete)** – Canonical edge-wall mechanics, sliding dynamics, Gymnasium API; deterministic seeding; ASCII/RGB rendering; optional no-op action.
+2. **Solver & Bank Precomputation (complete)** – BFS/A* solvers for optimal lengths; offline puzzle bank with metadata; curriculum sampling without online solving.
+3. **Training Framework (complete)** – SB3 PPO with vectorised envs, YAML config loader, logging, checkpoints; policies include MLP (symbolic), SmallCNN (image), ConvLSTM (DRC-lite prototype).
+4. **Curriculum Training & Evaluation (in progress)** – Run staged curricula on fixed-size RGB observations; evaluate success rate and optimality gap vs solver on held-out sets; produce rollouts/videos.
+5. **Mechanistic Interpretability Suite (planned)** – Activation capture, linear probes, saliency/attribution, feature visualisation, activation patching; summarise findings on plan representations and causal features.
+6. **Profiling & Monitoring (complete)** – Lightweight profiler across env rendering/model forward; monitoring hooks and TensorBoard/W&B metrics to track throughput and resource use.
+7. **Documentation & Repo Hygiene (in progress)** – Keep `WorkInProgress.md` current, ensure README/examples stay aligned with the new `src/` + `artifacts/` structure, and consolidate progress notes under `docs/`.
 
-Use `initial_visualisation_cells.py` (with `#%%` cells) to:
-- Load the bank curriculum from `puzzle_bank` and `curriculum_config_example2.json`
-- Load a checkpointed PPO model
-- Record and preview episodes at a few curriculum levels with both renderers
+## Additional Resources
+- `docs/ProgressNotes/`: Day-by-day engineering updates
+- `docs/ComponentSpecifications/`: Detailed component-level specs
+- `docs/AiChatLogs/`: Conversations and decision logs
 
-## Architecture Details
-
-### SmallCNN
-- 3x3 conv layers with padding=1 (safe for small grids)
-- Global average pooling
-- Suitable for 4x4+ grids
-
-### ConvLSTM (DRC-lite)
-- Convolutional LSTM layers for spatial planning
-- Configurable layers and repeats per timestep
-- Designed for recurrent planning behavior
-
-### Milestone Environments
-- **v0**: 4x4 grid, single RIGHT move to goal
-- **v1**: 5x5 grids, one move in each of four directions

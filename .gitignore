@@ -5,3 +5,5 @@ runs
 .DS_Store
 tmp/
 wandb/
+logs/
+artifacts/
