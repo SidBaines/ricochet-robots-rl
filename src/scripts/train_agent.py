@@ -1556,7 +1556,69 @@ def main() -> None:
                                         pass
                                     return e
                                 rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True, renderer=self._renderer)
-                                # Use a fresh non-curriculum single-env factory mirroring current args
+                                # If we have a bank curriculum, record one short trajectory per curriculum level
+                                if curriculum_manager is not None and hasattr(curriculum_manager, 'curriculum_levels') and hasattr(curriculum_manager, 'bank'):
+                                    try:
+                                        from src.env.curriculum import create_bank_curriculum_manager, BankCurriculumWrapper
+                                        import numpy as _np
+                                        levels = getattr(curriculum_manager, 'curriculum_levels')
+                                        bank_obj = getattr(curriculum_manager, 'bank')
+                                        srt = getattr(curriculum_manager, 'success_rate_threshold', 0.8)
+                                        min_eps = getattr(curriculum_manager, 'min_episodes_per_level', 100)
+                                        win_sz = getattr(curriculum_manager, 'success_rate_window_size', 200)
+                                        chk_freq = getattr(curriculum_manager, 'advancement_check_frequency', 50)
+                                        for lvl_idx, lvl_spec in enumerate(levels):
+                                            def _make_env_for_level(idx: int = lvl_idx):
+                                                mgr = create_bank_curriculum_manager(
+                                                    bank=bank_obj,
+                                                    curriculum_levels=levels,
+                                                    success_rate_threshold=srt,
+                                                    min_episodes_per_level=min_eps,
+                                                    success_rate_window_size=win_sz,
+                                                    advancement_check_frequency=chk_freq,
+                                                    verbose=False,
+                                                )
+                                                mgr.current_level = idx
+                                                return BankCurriculumWrapper(
+                                                    bank=bank_obj,
+                                                    curriculum_manager=mgr,
+                                                    obs_mode=(args.obs_mode if args.obs_mode in ("image", "rgb_image", "rgb_cell_image", "symbolic") else "rgb_image"),
+                                                    channels_first=True,
+                                                    render_mode=None,
+                                                    cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
+                                                    verbose=False,
+                                                )
+                                            rec_level = TrajectoryRecorder(episodes=1, capture_render=True, renderer=self._renderer)
+                                            trajs = rec_level.record(_make_env_for_level, self.model)
+                                            if trajs and trajs[0].get('frames'):
+                                                frames = trajs[0]['frames'] or []
+                                                video_thwc = _np.asarray(frames, dtype=_np.uint8)
+                                                if video_thwc.ndim == 3:
+                                                    video_thwc = video_thwc[:, :, :, None]
+                                                if video_thwc.shape[0] == 1:
+                                                    video_thwc = _np.concatenate([video_thwc, video_thwc], axis=0)
+                                                hub.log_video(f"eval/trajectories/level{lvl_idx:02d}/video0", video_thwc, self.num_timesteps, fps=4)
+                                                # Save local per-level MP4 for inspection
+                                                try:
+                                                    from pathlib import Path as _Path
+                                                    import imageio.v2 as _imageio
+                                                    _out_dir = ARTIFACTS_ROOT / "rollout_gifs"
+                                                    _out_dir.mkdir(parents=True, exist_ok=True)
+                                                    _mp4_path = _Path(_out_dir) / f"eval_traj_step{int(self.num_timesteps)}_L{lvl_idx:02d}.mp4"
+                                                    _writer = _imageio.get_writer(_mp4_path, fps=4, codec="libx264", quality=7)
+                                                    try:
+                                                        for f in video_thwc:
+                                                            _writer.append_data(_np.asarray(f, dtype=_np.uint8))
+                                                    finally:
+                                                        _writer.close()
+                                                except Exception as _save_exc:
+                                                    print(f"Warning: Local per-level eval video save failed at step {self.num_timesteps}: {_save_exc}")
+                                        # After per-level logging, skip the generic single-level path
+                                        self._last_traj_dump = self.num_timesteps
+                                        return True
+                                    except Exception as _per_level_exc:
+                                        print(f"Warning: Per-level trajectory logging failed, falling back to default: {_per_level_exc}")
+                                # Fallback: Use a fresh non-curriculum single-env factory mirroring current args
                                 rec_env_factory = _make_renderable_env
                                 trajectories = rec.record(rec_env_factory, self.model)
                                 # Build compact text summary of actions per episode
@@ -1614,6 +1676,83 @@ def main() -> None:
                     callbacks.append(_HubEvalForward(verbose=0))
                 except (OSError, json.JSONDecodeError) as e:
                     print(f"Warning: Failed to configure fixed-set evaluator: {e}")
+            # Always-on trajectory recorder (independent of fixedset) so it runs for default configs
+            if hub is not None and (args.eval_fixedset is None):
+                try:
+                    class _HubTrajectoryRecorder(BaseCallback):
+                        def __init__(self, verbose=0):
+                            super().__init__(verbose)
+                            self._last_traj_dump = 0
+                            self._renderer = None
+                            try:
+                                from src.env.visuals.mpl_renderer import MatplotlibBoardRenderer
+                                self._renderer = MatplotlibBoardRenderer(cell_size=28)
+                            except Exception:
+                                self._renderer = None
+                        def _on_step(self) -> bool:
+                            if args.traj_record_freq > 0 and (self.num_timesteps - self._last_traj_dump) >= args.traj_record_freq:
+                                # Prefer per-level trajectories if using bank curriculum; else fallback to single-env
+                                try:
+                                    from src.monitoring.evaluators import TrajectoryRecorder
+                                    if curriculum_manager is not None and hasattr(curriculum_manager, 'curriculum_levels') and hasattr(curriculum_manager, 'bank'):
+                                        from src.env.curriculum import create_bank_curriculum_manager, BankCurriculumWrapper
+                                        import numpy as _np
+                                        levels = getattr(curriculum_manager, 'curriculum_levels')
+                                        bank_obj = getattr(curriculum_manager, 'bank')
+                                        srt = getattr(curriculum_manager, 'success_rate_threshold', 0.8)
+                                        min_eps = getattr(curriculum_manager, 'min_episodes_per_level', 100)
+                                        win_sz = getattr(curriculum_manager, 'success_rate_window_size', 200)
+                                        chk_freq = getattr(curriculum_manager, 'advancement_check_frequency', 50)
+                                        for lvl_idx, _ in enumerate(levels):
+                                            def _make_env_for_level(idx: int = lvl_idx):
+                                                mgr = create_bank_curriculum_manager(
+                                                    bank=bank_obj,
+                                                    curriculum_levels=levels,
+                                                    success_rate_threshold=srt,
+                                                    min_episodes_per_level=min_eps,
+                                                    success_rate_window_size=win_sz,
+                                                    advancement_check_frequency=chk_freq,
+                                                    verbose=False,
+                                                )
+                                                mgr.current_level = idx
+                                                return BankCurriculumWrapper(
+                                                    bank=bank_obj,
+                                                    curriculum_manager=mgr,
+                                                    obs_mode=(args.obs_mode if args.obs_mode in ("image", "rgb_image", "rgb_cell_image", "symbolic") else "rgb_image"),
+                                                    channels_first=True,
+                                                    render_mode=None,
+                                                    cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
+                                                    verbose=False,
+                                                )
+                                            rec_level = TrajectoryRecorder(episodes=1, capture_render=True, renderer=self._renderer)
+                                            trajs = rec_level.record(_make_env_for_level, self.model)
+                                            if trajs and trajs[0].get('frames'):
+                                                frames = trajs[0]['frames'] or []
+                                                video_thwc = _np.asarray(frames, dtype=_np.uint8)
+                                                if video_thwc.ndim == 3:
+                                                    video_thwc = video_thwc[:, :, :, None]
+                                                if video_thwc.shape[0] == 1:
+                                                    video_thwc = _np.concatenate([video_thwc, video_thwc], axis=0)
+                                                hub.log_video(f"eval/trajectories/level{lvl_idx:02d}/video0", video_thwc, self.num_timesteps, fps=4)
+                                    else:
+                                        # Fallback: single non-curriculum env
+                                        def _make_renderable_env():
+                                            e = make_env_factory(args)()
+                                            try:
+                                                if hasattr(e, 'render_mode'):
+                                                    e.render_mode = 'rgb'
+                                            except Exception:
+                                                pass
+                                            return e
+                                        rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True, renderer=self._renderer)
+                                        rec.record(_make_renderable_env, self.model)
+                                except Exception as _exc:
+                                    print(f"Warning: Trajectory recorder failed at step {self.num_timesteps}: {_exc}")
+                                self._last_traj_dump = self.num_timesteps
+                            return True
+                    callbacks.append(_HubTrajectoryRecorder(verbose=0))
+                except Exception as e:
+                    print(f"Warning: Failed to configure trajectory recorder: {e}")
         if args.save_freq > 0:
             ckpt_cb = CheckpointCallback(save_freq=args.save_freq, save_path=(os.path.dirname(args.save_path) or "."),
                                          name_prefix=os.path.basename(args.save_path))
