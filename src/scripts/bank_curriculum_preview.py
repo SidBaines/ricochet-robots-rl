@@ -32,9 +32,10 @@ from src.env.puzzle_bank import PuzzleBank, SpecKey
 # Configuration
 BANK_DIR = str((ARTIFACTS_ROOT / "puzzle_bank").resolve())
 CONFIG_PATH = str((PROJECT_ROOT / "configs" / "curriculum_config_default.json").resolve())
-EXAMPLES_PER_LEVEL = 5
+EXAMPLES_PER_LEVEL = 3
 OBS_MODE = "rgb_image"
 CHANNELS_FIRST = True
+CELL_OBS_PIXEL_SIZE = 40  # used if OBS_MODE == "rgb_cell_image"
 
 # Curriculum thresholds (aligned with train_agent.py defaults)
 SUCCESS_RATE_THRESHOLD = 0.8
@@ -49,7 +50,7 @@ VERBOSE = True
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     config_data: Dict[str, Any] = json.load(f)
 
-levels: List[Dict[str, Any]] = config_data.get("levels", [])
+levels: List[Dict[str, Any]] = config_data.get("levels", [])[:1]
 for level in levels:
     spec_dict = level["spec_key"]
     if isinstance(spec_dict, dict):
@@ -89,6 +90,7 @@ def make_wrapper_for_current_level(render_mode: str = "rgb") -> BankCurriculumWr
         obs_mode=OBS_MODE,
         channels_first=CHANNELS_FIRST,
         render_mode=render_mode,
+        cell_obs_pixel_size=(CELL_OBS_PIXEL_SIZE if OBS_MODE == "rgb_cell_image" else None),
         verbose=VERBOSE,
     )
 
@@ -120,5 +122,46 @@ for level_idx, level_spec in enumerate(levels):
     env.close()
 
 print("Preview complete.")
+
+#%%
+# Additional preview cell: rgb_cell_image observation mode (centered cell-grid)
+
+try:
+    out_dir = Path(ARTIFACTS_ROOT) / "rollout_gifs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+except Exception:
+    out_dir = None
+
+OBS_MODE = "rgb_cell_image"
+plt.rcParams["figure.figsize"] = (4 * EXAMPLES_PER_LEVEL, 4)
+
+for level_idx, level_spec in enumerate(levels):
+    bank_manager.current_level = level_idx
+    env = make_wrapper_for_current_level(render_mode=None)
+    fig, axes = plt.subplots(1, EXAMPLES_PER_LEVEL)
+    if EXAMPLES_PER_LEVEL == 1:
+        axes = [axes]
+    for i in range(EXAMPLES_PER_LEVEL):
+        obs, info = env.reset()
+        arr = obs
+        if CHANNELS_FIRST and isinstance(arr, np.ndarray) and arr.ndim == 3 and arr.shape[0] == 3:
+            arr = np.transpose(arr, (1, 2, 0))
+        axes[i].imshow(arr)
+        axes[i].axis("off")
+        title = f"L{level_idx}: {level_spec['name']}\nopt_len={info.get('optimal_length', '?')} robots_moved={info.get('robots_moved', '?')}"
+        axes[i].set_title(title, fontsize=9)
+        if out_dir is not None:
+            try:
+                fn = out_dir / f"cellgrid_preview_L{level_idx:02d}_i{i:02d}.png"
+                import imageio.v2 as _imageio
+                _imageio.imwrite(fn, (arr).astype(np.uint8))
+            except Exception:
+                pass
+    fig.suptitle(f"Curriculum Level {level_idx}: {level_spec['name']} (rgb_cell_image)")
+    plt.tight_layout()
+    plt.show()
+    env.close()
+
+print("rgb_cell_image preview complete.")
 
 # %%

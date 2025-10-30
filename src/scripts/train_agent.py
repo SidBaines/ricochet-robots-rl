@@ -59,7 +59,8 @@ def build_training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ensure-solvable", action="store_true")
     parser.add_argument("--solver-max-depth", type=int, default=30)
     parser.add_argument("--solver-max-nodes", type=int, default=20000)
-    parser.add_argument("--obs-mode", choices=["image", "symbolic", "rgb_image"], default="image")
+    parser.add_argument("--obs-mode", choices=["image", "symbolic", "rgb_image", "rgb_cell_image"], default="image")
+    parser.add_argument("--cell-obs-pixel-size", type=int, default=128)
 
     # Profiling options
     parser.add_argument("--enable-profiling", action="store_true", help="Enable detailed profiling of training pipeline")
@@ -224,6 +225,7 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
             "solver_max_depth": "solver_max_depth",
             "solver_max_nodes": "solver_max_nodes",
             "obs_mode": "obs_mode",
+            "cell_obs_pixel_size": "cell_obs_pixel_size",
         }
         for k, v in env.items():
             dst = mapping.get(_normalize_key(k))
@@ -598,9 +600,10 @@ def make_bank_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable
         return BankCurriculumWrapper(
             bank=bank,
             curriculum_manager=bank_manager,
-            obs_mode=(args.obs_mode if args.obs_mode in ("image", "rgb_image", "symbolic") else "rgb_image"),
+            obs_mode=(args.obs_mode if args.obs_mode in ("image", "rgb_image", "rgb_cell_image", "symbolic") else "rgb_image"),
             channels_first=True,
             render_mode=None,
+            cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
             verbose=args.curriculum_verbose,
         )
     
@@ -853,7 +856,7 @@ def main() -> None:
         raise ValueError("ConvLSTM requires image observations, but symbolic mode was selected")
     
     # Policy selection based on observation mode and requirements
-    if args.obs_mode in ["image", "rgb_image"]:
+    if args.obs_mode in ["image", "rgb_image", "rgb_cell_image"]:
         if args.drc:
             if RecurrentPPO is None:
                 raise ImportError("sb3-contrib is required for recurrent PPO. Please install sb3-contrib.")
@@ -870,7 +873,7 @@ def main() -> None:
                     # use_pool_and_inject=True,
                 ),
                 net_arch=dict(pi=[128, 128], vf=[128, 128]),
-                normalize_images=(args.obs_mode == "rgb_image"),
+                normalize_images=(args.obs_mode in ("rgb_image", "rgb_cell_image")),
             )
         elif args.convlstm:
             # Until a compliant recurrent policy wired to ConvLSTM features is implemented,
@@ -881,7 +884,7 @@ def main() -> None:
             policy = "CnnLstmPolicy"
             policy_kwargs = dict(
                 net_arch=dict(pi=[128, 128], vf=[128, 128]),
-                normalize_images=(args.obs_mode == "rgb_image")
+                normalize_images=(args.obs_mode in ("rgb_image", "rgb_cell_image"))
             )
         elif not tiny_grid:
             # Fallback to CNN for image observations
@@ -894,7 +897,7 @@ def main() -> None:
                 policy = ResNetPolicy
                 policy_kwargs = dict(
                     # net_arch=dict(pi=[128, 128], vf=[128, 128]),
-                    normalize_images=(args.obs_mode == "rgb_image"),
+                    normalize_images=(args.obs_mode in ("rgb_image", "rgb_cell_image")),
                     # features_extractor_class=ResNetFeaturesExtractor,
                     # features_extractor_kwargs=dict(features_dim=args.features_dim),
 
@@ -903,7 +906,7 @@ def main() -> None:
                 policy = "CnnPolicy"
                 policy_kwargs = dict(
                     net_arch=dict(pi=[128, 128], vf=[128, 128]), 
-                    normalize_images=(args.obs_mode == "rgb_image")  # Normalize RGB images
+                    normalize_images=(args.obs_mode in ("rgb_image", "rgb_cell_image"))  # Normalize RGB images
                 )
                 if SmallCNN is not None and args.small_cnn:
                     policy_kwargs.update(dict(features_extractor_class=SmallCNN, features_extractor_kwargs=dict(features_dim=128)))

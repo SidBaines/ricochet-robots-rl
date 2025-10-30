@@ -570,7 +570,8 @@ def create_bank_curriculum_wrapper(
     obs_mode: str = "rgb_image",
     channels_first: bool = True,
     render_mode: Optional[str] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    cell_obs_pixel_size: Optional[int] = None,
 ) -> CriteriaFilteredEnv:
     """Create a bank-based curriculum wrapper.
     
@@ -594,7 +595,8 @@ def create_bank_curriculum_wrapper(
         obs_mode=obs_mode,
         channels_first=channels_first,
         render_mode=render_mode,
-        verbose=verbose
+        verbose=verbose,
+        cell_obs_pixel_size=cell_obs_pixel_size,
     )
 
 
@@ -615,7 +617,8 @@ class BankCurriculumWrapper(GymEnvBase):
         channels_first: bool = True,
         include_noop: bool = False,
         render_mode: Optional[str] = None,
-        verbose: bool = True
+        verbose: bool = True,
+        cell_obs_pixel_size: Optional[int] = None,
     ):
         """Initialize bank curriculum wrapper.
         
@@ -634,6 +637,7 @@ class BankCurriculumWrapper(GymEnvBase):
         self.include_noop = include_noop
         self.render_mode = render_mode
         self.verbose = verbose
+        self.cell_obs_pixel_size = cell_obs_pixel_size
         
         # Create current environment
         self._current_env = None
@@ -656,7 +660,8 @@ class BankCurriculumWrapper(GymEnvBase):
             include_noop=self.include_noop,
             render_mode=self.render_mode,
             verbose=self.verbose,
-            max_steps=criteria.max_optimal_length
+            max_steps=criteria.max_optimal_length,
+            cell_obs_pixel_size=self.cell_obs_pixel_size,
         )
     
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):

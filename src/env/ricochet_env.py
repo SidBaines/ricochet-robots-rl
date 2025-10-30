@@ -47,7 +47,7 @@ class FixedLayout:
     target_robot: int
 
 
-ObsMode = Literal["image", "symbolic", "rgb_image"]
+ObsMode = Literal["image", "symbolic", "rgb_image", "rgb_cell_image"]
 
 
 class RicochetRobotsEnv(GymEnvBase):
@@ -73,6 +73,8 @@ class RicochetRobotsEnv(GymEnvBase):
     metadata = {"render_modes": ["ascii", "rgb"], "render_fps": 4}
     # Class-level cache for RGB backgrounds per (H, W, cell_size, grid_color, grid_th, wall_color, wall_th)
     _RGB_BG_CACHE: Dict[Tuple[int, int, int, Tuple[int, int, int], int, Tuple[int, int, int], int], np.ndarray] = {}
+    # Class-level cache for CellGrid backgrounds per (H, W, light_gray, dark_gray)
+    _CELL_BG_CACHE: Dict[Tuple[int, int, Tuple[int, int, int], Tuple[int, int, int]], np.ndarray] = {}
 
     def __init__(
         self,
@@ -98,6 +100,9 @@ class RicochetRobotsEnv(GymEnvBase):
         central_l_per_quadrant: Optional[int] = None,
         # RGB render configuration
         render_rgb_config: Optional[Dict[str, object]] = None,
+        # RGB Cell-grid observation configuration
+        cell_obs_pixel_size: Optional[int] = None,
+        render_cell_config: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__()
         self.height = height
@@ -146,6 +151,23 @@ class RicochetRobotsEnv(GymEnvBase):
             self._render_rgb_cfg.update(render_rgb_config)
         # Per-instance cache: RGB internal walls overlay built for current layout (excludes boundary walls)
         self._rgb_internal_walls_overlay: Optional[np.ndarray] = None
+        # Cell-grid rendering defaults (for rgb_cell_image)
+        self._cell_obs_pixel_size: int = 128 if cell_obs_pixel_size is None else int(cell_obs_pixel_size)
+        self._render_cell_cfg: Dict[str, object] = {
+            "light_gray": (200, 200, 200),
+            "dark_gray": (40, 40, 40),
+            "robot_colors": [
+                (220, 50, 50),     # red
+                (50, 120, 220),    # blue
+                (50, 180, 80),     # green
+                (230, 200, 40),    # yellow
+                (180, 80, 180),    # purple (extra if more robots)
+            ],
+            "goal_light_factor": 1.5,
+        }
+        if render_cell_config is not None:
+            self._render_cell_cfg.update(render_cell_config)
+        self._cell_internal_walls_overlay: Optional[np.ndarray] = None
 
         # Seeding: adopt Gymnasium convention with self.np_random
         self.np_random: np.random.Generator
@@ -196,6 +218,18 @@ class RicochetRobotsEnv(GymEnvBase):
                 obs_shape = (3, FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE)
             else:
                 obs_shape = (FIXED_PIXEL_SIZE, FIXED_PIXEL_SIZE, 3)
+            self.observation_space = spaces.Box(
+                low=0,
+                high=255,
+                shape=obs_shape,
+                dtype=np.uint8,
+            )
+        elif self.obs_mode == "rgb_cell_image":
+            # RGB cell-grid observation on a fixed square canvas
+            if self.channels_first:
+                obs_shape = (3, self._cell_obs_pixel_size, self._cell_obs_pixel_size)
+            else:
+                obs_shape = (self._cell_obs_pixel_size, self._cell_obs_pixel_size, 3)
             self.observation_space = spaces.Box(
                 low=0,
                 high=255,
@@ -288,6 +322,12 @@ class RicochetRobotsEnv(GymEnvBase):
                     self._build_rgb_internal_walls_overlay(self._board)
             except Exception:
                 self._rgb_internal_walls_overlay = None
+            # Build per-layout cell-grid internal walls overlay (for rgb_cell_image obs)
+            try:
+                if self.obs_mode == "rgb_cell_image":
+                    self._build_cell_internal_walls_overlay(self._board)
+            except Exception:
+                self._cell_internal_walls_overlay = None
             with profile("env_make_obs", track_memory=True):
                 obs = self._make_obs(self._board)
             info = {
@@ -457,6 +497,8 @@ class RicochetRobotsEnv(GymEnvBase):
             return self._board_to_image_obs(board)
         elif self.obs_mode == "rgb_image":
             return self._board_to_rgb_obs(board)
+        elif self.obs_mode == "rgb_cell_image":
+            return self._board_to_rgb_cell_obs(board)
         return self._board_to_symbolic_obs(board)
 
     def _board_to_image_obs(self, board: Board) -> np.ndarray:
@@ -556,6 +598,66 @@ class RicochetRobotsEnv(GymEnvBase):
             with profile("env_rgb_rendering_cached", track_memory=True):
                 region = self._render_rgb_cached(board, cell_size)
             canvas[y0:y0+H_px, x0:x0+W_px] = region
+            if self.channels_first:
+                canvas = np.transpose(canvas, (2, 0, 1))
+            return canvas
+
+    def _board_to_rgb_cell_obs(self, board: Board) -> np.ndarray:
+        """Convert board to RGB cell-grid observation on a fixed canvas.
+        
+        Content region has shape (2H+1, 2W+1), where cells are at odd-odd indices,
+        boundaries at even indices, and corners at even-even. The region is centered
+        on a black canvas of size (cell_obs_pixel_size, cell_obs_pixel_size).
+        """
+        try:
+            from ..profiling import profile
+        except ImportError:
+            def profile(name, track_memory=True):
+                from contextlib import nullcontext
+                return nullcontext()
+
+        with profile("env_rgb_cell_observation_generation", track_memory=True):
+            H, W = board.height, board.width
+            content_h = 2 * H + 1
+            content_w = 2 * W + 1
+
+            # Background: boundary defaults (light gray), corners light gray; outer boundaries dark gray
+            bg = self._get_cell_background(H, W)
+            img = bg.copy()
+
+            # Overlay interior walls (dark gray)
+            if self._cell_internal_walls_overlay is None or self._cell_internal_walls_overlay.shape[:2] != (content_h, content_w):
+                self._build_cell_internal_walls_overlay(board)
+            if self._cell_internal_walls_overlay is not None:
+                overlay = self._cell_internal_walls_overlay
+                mask = (overlay.sum(axis=2) < 3 * 255)
+                img[mask] = overlay[mask]
+
+            # Dynamic: robots and goal on cell pixels (odd, odd)
+            robot_colors = [tuple(int(a) for a in t) for t in self._render_cell_cfg["robot_colors"]]  # type: ignore[index]
+            goal_light = float(self._render_cell_cfg["goal_light_factor"])  # type: ignore[index]
+            for rid, (rr, cc) in board.robot_positions.items():
+                r_idx = 2 * int(rr) + 1
+                c_idx = 2 * int(cc) + 1
+                color = robot_colors[rid % len(robot_colors)]
+                img[r_idx, c_idx] = color
+            tr = int(board.target_robot)
+            gr, gc = board.goal_position
+            tr_color = robot_colors[tr % len(robot_colors)]
+            light_color = tuple(int(min(255, round(goal_light * v))) for v in tr_color)
+            img[2 * int(gr) + 1, 2 * int(gc) + 1] = light_color
+
+            # Center on fixed canvas with black padding
+            size = int(self._cell_obs_pixel_size)
+            canvas = np.zeros((size, size, 3), dtype=np.uint8)
+            y0 = max(0, (size - content_h) // 2)
+            x0 = max(0, (size - content_w) // 2)
+            y1 = y0 + min(content_h, size)
+            x1 = x0 + min(content_w, size)
+            cy1 = min(content_h, size)
+            cx1 = min(content_w, size)
+            canvas[y0:y1, x0:x1] = img[0:cy1, 0:cx1]
+
             if self.channels_first:
                 canvas = np.transpose(canvas, (2, 0, 1))
             return canvas
@@ -867,6 +969,77 @@ class RicochetRobotsEnv(GymEnvBase):
                     y1 = int((r + 1) * cell_size)
                     overlay[y0:y1, x0:x1] = wall_color
         self._rgb_internal_walls_overlay = overlay
+
+    def _get_cell_background(self, H: int, W: int) -> np.ndarray:
+        """Background for cell-grid: boundaries/corners light gray, outer boundaries dark gray.
+        Cells remain black; only boundary pixels are colored by default.
+        """
+        light_gray = tuple(int(x) for x in self._render_cell_cfg["light_gray"])  # type: ignore[index]
+        dark_gray = tuple(int(x) for x in self._render_cell_cfg["dark_gray"])  # type: ignore[index]
+        key = (int(H), int(W), light_gray, dark_gray)
+        cached = RicochetRobotsEnv._CELL_BG_CACHE.get(key)
+        if cached is not None:
+            return cached
+        content_h = 2 * int(H) + 1
+        content_w = 2 * int(W) + 1
+        img = np.zeros((content_h, content_w, 3), dtype=np.uint8)
+        # Set all boundaries (even rows with odd cols, odd rows with even cols) to light gray
+        # Horizontal boundary rows (even indices): columns at odd indices
+        for r in range(0, content_h, 2):
+            for c in range(1, content_w, 2):
+                img[r, c] = light_gray
+        # Vertical boundary columns (even indices): rows at odd indices
+        for c in range(0, content_w, 2):
+            for r in range(1, content_h, 2):
+                img[r, c] = light_gray
+        # Corners (even-even) default to light gray
+        for r in range(0, content_h, 2):
+            for c in range(0, content_w, 2):
+                img[r, c] = light_gray
+        # Cells (odd-odd) should be white (empty cell background)
+        for r in range(1, content_h, 2):
+            for c in range(1, content_w, 2):
+                img[r, c] = (255, 255, 255)
+        # Outer boundaries are walls: set to dark gray
+        # Top and bottom rows (even): odd columns
+        for c in range(1, content_w, 2):
+            img[0, c] = dark_gray
+            img[content_h - 1, c] = dark_gray
+        # Left and right columns (even): odd rows
+        for r in range(1, content_h, 2):
+            img[r, 0] = dark_gray
+            img[r, content_w - 1] = dark_gray
+        # Outer corners
+        img[0, 0] = dark_gray
+        img[0, content_w - 1] = dark_gray
+        img[content_h - 1, 0] = dark_gray
+        img[content_h - 1, content_w - 1] = dark_gray
+        RicochetRobotsEnv._CELL_BG_CACHE[key] = img
+        return img
+
+    def _build_cell_internal_walls_overlay(self, board: Board) -> None:
+        """Build overlay marking interior walls as dark gray on boundary pixels only."""
+        dark_gray = tuple(int(x) for x in self._render_cell_cfg["dark_gray"])  # type: ignore[index]
+        H, W = board.height, board.width
+        content_h = 2 * int(H) + 1
+        content_w = 2 * int(W) + 1
+        overlay = np.ones((content_h, content_w, 3), dtype=np.uint8) * 255
+        # Start from transparent (all 255), then draw only dark-gray where interior walls exist
+        # Horizontal interior walls: r=1..H-1 at row index 2*r, columns at odd indices
+        for r in range(1, H):
+            row_idx = 2 * int(r)
+            for c in range(W):
+                if board.h_walls[r, c]:
+                    col_idx = 2 * int(c) + 1
+                    overlay[row_idx, col_idx] = dark_gray
+        # Vertical interior walls: c=1..W-1 at col index 2*c, rows at odd indices
+        for c in range(1, W):
+            col_idx = 2 * int(c)
+            for r in range(H):
+                if board.v_walls[r, c]:
+                    row_idx = 2 * int(r) + 1
+                    overlay[row_idx, col_idx] = dark_gray
+        self._cell_internal_walls_overlay = overlay
 
 
 def generate_board_from_spec_with_seed(
