@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
+import numpy as np
+
 from .hub import MonitoringHub
 
 
@@ -12,6 +14,32 @@ def _board_signature(layout: Dict[str, Any]) -> str:
     import hashlib
     payload = json.dumps(layout, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _coerce_action_scalar(action: Any) -> int:
+    """Best-effort conversion of model actions to a scalar index.
+
+    Handles numpy arrays, torch tensors (via .item), lists, and plain scalars.
+    Falls back to the first element when the action is vector-valued.
+    """
+    if isinstance(action, (int, np.integer)):
+        return int(action)
+    if hasattr(action, "item"):
+        try:
+            return int(action.item())
+        except Exception:
+            pass
+    try:
+        arr = np.asarray(action)
+    except Exception:
+        if isinstance(action, (list, tuple)) and action:
+            return int(action[0])
+        return int(action)
+    if arr.shape == ():
+        return int(arr.item())
+    if arr.size == 0:
+        raise ValueError("Cannot convert empty action to scalar")
+    return int(arr.flat[0])
 
 
 @dataclass
@@ -39,7 +67,6 @@ class FixedSetEvaluator:
         self.episodes = int(episodes)
 
     def evaluate(self, hub: MonitoringHub, make_env_fn, model, step: Optional[int] = None) -> Dict[str, Any]:
-        import numpy as np
         success = 0
         lengths: List[int] = []
         noop_counts: List[int] = []
@@ -53,10 +80,11 @@ class FixedSetEvaluator:
             noops = 0
             while not (done or trunc):
                 action, _ = model.predict(obs, deterministic=True)
-                is_noop = (getattr(env, "_noop_action", None) is not None and int(action) == env._noop_action)
+                action_scalar = _coerce_action_scalar(action)
+                is_noop = (getattr(env, "_noop_action", None) is not None and action_scalar == env._noop_action)
                 if is_noop:
                     noops += 1
-                obs, _, done, trunc, info = env.step(int(action))
+                obs, _, done, trunc, info = env.step(action_scalar)
                 steps += 1
             if info.get("is_success", False):
                 success += 1
@@ -124,7 +152,8 @@ class OptimalityGapEvaluator:
             steps = 0
             while not (done or trunc):
                 action, _ = model.predict(obs, deterministic=True)
-                obs, _, done, trunc, info = env.step(int(action))
+                action_scalar = _coerce_action_scalar(action)
+                obs, _, done, trunc, info = env.step(action_scalar)
                 steps += 1
             env.close()
             if info.get("is_success", False) and opt is not None:
@@ -208,13 +237,14 @@ class TrajectoryRecorder:
                     frames.append(initial)
             while not (done or trunc):
                 action, _ = model.predict(obs, deterministic=True)
-                next_obs, reward, done, trunc, info = env.step(int(action))
+                action_scalar = _coerce_action_scalar(action)
+                next_obs, reward, done, trunc, info = env.step(action_scalar)
                 if self.capture_render:
                     captured = self._capture_frame(env)
                     if captured is not None:
                         frames.append(captured)
                 steps.append({
-                    "action": int(action),
+                    "action": action_scalar,
                     "reward": float(reward),
                     "done": bool(done),
                     "truncated": bool(trunc),
@@ -268,7 +298,8 @@ def rollout_episode_with_recurrent_support(env_factory: Callable[[], Any], model
                 policy_obj.set_episode_starts([episode_starts])
             action, _ = policy_obj._predict(obs, deterministic=deterministic)  # type: ignore[attr-defined]
 
-        obs, _, done, trunc, info = env.step(int(action))
+        action_scalar = _coerce_action_scalar(action)
+        obs, _, done, trunc, info = env.step(action_scalar)
         if custom_recurrent:
             policy_obj.set_episode_starts([done or trunc])
         episode_starts = done or trunc

@@ -104,43 +104,54 @@ class WandbBackend:
             arr = arr.numpy()
         if isinstance(arr, list):
             arr = np.asarray(arr)
-        
-        # Handle different input formats
+
+        # Normalize to Weights & Biases expected layout: (T, C, H, W)
         if arr.ndim == 5:
-            # (N, C, T, H, W) or (N, T, H, W, C) -> pick first batch
+            # (N, C, T, H, W) or (N, T, H, W, C) → (T, C, H, W), first batch
             if arr.shape[1] in (1, 3, 4):
-                # (N, C, T, H, W) -> (T, H, W, C)
-                arr = np.transpose(arr[0], (1, 2, 3, 0))
+                arr = np.transpose(arr[0], (1, 0, 2, 3))
+            elif arr.shape[-1] in (1, 3, 4):
+                arr = np.transpose(arr[0], (0, 4, 1, 2))
             else:
-                # (N, T, H, W, C)
-                arr = arr[0]
+                print(f"Warning: Unrecognized 5D video array layout: {arr.shape}")
+                return
+        elif arr.ndim == 4:
+            # Either (T, H, W, C) or already (T, C, H, W)
+            if arr.shape[-1] in (1, 3, 4):
+                arr = np.transpose(arr, (0, 3, 1, 2))
+            elif arr.shape[1] in (1, 3, 4):
+                pass  # already (T, C, H, W)
+            else:
+                print(f"Warning: Ambiguous 4D video array layout: {arr.shape}")
+                return
         elif arr.ndim == 3:
-            # (T, H, W) -> (T, H, W, 1) for grayscale
-            arr = arr[:, :, :, np.newaxis]
-        
-        if arr.ndim != 4:
-            print(f"Warning: Expected 4D video array (T, H, W, C), got {arr.ndim}D with shape {arr.shape}")
+            # (T, H, W) → (T, 1, H, W)
+            arr = arr[:, np.newaxis, :, :]
+        else:
+            print(f"Warning: Expected 3D/4D/5D video array, got {arr.ndim}D with shape {arr.shape}")
             return
-            
+
         if arr.dtype != np.uint8:
             arr = arr.astype(np.uint8)
-            
-        # Ensure we have at least 2 frames for a video
+
         if arr.shape[0] < 2:
             print(f"Warning: Video has only {arr.shape[0]} frames, logging as image instead")
             try:
-                self._wandb.log({key+"/frame0": self._wandb.Image(arr[0])}, step=step)
+                # Convert (T, C, H, W) → (H, W, C)
+                f0 = np.transpose(arr[0], (1, 2, 0))
+                self._wandb.log({key+"/frame0": self._wandb.Image(f0)}, step=step)
             except Exception:
                 pass
             return
-            
+
         try:
             self._wandb.log({key: self._wandb.Video(arr, fps=fps, format="mp4")}, step=step)
         except Exception as e:
             print(f"Warning: wandb video logging failed: {e}")
             # Fallback: log first frame as image if video fails
             try:
-                self._wandb.log({key+"/frame0": self._wandb.Image(arr[0])}, step=step)
+                f0 = np.transpose(arr[0], (1, 2, 0))
+                self._wandb.log({key+"/frame0": self._wandb.Image(f0)}, step=step)
             except Exception:
                 pass
 

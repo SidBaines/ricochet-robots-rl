@@ -466,6 +466,7 @@ def make_env_factory(args: argparse.Namespace) -> Callable[[], RicochetRobotsEnv
                 max_steps=args.max_steps,
                 obs_mode=args.obs_mode,
                 channels_first=True,
+                cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
             )
         return _fn
 
@@ -487,6 +488,7 @@ def make_env_factory(args: argparse.Namespace) -> Callable[[], RicochetRobotsEnv
                 max_steps=args.max_steps,
                 obs_mode=args.obs_mode,
                 channels_first=True,
+                cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
             )
         return _fn
 
@@ -507,6 +509,7 @@ def make_env_factory(args: argparse.Namespace) -> Callable[[], RicochetRobotsEnv
             solver_max_nodes=args.solver_max_nodes,
             obs_mode=args.obs_mode,
             channels_first=True,
+            cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
         )
     return _fn
 
@@ -616,11 +619,13 @@ def main() -> None:
     cli_args = cli_parser.parse_args()
 
     config_path = cli_args.config_path
-    config_data = load_config_file(config_path)
+    raw_config = load_config_file(config_path)
+    init_config_block = raw_config.get("initialization")
+    if init_config_block is not None and not isinstance(init_config_block, dict):
+        raise ValueError("'initialization' config must be a mapping")
     # Support structured configs: flatten known sections into argparse keys
-    if any(k in config_data for k in ("env", "algo", "model", "curriculum", "eval", "monitoring", "training", "paths")):
-        config_data = flatten_structured_config(config_data)
-    init_config_block = config_data.pop("initialization", None)
+    config_data = flatten_structured_config(raw_config)
+    config_data.pop("initialization", None)
 
     training_parser = build_training_parser()
     defaults_namespace = training_parser.parse_args([])
@@ -946,6 +951,7 @@ def main() -> None:
     model = None  # type: ignore[assignment]
     resume_mode = args.init_mode == "resume"
     warmstart_mode = args.init_mode == "warmstart"
+    print(f"args.init_mode: {args.init_mode}")
 
     if resume_mode:
         checkpoint_path = args.resume_checkpoint_path or ""
@@ -1055,11 +1061,15 @@ def main() -> None:
                 monitoring_backends.append(WandbBackend(project=(args.wandb_project or "ricochet-robots"), entity=args.wandb_entity, run_name=args.wandb_run_name, tags=args.wandb_tags, config={"args": vars(args)}))
             except ImportError:
                 print("Warning: wandb requested but not available; skipping")
-        hub = MonitoringHub(backends=monitoring_backends, collectors=[
-            EpisodeStatsCollector(window_size=200),
-            ActionUsageCollector(track_noop=True),
-            CurriculumProgressCollector(),
-        ])
+        if not monitoring_backends:
+            print("MonitoringHub disabled: no logging backends enabled (set monitoring.tensorboard or monitoring.wandb).")
+            hub = None  # type: ignore
+        else:
+            hub = MonitoringHub(backends=monitoring_backends, collectors=[
+                EpisodeStatsCollector(window_size=200),
+                ActionUsageCollector(track_noop=True),
+                CurriculumProgressCollector(),
+            ])
     except ImportError:
         hub = None  # type: ignore
     try:
@@ -1341,7 +1351,7 @@ def main() -> None:
                                 if hasattr(e, 'render_mode'):
                                     e.render_mode = 'rgb'
                             except Exception:
-                                    pass
+                                pass
                             return e
                         try:
                             rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True, renderer=self._renderer)
@@ -1352,29 +1362,43 @@ def main() -> None:
                                 acts = [str(step.get('action', -1)) for step in traj.get('steps', [])]
                                 succ = "✓" if bool(traj.get('success', False)) else "✗"
                                 summaries.append(f"ep {idx}: success={succ}, steps={len(acts)}, actions=[" + ",".join(acts[:60]) + (",..." if len(acts) > 60 else "]"))
-                            hub.log_text("eval/trajectories/text", "\n".join(summaries), self.num_timesteps)
+                            if summaries:
+                                hub.log_text("eval/trajectories/text", "\n".join(summaries), self.num_timesteps)
                             # If frames are present, log a short video for the first episode
+                            first_frames: list[Any] = []
                             if trajectories and trajectories[0].get('frames'):
                                 first_frames = trajectories[0]['frames'] or []
-                                # Expect list of (H, W, 3) uint8
                                 try:
                                     import numpy as _np
-                                    if len(first_frames) > 1 and isinstance(first_frames[0], (_np.ndarray, list)):
+                                    if first_frames and isinstance(first_frames[0], (_np.ndarray, list)):
                                         video = _np.asarray(first_frames, dtype=_np.uint8)
-                                        # Ensure shape (T, H, W, C)
+                                        if video.ndim == 3:
+                                            # Single frame -> add time axis
+                                            video = video[None, ...]
+                                        if video.shape[0] == 1:
+                                            # Duplicate lone frame so wandb can encode a short clip
+                                            video = _np.repeat(video, 2, axis=0)
                                         if video.ndim == 3:
                                             video = video[:, :, :, None]
+                                        elif video.ndim == 4 and video.shape[-1] not in (1, 3, 4):
+                                            video = video[..., None]
                                         hub.log_video("eval/trajectories/video0", video, self.num_timesteps, fps=4)
-                                    elif len(first_frames) > 0:
+                                    elif first_frames:
                                         hub.log_image("eval/trajectories/frame0", first_frames[0], self.num_timesteps)
-                                except Exception:
-                                    # Fall back silently
-                                    pass
+                                    else:
+                                        print(f"Warning: No frames captured for trajectory video at step {self.num_timesteps}")
+                                except Exception as exc:
+                                    print(f"Warning: Trajectory video logging failed at step {self.num_timesteps}: {exc}")
+                                    try:
+                                        if first_frames:
+                                            hub.log_image("eval/trajectories/frame0", first_frames[0], self.num_timesteps)
+                                    except Exception as img_exc:
+                                        print(f"Warning: Trajectory image fallback failed at step {self.num_timesteps}: {img_exc}")
                             # Also log a basic step counter to ensure the run shows activity
                             hub.log_scalar("train/num_timesteps", float(self.num_timesteps), self.num_timesteps)
-                        except Exception:
-                            # Swallow any logging errors to not interrupt training
-                            pass
+                        except Exception as exc:
+                            # Surface issues instead of failing silently
+                            print(f"Warning: Trajectory logging failed at step {self.num_timesteps}: {exc}")
                         self._last_traj_dump = self.num_timesteps
                     return True
             callbacks.append(_HubTrajectoryLogger(verbose=0))
@@ -1542,23 +1566,49 @@ def main() -> None:
                                         acts = [str(step.get('action', -1)) for step in traj.get('steps', [])]
                                         succ = "✓" if bool(traj.get('success', False)) else "✗"
                                         summaries.append(f"ep {idx}: success={succ}, steps={len(acts)}, actions=[" + ",".join(acts[:60]) + (",..." if len(acts) > 60 else "]"))
-                                    hub.log_text("eval/trajectories/text", "\n".join(summaries), self.num_timesteps)
-                                except Exception:
-                                    pass
-                                # If frames are present, log a short video for the first episode
+                                    if summaries:
+                                        hub.log_text("eval/trajectories/text", "\n".join(summaries), self.num_timesteps)
+                                except Exception as exc:
+                                    print(f"Warning: Trajectory text logging failed during eval at step {self.num_timesteps}: {exc}")
+                                # If frames are present, log a short video for the first episode and save a local copy
+                                first_frames: list[Any] = []
                                 try:
                                     if trajectories and trajectories[0].get('frames'):
                                         first_frames = trajectories[0]['frames'] or []
                                         import numpy as _np
-                                        if len(first_frames) > 1 and isinstance(first_frames[0], (_np.ndarray, list)):
-                                            video = _np.asarray(first_frames, dtype=_np.uint8)
-                                            if video.ndim == 3:
-                                                video = video[:, :, :, None]
-                                            hub.log_video("eval/trajectories/video0", video, self.num_timesteps, fps=4)
-                                        elif len(first_frames) > 0:
+                                        video_thwc = _np.asarray(first_frames, dtype=_np.uint8)  # (T,H,W,C) expected
+                                        # Ensure shape is (T,H,W,C)
+                                        if video_thwc.ndim == 3:  # (T,H,W) -> add channel
+                                            video_thwc = video_thwc[:, :, :, None]
+                                        # Ensure at least 2 frames for encoders that reject 1-frame videos
+                                        if video_thwc.shape[0] == 1:
+                                            video_thwc = _np.concatenate([video_thwc, video_thwc], axis=0)
+                                        hub.log_video("eval/trajectories/video0", video_thwc, self.num_timesteps, fps=4)
+
+                                        # Also save a local MP4 for quick inspection with a standard codec
+                                        try:
+                                            from pathlib import Path as _Path
+                                            _out_dir = ARTIFACTS_ROOT / "rollout_gifs"
+                                            _out_dir.mkdir(parents=True, exist_ok=True)
+                                            _mp4_path = _Path(_out_dir) / f"eval_traj_step{int(self.num_timesteps)}_ep0.mp4"
+                                            import imageio.v2 as _imageio
+                                            _writer = _imageio.get_writer(_mp4_path, fps=4, codec="libx264", quality=7)
+                                            try:
+                                                for f in video_thwc:
+                                                    _writer.append_data(_np.asarray(f, dtype=_np.uint8))
+                                            finally:
+                                                _writer.close()
+                                        except Exception as _save_exc:
+                                            print(f"Warning: Local eval video save failed at step {self.num_timesteps}: {_save_exc}")
+                                    else:
+                                        print(f"Warning: No frames captured for eval trajectory video at step {self.num_timesteps}")
+                                except Exception as exc:
+                                    print(f"Warning: Trajectory video logging failed during eval at step {self.num_timesteps}: {exc}")
+                                    try:
+                                        if first_frames:
                                             hub.log_image("eval/trajectories/frame0", first_frames[0], self.num_timesteps)
-                                except Exception:
-                                    pass
+                                    except Exception as img_exc:
+                                        print(f"Warning: Trajectory image fallback failed during eval at step {self.num_timesteps}: {img_exc}")
                                 self._last_traj_dump = self.num_timesteps
                             return True
                     callbacks.append(_HubEvalForward(verbose=0))
