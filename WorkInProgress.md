@@ -2,17 +2,17 @@
 Contains a description, detailed specifications, discussion, notes, questions and answers, and any progress notes etc. all related to the current task. You should update this file whenever you have made changes or progress on a task, and list next step and what remains.
 
 ## Current task
-We've implemented stage 2 of the development process, and we're in the process of checking it. At the moment, we're focussing on getting the training code to work properly.
-In src/scripts/bank_agent_rollout_cells.py, I want to make two changes:
-- In plot_episode_interactive, I want to add a third graphic (alongside the board rendering and reward plot) which shows the value that the model assigns to the given state.
-- I want to be able to save an episode as a gif. Please add add in a new cell at the bottom a funtion which will take level index and episode index, and then create and save both plotly and matplotlib style gifs. 
+We've implemented stage 2 of the development process, and we're in the process of checking it. At the moment, we're focussing on getting the training code to work properly. 
+I want you to do two things:
+1) Add way more metric logging (including the usual RL metrics, for example KL, entropy, clip fraction, etc.). Please think about and decide what to log, then implement it.
+2) Rearrange the yaml config file so that the parameters come in blocks which are relevant (eg. resnet parameters indented under a heading which says 'resnet-params' or something, same with convlstm, drc, etc., then eval parameters indented in an eval section)
 
-## Progress
-- Episode recorder now captures per-state value estimates so the Plotly viewer has the data it needs.
-- Interactive episode plot shows board, cumulative reward, and value estimate with synced slider controls, including a step counter overlay.
-- Added `save_episode_gifs` helper that writes looping matplotlib and Plotly GIFs with step labels and a configurable end-of-loop pause (Plotly export requires kaleido).
-- Tweaked GIF exporting to work with recent Pillow/Plotly versions (Pillow 10+ `textbbox`, dropped deprecated Plotly `animation_opts`).
+### Notes on metrics logging plan (implemented)
+- Added forwarding of SB3 scalar logs to the monitoring hub for keys under `train/`, `rollout/`, and `time/`.
+- This captures: `train/approx_kl`, `train/clip_fraction`, `train/entropy_loss`, `train/policy_gradient_loss`, `train/value_loss`, `train/explained_variance`, `train/learning_rate`, plus rollout means and FPS.
+- Existing custom collectors remain (episode success window, action/no-op stats, curriculum events) and continue to log under `train/` and `curriculum/`.
 
-## Next steps
-- Verify Plotly GIF export once kaleido is available, or document installation if missing.
-- Decide on preferred pause duration/overlay styling after reviewing generated examples.
+### Notes on config restructuring (implemented)
+- Config now supports a structured layout with sections: `env`, `algo`, `model`, `curriculum`, `eval`, `monitoring`, and existing `initialization`.
+- A loader now flattens these sections into argparse-compatible keys for backward compatibility; old flat configs still work.
+- Default config (`configs/train_defaults.yaml`) has been rewritten to the new sectioned layout.

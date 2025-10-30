@@ -1,289 +1,266 @@
-from __future__ import annotations
-
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-from collections import namedtuple
-
-import torch
+import numpy as np
+import torch as th
 import torch.nn as nn
-from gymnasium.spaces import Box, Discrete
-
+# from stable_baselines3.common.policies import RecurrentActorCriticPolicy
+from stable_baselines3.common.distributions import (
+    CategoricalDistribution, MultiCategoricalDistribution, DiagGaussianDistribution,
+    BernoulliDistribution, StateDependentNoiseDistribution, make_proba_distribution
+)
 try:
     # sb3-contrib recurrent base policy
-    from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy as _SB3RecurrentPolicy  # type: ignore
+    from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy # type: ignore
 except Exception as _e:  # pragma: no cover - optional dependency
     _SB3RecurrentPolicy = object  # type: ignore
+from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
-from stable_baselines3.common.distributions import Distribution, CategoricalDistribution
-from stable_baselines3.common.utils import get_device
-
-from .convlstm import ConvLSTMFeaturesExtractor  # type: ignore
-
-
-class DRCRecurrentPolicy(_SB3RecurrentPolicy):
-    """sb3-contrib-compatible recurrent policy that uses our DRC ConvLSTM features.
-
-    Notes:
-    - We piggyback on sb3-contrib's recurrent API (lstm_states, episode_starts) but
-      store our ConvLSTM hidden state list directly inside lstm_states. RecurrentPPO
-      treats lstm_states as an opaque object to pass between calls; only episode_starts
-      is used for sequence padding/masking. We handle per-env resets using that mask.
-    - Action space is assumed to be Discrete.
-    """
-
-    def __init__(
-        self,
-        observation_space: Box,
-        action_space: Discrete,
-        lr_schedule,
-        features_extractor_class: type[ConvLSTMFeaturesExtractor] = ConvLSTMFeaturesExtractor,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        net_arch: Optional[Dict[str, Sequence[int]]] = None,
-        activation_fn: type[nn.Module] = nn.ReLU,
-        ortho_init: bool = True,
-        normalize_images: bool = True,
-        **kwargs,
-    ) -> None:
+class DRCRecurrentPolicy(RecurrentActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule,
+                 n_layers=3, repeats=3, hidden_channels=32, ortho_init=True, forget_bias=0.0, **kwargs):
+        # super().__init__(self)  # initialize nn.Module
+        # nn.Module.__init__(self)  # initialize nn.Module
         super().__init__(
-            observation_space=observation_space,
-            action_space=action_space,
-            lr_schedule=lr_schedule,
-            # The parent expects to create a features extractor via policy_kwargs,
-            # but we will create and manage our own extractor explicitly below.
-            **kwargs,
+            observation_space,
+            action_space,
+            lr_schedule,
+            **kwargs
         )
-
-        self._device = get_device("auto")
-        self.normalize_images = bool(normalize_images)
-        self.activation_fn = activation_fn
-        self.ortho_init = bool(ortho_init)
-        self.net_arch: Dict[str, Sequence[int]] = net_arch or {"pi": [128, 128], "vf": [128, 128]}
-
-        # Build DRC features extractor (encoder→DRC→projection)
-        self.features_extractor: ConvLSTMFeaturesExtractor = features_extractor_class(
-            observation_space=self.observation_space,
-            **(features_extractor_kwargs or {}),
-        )
-        self.features_dim: int = int(self.features_extractor._features_dim)  # type: ignore[attr-defined]
-
-        # Determine encoded spatial size (after encoder pooling) to define hidden_size
-        obs_shape = tuple(self.observation_space.shape)
-        assert len(obs_shape) == 3, "Expected image obs (C,H,W)"
-        H, W = int(obs_shape[1]), int(obs_shape[2])
-        # Encoder halves spatial dims via AvgPool2d(2)
-        self._enc_H = max(1, H // 2)
-        self._enc_W = max(1, W // 2)
-        self._hidden_channels = int(self.features_extractor.hidden_channels)
-        self._num_layers = int(self.features_extractor.num_layers)
-        self._hidden_size = int(self._hidden_channels * self._enc_H * self._enc_W)
-
-        # Expose dummy LSTM modules (as nn.Module) to satisfy sb3-contrib expectations
-        class _DummyLSTMMod(nn.Module):
-            def __init__(self, hidden_size: int, num_layers: int) -> None:
-                super().__init__()
-                self.hidden_size = int(hidden_size)
-                self.num_layers = int(num_layers)
-        self.lstm_actor = _DummyLSTMMod(self._hidden_size, self._num_layers)
-        self.lstm_critic = _DummyLSTMMod(self._hidden_size, self._num_layers)
-
-        # Build heads
-        self.mlp_extractor = None  # not used; keep attr for compatibility
-        self.action_net = nn.Sequential(
-            nn.Linear(self.features_dim, self.net_arch["pi"][0]),
-            self.activation_fn(),
-            nn.Linear(self.net_arch["pi"][0], self.net_arch["pi"][1]),
-            self.activation_fn(),
-            nn.Linear(self.net_arch["pi"][1], self.action_space.n),
-        )
-        self.value_net = nn.Sequential(
-            nn.Linear(self.features_dim, self.net_arch["vf"][0]),
-            self.activation_fn(),
-            nn.Linear(self.net_arch["vf"][0], self.net_arch["vf"][1]),
-            self.activation_fn(),
-            nn.Linear(self.net_arch["vf"][1], 1),
-        )
-
-        if self.ortho_init:
-            for module in self.modules():
-                if isinstance(module, nn.Linear):
-                    nn.init.orthogonal_(module.weight, gain=1.0)
-                    if module.bias is not None:
-                        nn.init.constant_(module.bias, 0.0)
-
-        # Optimizer
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr_schedule(1))
-
-    # --- Helpers ---
-    def _preprocess_obs(self, obs: torch.Tensor) -> torch.Tensor:
-        if self.normalize_images and obs.dtype == torch.uint8:
-            return obs.float().div_(255.0)
-        return obs.float()
-
-    def _apply_episode_starts(self, hidden_states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]], episode_starts: torch.Tensor) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
-        if hidden_states is None:
-            return None
-        if not isinstance(episode_starts, torch.Tensor):
-            return hidden_states
-        mask = episode_starts.bool().to(hidden_states[0][0].device)
-        if mask.ndim == 0:
-            mask = mask.unsqueeze(0)
-        # Zero out states where episode starts
-        for i, (h, c) in enumerate(hidden_states):
-            if mask.numel() != h.shape[0]:
-                # batch mismatch; drop states to re-init in extractor
-                return None
-            if mask.any():
-                h = h.clone()
-                c = c.clone()
-                h[mask] = 0.0
-                c[mask] = 0.0
-                hidden_states[i] = (h, c)
-        return hidden_states
-
-    # ---- Conversion between our list[(h,c)] L layers and sb3-contrib LSTMStates ----
-    _LSTMState = namedtuple("_LSTMState", ["hidden", "cell"])  # (hidden, cell)
-    _LSTMStates = namedtuple("_LSTMStates", ["pi", "vf"])     # (pi: _LSTMState, vf: _LSTMState)
-
-    def _pack_states(self, states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]) -> Any:
-        if states is None or len(states) == 0:
-            return None
-        # states: list over L layers, each (h,c) with shape [B,C,H',W']
-        h_stack_spatial = torch.stack([hc[0] for hc in states], dim=0)  # [L,B,C,H',W']
-        c_stack_spatial = torch.stack([hc[1] for hc in states], dim=0)
-        L, B, C, H, W = h_stack_spatial.shape
-        # Flatten spatial to hidden_size: [L,B,C*H*W]
-        h_flat = h_stack_spatial.reshape(L, B, C * H * W)
-        c_flat = c_stack_spatial.reshape(L, B, C * H * W)
-        state = self._LSTMState(hidden=h_flat, cell=c_flat)
-        return self._LSTMStates(pi=state, vf=state)
-
-    def _unpack_states(self, lstm_states: Any) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
-        if lstm_states is None:
-            return None
-        try:
-            h_flat = lstm_states.pi.hidden  # [L,B,hidden]
-            c_flat = lstm_states.pi.cell
-        except Exception:
-            return None
-        if not isinstance(h_flat, torch.Tensor) or not isinstance(c_flat, torch.Tensor):
-            return None
-        L, B, hidden = h_flat.shape
-        C = self._hidden_channels
-        H = self._enc_H
-        W = self._enc_W
-        if hidden != C * H * W:
-            return None
-        h_stack = h_flat.reshape(L, B, C, H, W)
-        c_stack = c_flat.reshape(L, B, C, H, W)
-        h_list = list(torch.unbind(h_stack, dim=0))
-        c_list = list(torch.unbind(c_stack, dim=0))
-        return list(zip(h_list, c_list))
-
-    def _dist_from_features(self, features: torch.Tensor) -> CategoricalDistribution:
-        dist = CategoricalDistribution(self.action_space.n)
-        dist.proba_distribution(action_logits=self.action_net(features))
-        return dist
-
-    # --- sb3-contrib required API ---
-    def forward(
-        self,
-        obs: torch.Tensor,
-        lstm_states: Optional[Any],
-        episode_starts: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
-        # observation: [B, ...]
-        obs = self._preprocess_obs(obs)
-
-        # Unpack our DRC states from sb3-contrib LSTMStates
-        drc_states = self._unpack_states(lstm_states)
-
-        # Apply per-env reset mask
-        drc_states = self._apply_episode_starts(drc_states, episode_starts)
-
-        # Extract features via DRC core
-        features, new_states = self.features_extractor(obs, drc_states)
-
-        # Heads
-        logits = self.action_net(features)
-        value = self.value_net(features).squeeze(-1)
-
-        dist = CategoricalDistribution(self.action_space.n)
-        dist.proba_distribution(action_logits=logits)
-
-        actions = dist.get_actions()
-        log_prob = dist.log_prob(actions)
-
-        # Re-pack into sb3-contrib style states
-        packed = self._pack_states(new_states)
-        return actions, value, log_prob, packed
-
-    def get_distribution(
-        self,
-        obs: torch.Tensor,
-        lstm_states: Optional[Any],
-        episode_starts: torch.Tensor,
-    ) -> Tuple[Distribution, Any]:
-        obs = self._preprocess_obs(obs)
-        drc_states = self._unpack_states(lstm_states)
-        drc_states = self._apply_episode_starts(drc_states, episode_starts)
-        features, new_states = self.features_extractor(obs, drc_states)
-        return self._dist_from_features(features), self._pack_states(new_states)
-
-    def evaluate_actions(
-        self,
-        obs: torch.Tensor,
-        actions: torch.Tensor,
-        lstm_states: Optional[Any],
-        episode_starts: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs = self._preprocess_obs(obs)
-        drc_states = self._unpack_states(lstm_states)
-        drc_states = self._apply_episode_starts(drc_states, episode_starts)
-        features, new_states = self.features_extractor(obs, drc_states)
-
-        logits = self.action_net(features)
-        value = self.value_net(features).squeeze(-1)
-
-        dist = CategoricalDistribution(self.action_space.n)
-        dist.proba_distribution(action_logits=logits)
-
-        if actions.dtype != torch.long:
-            actions = actions.long()
-        log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
-        return value, log_prob, entropy
-
-    def _predict(
-        self,
-        obs: torch.Tensor,
-        lstm_states: Optional[Any],
-        episode_starts: torch.Tensor,
-        deterministic: bool = False,
-    ) -> Tuple[torch.Tensor, Any]:
-        # sb3-contrib calls this from predict()
-        dist, packed_states = self.get_distribution(obs, lstm_states, episode_starts)
-        actions = dist.mode() if deterministic else dist.get_actions()
-        # For predict(), return (hidden, cell) tensors tuple for actor branch
-        if packed_states is None:
-            ret_states: Any = None
+        # Initialize base policy attributes
+        self.observation_space = observation_space
+        self.action_space = action_space
+        self.lr_schedule = lr_schedule
+        self.n_layers = n_layers
+        self.repeats = repeats
+        self.hidden_channels = hidden_channels
+        self.use_sde = kwargs.get('use_sde', False)
+        dist_kwargs = kwargs.get('dist_kwargs', None)
+        # Create action distribution
+        self.action_dist = make_proba_distribution(action_space, use_sde=self.use_sde, dist_kwargs=dist_kwargs)
+        # Determine input shape (channels, height, width)
+        if len(observation_space.shape) == 3:
+            # Assume observation_space.shape = (C, H, W) or (H, W, C)
+            if observation_space.shape[0] <= 4:  # likely channel-first
+                in_channels, obs_h, obs_w = observation_space.shape
+            else:  # channel-last
+                obs_h, obs_w, in_channels = observation_space.shape
         else:
-            try:
-                ret_states = (packed_states.pi.hidden, packed_states.pi.cell)
-            except Exception:
-                ret_states = None
-        return actions, ret_states
+            # Non-image input (flattened) – in this context, not expected
+            in_channels, obs_h, obs_w = observation_space.shape[0], 1, 1
+        self.height, self.width = obs_h, obs_w
+        # **Encoder:** two conv layers (4×4 filters) encoding the observation:contentReference[oaicite:25]{index=25}
+        self.conv_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=4, stride=1, padding=1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=4, stride=1, padding=1)
+        )
+        # **ConvLSTM core:** define convolutional gates for each layer
+        # Each layer input = [encoded_obs, injection, fence] so input channels = hidden_channels + hidden_channels + 1
+        self.conv_x = nn.ModuleList([
+            nn.Conv2d(hidden_channels*2 + 1, 4 * hidden_channels, kernel_size=3, stride=1, padding=1)
+            for _ in range(n_layers)
+        ])
+        self.conv_h = nn.ModuleList([
+            nn.Conv2d(hidden_channels, 4 * hidden_channels, kernel_size=3, stride=1, padding=1, bias=False)
+            for _ in range(n_layers)
+        ])
+        # Pool-and-inject parameters (per-channel linear combination of mean & max) for each layer:contentReference[oaicite:26]{index=26}
+        self.injection_w_mean = nn.ParameterList([nn.Parameter(th.zeros(hidden_channels)) for _ in range(n_layers)])
+        self.injection_w_max  = nn.ParameterList([nn.Parameter(th.zeros(hidden_channels)) for _ in range(n_layers)])
+        self.injection_b      = nn.ParameterList([nn.Parameter(th.zeros(hidden_channels)) for _ in range(n_layers)])
+        self.forget_bias = forget_bias  # bias added to forget gate
+        # **Fence channel:** binary mask with ones on the boundary and zeros inside:contentReference[oaicite:27]{index=27}
+        fence = th.ones(1, 1, obs_h + 2, obs_w + 2)
+        fence[:, :, 1:-1, 1:-1] = 0  # zeros in interior, ones at border
+        fence = fence[:, :, 1:-1, 1:-1]  # crop to original obs size (border of ones)
+        self.register_buffer("fence", fence)  # not a parameter, just a constant tensor
+        # **Fully-connected head:** flatten top-layer hidden state to 256 units:contentReference[oaicite:28]{index=28}
+        self.fc_embed = nn.Linear(hidden_channels * obs_h * obs_w, 256)
+        # Policy and value output layers
+        if isinstance(self.action_dist, DiagGaussianDistribution) or isinstance(self.action_dist, StateDependentNoiseDistribution):
+            # Continuous actions (Gaussian) - use mean and log_std
+            self.action_net = nn.Linear(256, self.action_space.n)
+            self.log_std = nn.Parameter(th.zeros(self.action_space.n) + kwargs.get('log_std_init', 0.0))
+        else:
+            # Discrete or multi-binary actions
+            self.action_net = nn.Linear(256, self.action_space.n)
+            self.log_std = None
+        self.value_net = nn.Linear(256, 1)
+        # Orthogonal initialization (for stability)
+        if ortho_init:
+            def init_weights(m):
+                if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+                    nn.init.orthogonal_(m.weight, gain=th.sqrt(th.tensor(2.0)))
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0.0)
+            self.apply(init_weights)
+            # Small initial weight for policy output (improves training stability)
+            nn.init.constant_(self.action_net.weight, 0.01)
+        # Optimizer (Adam by default)
+        optimizer_cls = kwargs.get('optimizer_class', th.optim.Adam)
+        optimizer_kwargs = kwargs.get('optimizer_kwargs', {})
+        self.optimizer = optimizer_cls(self.parameters(), lr=lr_schedule(1), **optimizer_kwargs)
 
-    def predict_values(
-        self,
-        obs: torch.Tensor,
-        lstm_states: Optional[Any],
-        episode_starts: torch.Tensor,
-    ) -> torch.Tensor:
-        # Return only values tensor to satisfy SB3 buffer expectations
-        obs = self._preprocess_obs(obs)
-        drc_states = self._unpack_states(lstm_states)
-        drc_states = self._apply_episode_starts(drc_states, episode_starts)
-        features, _ = self.features_extractor(obs, drc_states)
-        value = self.value_net(features).squeeze(-1)
-        return value
+    def _get_initial_state(self, batch_size: int) -> tuple:
+        """Return a zero-initialized hidden state (hidden and cell) for a given batch size."""
+        h0 = np.zeros((self.n_layers, batch_size, self.hidden_channels, self.height, self.width), dtype=np.float32)
+        c0 = np.zeros((self.n_layers, batch_size, self.hidden_channels, self.height, self.width), dtype=np.float32)
+        return RNNStates(h0, c0)
 
+    def forward(self, obs, state=None, episode_start=None, deterministic=False):
+        """Forward one timestep (with internal repeats) through the policy. Returns action, value, log_prob, and new_state."""
+        batch_size = obs.shape[0] if obs.ndim == 4 else 1
+        # Initialize or unpack the RNN state
+        if state is None:
+            state = self._get_initial_state(batch_size)
+        hidden_np, cell_np = state  # each is an np.array of shape (n_layers, batch, ch, H, W)
+        hidden = th.tensor(hidden_np, device=self.fence.device)
+        cell   = th.tensor(cell_np, device=self.fence.device)
+        if episode_start is None:
+            episode_start = th.zeros(batch_size, dtype=th.bool, device=self.fence.device)
+        else:
+            episode_start = th.tensor(episode_start, dtype=th.bool, device=self.fence.device)
+        # Prepare observation (ensure channel-first tensor)
+        obs_tensor = obs if isinstance(obs, th.Tensor) else th.tensor(obs)
+        if obs_tensor.dim() == 3:  # if a single observation without batch dim
+            obs_tensor = obs_tensor.unsqueeze(0)
+        if obs_tensor.shape[1] not in [1, 3] and obs_tensor.shape[-1] in [1, 3]:
+            obs_tensor = obs_tensor.permute(0, 3, 1, 2)  # to (B,C,H,W)
+        # Encode observation through conv encoder
+        embed = self.conv_encoder(obs_tensor)  # shape: (batch, hidden_channels, H, W)
+        # Repeat internal computation N times (extra thinking steps):contentReference[oaicite:29]{index=29}
+        for _ in range(self.repeats):
+            # Reset hidden state for new episodes
+            if episode_start.any():
+                hidden[:, episode_start, :, :, :] = 0.0
+                cell[:, episode_start, :, :, :] = 0.0
+            # Process each ConvLSTM layer
+            for l in range(self.n_layers):
+                h_prev = hidden[l]  # previous hidden state for layer l
+                # Pool-and-inject: compute per-channel stats from h_prev:contentReference[oaicite:30]{index=30}
+                h_mean = th.mean(h_prev, dim=(2, 3))  # (batch, channels)
+                h_max  = th.amax(h_prev, dim=(2, 3))
+                # Linear combination per channel: inj_val[c] = w_max[c]*h_max[c] + w_mean[c]*h_mean[c] + b[c]
+                inj = self.injection_w_max[l] * h_max + self.injection_w_mean[l] * h_mean + self.injection_b[l]
+                inj_map = inj.view(batch_size, -1, 1, 1).expand(-1, -1, self.height, self.width)  # expand to map
+                fence_map = self.fence
+                if fence_map.shape[2:] != (self.height, self.width):
+                    # If input size changed (unlikely here), adjust fence size
+                    fence_map = th.ones(1, 1, self.height, self.width, device=self.fence.device)
+                    fence_map[:, :, 1:-1, 1:-1] = 0
+                fence_map_exp = fence_map.expand(batch_size, -1, -1, -1)
+                # Concatenate inputs for layer l
+                x = th.cat([embed, inj_map, fence_map_exp], dim=1)
+                # ConvLSTM gating (input+hidden conv):contentReference[oaicite:31]{index=31}
+                gates = self.conv_x[l](x) + self.conv_h[l](h_prev)
+                i, f, o, g = th.chunk(gates, 4, dim=1)  # split into 4 gate tensors
+                i = th.sigmoid(i)                           # input gate
+                f = th.sigmoid(f + self.forget_bias)        # forget gate (with bias) 
+                o = th.tanh(o)                              # output gate (tanh):contentReference[oaicite:32]{index=32}
+                g = th.tanh(g)                              # cell candidate
+                c_prev = cell[l]
+                c_new = f * c_prev + i * g                  # new cell state
+                h_new = o * th.tanh(c_new)                  # new hidden state
+                cell[l] = c_new
+                hidden[l] = h_new
+            # end for each layer
+        # end for repeats
+        # Prepare outputs from final hidden state of top layer
+        top_hidden = hidden[self.n_layers - 1]  # shape: (batch, hidden_channels, H, W)
+        flat_hidden = top_hidden.view(batch_size, -1)      # flatten spatially
+        latent = th.relu(self.fc_embed(flat_hidden))       # 256-dim latent vector:contentReference[oaicite:33]{index=33}
+        values = self.value_net(latent)                    # Critic output
+        # Actor output distribution
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            mean = self.action_net(latent)
+            dist = self.action_dist.proba_distribution(mean_actions=mean, log_std=self.log_std)
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            mean = self.action_net(latent)
+            dist = self.action_dist.proba_distribution(mean_actions=mean, log_std=self.log_std, latent_sde=latent)
+        elif isinstance(self.action_dist, CategoricalDistribution):
+            logits = self.action_net(latent)
+            dist = self.action_dist.proba_distribution(action_logits=logits)
+        elif isinstance(self.action_dist, MultiCategoricalDistribution):
+            logits = self.action_net(latent)
+            dist = self.action_dist.proba_distribution(action_logits=logits)
+        elif isinstance(self.action_dist, BernoulliDistribution):
+            logits = self.action_net(latent)
+            dist = self.action_dist.proba_distribution(action_logits=logits)
+        else:
+            raise NotImplementedError("Unsupported distribution")
+        # Sample or choose action
+        actions = dist.get_actions(deterministic=deterministic)
+        log_prob = dist.log_prob(actions)
+        # Package new hidden state for output (as numpy arrays)
+        new_state = RNNStates(hidden.cpu().numpy(), cell.cpu().numpy())
+        return actions, values, log_prob, new_state
 
+    def evaluate_actions(self, obs, actions, state, episode_start):
+        """Evaluate given action selections for a sequence of observations (for PPO loss calculation)."""
+        # Convert inputs to torch tensors
+        obs = th.tensor(obs, device=self.fence.device) if not isinstance(obs, th.Tensor) else obs.to(self.fence.device)
+        actions = th.tensor(actions, device=self.fence.device) if not isinstance(actions, th.Tensor) else actions.to(self.fence.device)
+        hidden_np, cell_np = state
+        hidden = th.tensor(hidden_np, device=self.fence.device)
+        cell   = th.tensor(cell_np, device=self.fence.device)
+        # Handle sequence inputs: obs shape (T, N, C, H, W) or (N, C, H, W)
+        if obs.dim() == 4:
+            obs = obs.unsqueeze(0)  # add time dimension T=1
+            actions = actions.unsqueeze(0)
+            episode_start = np.expand_dims(episode_start, axis=0)
+        T, N = obs.shape[0], obs.shape[1]
+        values = []
+        log_probs = []
+        entropies = []
+        for t in range(T):
+            obs_batch = obs[t]
+            if obs_batch.shape[1] not in [1, 3] and obs_batch.shape[-1] in [1, 3]:
+                obs_batch = obs_batch.permute(0, 3, 1, 2)  # ensure channel-first
+            done_mask = th.tensor(episode_start[t], dtype=th.bool, device=self.fence.device)
+            # Reset hidden state for new episodes at this timestep
+            if done_mask.any():
+                hidden[:, done_mask, :, :, :] = 0.0
+                cell[:, done_mask, :, :, :] = 0.0
+            # Encode obs and perform internal repeats as in forward()
+            embed = self.conv_encoder(obs_batch)
+            for _ in range(self.repeats):
+                if done_mask.any():
+                    hidden[:, done_mask, :, :, :] = 0.0
+                    cell[:, done_mask, :, :, :] = 0.0
+                for l in range(self.n_layers):
+                    h_prev = hidden[l]
+                    h_mean = th.mean(h_prev, dim=(2, 3))
+                    h_max  = th.amax(h_prev, dim=(2, 3))
+                    inj = (self.injection_w_max[l] * h_max + self.injection_w_mean[l] * h_mean + self.injection_b[l])
+                    inj_map = inj.view(N, -1, 1, 1).expand(-1, -1, self.height, self.width)
+                    fence_map = self.fence.expand(N, -1, -1, -1)
+                    x = th.cat([embed, inj_map, fence_map], dim=1)
+                    gates = self.conv_x[l](x) + self.conv_h[l](h_prev)
+                    i, f, o, g = th.chunk(gates, 4, dim=1)
+                    i = th.sigmoid(i);  f = th.sigmoid(f + self.forget_bias)
+                    o = th.tanh(o);     g = th.tanh(g)
+                    c_new = f * cell[l] + i * g
+                    h_new = o * th.tanh(c_new)
+                    cell[l] = c_new;  hidden[l] = h_new
+            # After repeats, get outputs for timestep t
+            top_hidden = hidden[self.n_layers - 1].view(N, -1)
+            latent = th.relu(self.fc_embed(top_hidden))
+            value = self.value_net(latent)
+            # Compute log-prob and entropy of the provided actions at this timestep
+            if isinstance(self.action_dist, DiagGaussianDistribution):
+                dist = self.action_dist.proba_distribution(mean_actions=self.action_net(latent), log_std=self.log_std)
+            elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+                dist = self.action_dist.proba_distribution(mean_actions=self.action_net(latent), log_std=self.log_std, latent_sde=latent)
+            elif isinstance(self.action_dist, CategoricalDistribution):
+                dist = self.action_dist.proba_distribution(action_logits=self.action_net(latent))
+            elif isinstance(self.action_dist, MultiCategoricalDistribution):
+                dist = self.action_dist.proba_distribution(action_logits=self.action_net(latent))
+            elif isinstance(self.action_dist, BernoulliDistribution):
+                dist = self.action_dist.proba_distribution(action_logits=self.action_net(latent))
+            log_prob = dist.log_prob(actions[t])
+            entropy = dist.entropy()
+            values.append(value)
+            log_probs.append(log_prob)
+            entropies.append(entropy)
+        # Concatenate results over time
+        values = th.cat(values, dim=0)
+        log_probs = th.cat(log_probs, dim=0)
+        entropies = th.cat(entropies, dim=0)
+        return values, log_probs, entropies

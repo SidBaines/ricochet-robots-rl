@@ -19,6 +19,7 @@ import math
 import numbers
 import copy
 import yaml
+from datetime import datetime
 
 from src.env import RicochetRobotsEnv, fixed_layout_v0_one_move, fixed_layouts_v1_four_targets
 from src.env.curriculum import (
@@ -35,6 +36,11 @@ try:
     from src.models.drc_policy import DRCRecurrentPolicy  # type: ignore
 except ImportError:
     DRCRecurrentPolicy = None  # type: ignore
+try:
+    from src.models.resnet import ResNetFeaturesExtractor, ResNetPolicy  # type: ignore
+except ImportError:
+    ResNetFeaturesExtractor = None  # type: ignore
+    ResNetPolicy = None  # type: ignore
 
 
 def build_training_parser() -> argparse.ArgumentParser:
@@ -171,6 +177,177 @@ def load_config_file(config_path: str) -> Dict[str, Any]:
     return data
 
 
+def _normalize_key(name: str) -> str:
+    # Normalize keys from YAML (allow hyphenated keys)
+    return str(name).replace("-", "_")
+
+
+def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Support sectioned YAML by flattening known sections to argparse keys.
+
+    Supported sections:
+    - env: maps to env-related CLI flags
+    - algo: maps to PPO/RecurrentPPO hyperparameters (and algo name)
+    - model: {type: resnet|convlstm|drc|small_cnn, params: {...}}
+    - curriculum: curriculum toggles and thresholds (incl. bank_dir)
+    - eval: evaluation cadence and options
+    - monitoring: logging backends, paths, save freq
+    - training/paths: optional aliases for common fields
+    Unrecognized sections/keys are left as-is (top-level flat config remains valid).
+    """
+    flat: Dict[str, Any] = {}
+
+    # Pass through existing top-level simple keys first (will be overridden by sections if present)
+    for k, v in data.items():
+        if isinstance(v, dict) and k in ("env", "algo", "model", "curriculum", "eval", "monitoring", "training", "paths"):
+            continue
+        if k == "initialization":
+            # handled separately by caller
+            continue
+        flat[_normalize_key(k)] = v
+
+    # env section
+    env = data.get("env") or {}
+    if isinstance(env, dict):
+        mapping = {
+            "mode": "env_mode",
+            "height": "height",
+            "width": "width",
+            "num_robots": "num_robots",
+            "include_noop": "include_noop",
+            "step_penalty": "step_penalty",
+            "goal_reward": "goal_reward",
+            "noop_penalty": "noop_penalty",
+            "max_steps": "max_steps",
+            "seed": "seed",
+            "ensure_solvable": "ensure_solvable",
+            "solver_max_depth": "solver_max_depth",
+            "solver_max_nodes": "solver_max_nodes",
+            "obs_mode": "obs_mode",
+        }
+        for k, v in env.items():
+            dst = mapping.get(_normalize_key(k))
+            if dst:
+                flat[dst] = v
+
+    # algo section
+    algo = data.get("algo") or {}
+    if isinstance(algo, dict):
+        mapping = {
+            "algo": "algo",
+            "name": "algo",
+            "timesteps": "timesteps",
+            "n_envs": "n_envs",
+            "n_steps": "n_steps",
+            "batch_size": "batch_size",
+            "n_epochs": "n_epochs",
+            "lr": "lr",
+            "lr_end": "lr_end",
+            "lr_schedule": "lr_schedule",
+            "gamma": "gamma",
+            "clip_range": "clip_range",
+            "clip_end": "clip_end",
+            "clip_schedule": "clip_schedule",
+            "gae_lambda": "gae_lambda",
+            "vf_coef": "vf_coef",
+            "max_grad_norm": "max_grad_norm",
+            "ent_coef": "ent_coef",
+            "normalize_advantage": "normalize_advantage",
+            "device": "device",
+        }
+        for k, v in algo.items():
+            dst = mapping.get(_normalize_key(k))
+            if dst:
+                flat[dst] = v
+
+    # model section
+    model = data.get("model") or {}
+    if isinstance(model, dict):
+        model_type = model.get("type")
+        if isinstance(model_type, str):
+            mt = model_type.strip().lower()
+            if mt in ("resnet", "convlstm", "drc", "small_cnn"):
+                flat[mt] = True
+        params = model.get("params") or {}
+        if isinstance(params, dict):
+            param_mapping = {
+                "features_dim": "features_dim",
+                "conv_channels": "conv_channels",
+                "lstm_channels": "lstm_channels",
+                "lstm_layers": "lstm_layers",
+                "lstm_repeats": "lstm_repeats",
+            }
+            for k, v in params.items():
+                nk = _normalize_key(k)
+                dst = param_mapping.get(nk)
+                if dst:
+                    flat[dst] = v
+
+    # curriculum section
+    cur = data.get("curriculum") or {}
+    if isinstance(cur, dict):
+        mapping = {
+            "enabled": "curriculum",
+            "use_bank": "use_bank_curriculum",
+            "bank_dir": "bank_dir",
+            "config": "curriculum_config",
+            "initial_level": "curriculum_initial_level",
+            "success_threshold": "curriculum_success_threshold",
+            "min_episodes": "curriculum_min_episodes",
+            "window_size": "curriculum_window_size",
+            "check_freq": "curriculum_check_freq",
+            "verbose": "curriculum_verbose",
+        }
+        for k, v in cur.items():
+            dst = mapping.get(_normalize_key(k))
+            if dst:
+                flat[dst] = v
+
+    # eval section
+    ev = data.get("eval") or {}
+    if isinstance(ev, dict):
+        mapping = {
+            "eval_freq": "eval_freq",
+            "eval_episodes": "eval_episodes",
+            "fixedset": "eval_fixedset",
+            "solver_cache": "solver_cache",
+            "traj_record_freq": "traj_record_freq",
+            "traj_record_episodes": "traj_record_episodes",
+        }
+        for k, v in ev.items():
+            dst = mapping.get(_normalize_key(k))
+            if dst:
+                flat[dst] = v
+
+    # monitoring section
+    mon = data.get("monitoring") or {}
+    if isinstance(mon, dict):
+        mapping = {
+            "log_dir": "log_dir",
+            "save_path": "save_path",
+            "save_freq": "save_freq",
+            "tensorboard": "monitor_tensorboard",
+            "wandb": "monitor_wandb",
+            "wandb_project": "wandb_project",
+            "wandb_entity": "wandb_entity",
+            "wandb_run_name": "wandb_run_name",
+            "wandb_tags": "wandb_tags",
+        }
+        for k, v in mon.items():
+            dst = mapping.get(_normalize_key(k))
+            if dst:
+                flat[dst] = v
+
+    # optional training/paths sections as aliases
+    for sec_name in ("training", "paths"):
+        sec = data.get(sec_name) or {}
+        if isinstance(sec, dict):
+            for k, v in sec.items():
+                nk = _normalize_key(k)
+                if nk in ("log_dir", "save_path", "save_freq", "profile"):
+                    flat[nk] = v
+
+    return flat
 def apply_profile_presets(args_dict: Dict[str, Any], profile: str, defaults: Dict[str, Any]) -> None:
     if profile == "research_plan":
         if args_dict.get("timesteps") == defaults.get("timesteps"):
@@ -437,6 +614,9 @@ def main() -> None:
 
     config_path = cli_args.config_path
     config_data = load_config_file(config_path)
+    # Support structured configs: flatten known sections into argparse keys
+    if any(k in config_data for k in ("env", "algo", "model", "curriculum", "eval", "monitoring", "training", "paths")):
+        config_data = flatten_structured_config(config_data)
     init_config_block = config_data.pop("initialization", None)
 
     training_parser = build_training_parser()
@@ -554,6 +734,24 @@ def main() -> None:
     vec_env_mod = importlib.import_module("stable_baselines3.common.env_util")
     make_vec_env = vec_env_mod.make_vec_env
 
+    # Timestamp the run and prefix WandB run name and save/checkpoint files
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Prefix wandb run name
+    try:
+        existing_name = getattr(args, "wandb_run_name", None)
+        args.wandb_run_name = f"{run_timestamp}_{existing_name}" if existing_name else run_timestamp
+    except Exception:
+        # Best-effort; keep default WandB naming if something goes wrong
+        pass
+    # Prefix model save_path basename for final save and checkpoint prefixes
+    try:
+        if getattr(args, "save_path", None):
+            _sp_dir = os.path.dirname(args.save_path) or "."
+            _sp_base = os.path.basename(args.save_path)
+            args.save_path = os.path.join(_sp_dir, f"{run_timestamp}_{_sp_base}")
+    except Exception:
+        pass
+
     os.makedirs(args.log_dir, exist_ok=True)
     _save_dir = os.path.dirname(args.save_path)
     if _save_dir == "":
@@ -664,12 +862,12 @@ def main() -> None:
             policy = DRCRecurrentPolicy  # type: ignore[assignment]
             policy_kwargs = dict(
                 features_extractor_kwargs=dict(
-                    features_dim=args.features_dim,
-                    conv_channels=args.conv_channels,
-                    lstm_channels=args.lstm_channels,
-                    num_lstm_layers=args.lstm_layers,
-                    num_repeats=args.lstm_repeats,
-                    use_pool_and_inject=True,
+                    # features_dim=args.features_dim,
+                    # conv_channels=args.conv_channels,
+                    # lstm_channels=args.lstm_channels,
+                    # num_lstm_layers=args.lstm_layers,
+                    # num_repeats=args.lstm_repeats,
+                    # use_pool_and_inject=True,
                 ),
                 net_arch=dict(pi=[128, 128], vf=[128, 128]),
                 normalize_images=(args.obs_mode == "rgb_image"),
@@ -693,12 +891,13 @@ def main() -> None:
                     from src.models.resnet import ResNetFeaturesExtractor  # type: ignore
                 except ImportError as _e:
                     raise ImportError(f"ResNet baseline requested but not available: {_e}")
-                policy = "CnnPolicy"
+                policy = ResNetPolicy
                 policy_kwargs = dict(
-                    net_arch=dict(pi=[128, 128], vf=[128, 128]),
+                    # net_arch=dict(pi=[128, 128], vf=[128, 128]),
                     normalize_images=(args.obs_mode == "rgb_image"),
-                    features_extractor_class=ResNetFeaturesExtractor,
-                    features_extractor_kwargs=dict(features_dim=args.features_dim),
+                    # features_extractor_class=ResNetFeaturesExtractor,
+                    # features_extractor_kwargs=dict(features_dim=args.features_dim),
+
                 )
             else:
                 policy = "CnnPolicy"
@@ -863,17 +1062,21 @@ def main() -> None:
     try:
         from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
         from stable_baselines3.common.env_util import make_vec_env as _make
-        try:
-            from stable_baselines3.common.logger import KVWriter  # type: ignore[attr-defined]
-        except ImportError:
-            KVWriter = None  # type: ignore
 
-        if hub is not None and KVWriter is not None and hasattr(model, "logger"):
-            class _HubEvalMetricWriter(KVWriter):
+        if hub is not None and hasattr(model, "logger"):
+            # Version-agnostic writer: accepts both (kvs, step) and (kvs, key_excluded, step)
+            class _HubSB3Writer:
                 def __init__(self, hub_ref):
                     self._hub = hub_ref
 
-                def write(self, key_values, step: int = 0) -> None:
+                def write(self, *args, **kwargs) -> None:
+                    # Extract kvs and step across SB3 versions
+                    key_values = args[0] if len(args) >= 1 else kwargs.get("key_values")
+                    step = kwargs.get("step", 0)
+                    if len(args) >= 2 and isinstance(args[1], numbers.Number) and "step" not in kwargs:
+                        step = args[1]
+                    elif len(args) >= 3 and isinstance(args[2], numbers.Number) and "step" not in kwargs:
+                        step = args[2]
                     step_value = None
                     if isinstance(step, numbers.Number):
                         try:
@@ -882,16 +1085,17 @@ def main() -> None:
                                 step_value = int(step_float)
                         except (TypeError, ValueError, OverflowError):
                             step_value = None
+                    if not isinstance(key_values, dict):
+                        return None
                     for key, value in key_values.items():
-                        if not isinstance(key, str) or not key.startswith("eval/"):
+                        if not isinstance(key, str):
                             continue
-                        if isinstance(value, numbers.Number):
+                        if not (key.startswith("train/") or key.startswith("rollout/") or key.startswith("time/") or key.startswith("eval/")):
+                            continue
+                        try:
                             scalar = float(value)
-                        else:
-                            try:
-                                scalar = float(value)
-                            except (TypeError, ValueError):
-                                continue
+                        except (TypeError, ValueError):
+                            continue
                         if not math.isfinite(scalar):
                             continue
                         try:
@@ -899,14 +1103,14 @@ def main() -> None:
                         except Exception:
                             pass
 
-                def write_sequence(self, sequence, step: int = 0) -> None:
+                def write_sequence(self, *args, **kwargs) -> None:
                     return None
 
                 def close(self) -> None:
                     return None
 
             try:
-                model.logger.output_formats.append(_HubEvalMetricWriter(hub))
+                model.logger.output_formats.append(_HubSB3Writer(hub))
             except Exception:
                 pass
 

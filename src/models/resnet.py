@@ -1,144 +1,67 @@
-from __future__ import annotations
-
-import torch
+import torch as th
 import torch.nn as nn
-from gymnasium.spaces import Box
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.policies import ActorCriticCnnPolicy
 
-
-class ResidualBlock(nn.Module):
-    """Simple residual block with two conv layers and optional normalization."""
-
-    def __init__(self, channels: int, kernel_size: int = 3, use_norm: bool = True) -> None:
-        super().__init__()
-        p = kernel_size // 2
-        self.use_norm = use_norm
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=p, bias=True)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=p, bias=True)
-        if use_norm:
-            self.norm1 = nn.GroupNorm(1, channels)
-            self.norm2 = nn.GroupNorm(1, channels)
-        self.act = nn.ReLU(inplace=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        out = self.conv1(x)
-        if self.use_norm:
-            out = self.norm1(out)
-        out = self.act(out)
-        out = self.conv2(out)
-        if self.use_norm:
-            out = self.norm2(out)
-        out = out + residual
-        return self.act(out)
-
-
-class ResNetBackbone(nn.Module):
-    def __init__(self, in_channels: int, kernel_size: int = 3) -> None:
-        super().__init__()
-        p = kernel_size // 2
-
-        # Channel configuration (hardcoded attributes for easy experimentation)
-        # Notes/constraints:
-        # - ResidualBlock(C) assumes in_channels == out_channels == C for identity skips.
-        # - The 1×1 conv is the only width-changing op between stages; its out_channels
-        #   must match the channel count expected by subsequent blocks.
-        # - Global pooling in ResNetFeaturesExtractor removes the dependence on H×W for
-        #   the projection layer, but activations earlier in the network still preserve
-        #   spatial resolution.
-        # - Keep kernel_size odd so padding=k//2 preserves spatial size.
-        self.stem_channels: int = 32   # width after stem conv (was 32)
-        self.stage1_channels: int = 32 # width inside stage 1 residual blocks (was 32)
-        self.stage2_channels: int = 64 # width inside stage 2 residual blocks (was 64)
-        self.num_blocks_stage1: int = 2 # number of BasicBlock2Branch in stage 1 (was 2)
-        self.num_blocks_stage2: int = 7 # number of BasicBlock2Branch in stage 2 (was 7)
-
-        # Stem
-        self.use_norm = True
-
-        stem_layers: list[nn.Module] = [
-            nn.Conv2d(in_channels, self.stem_channels, kernel_size, padding=p, bias=True)
-        ]
-        if self.use_norm:
-            stem_layers.append(nn.GroupNorm(1, self.stem_channels))
-        stem_layers.append(nn.ReLU(inplace=False))
-        self.stem = nn.Sequential(*stem_layers)
-
-        # Stages
-        blocks: list[nn.Module] = []
-        # Stage 1: residual blocks at stage1_channels
-        # Constraint: stem_channels must equal stage1_channels for residual add without a projection.
-        # If they differ, insert a 1×1 projection from stem_channels→stage1_channels before blocks.
-        if self.stem_channels != self.stage1_channels:
-            proj = [nn.Conv2d(self.stem_channels, self.stage1_channels, kernel_size=1, bias=True)]
-            if self.use_norm:
-                proj.append(nn.GroupNorm(1, self.stage1_channels))
-            proj.append(nn.ReLU(inplace=False))
-            blocks.append(nn.Sequential(*proj))
-        blocks += [ResidualBlock(self.stage1_channels, kernel_size, use_norm=self.use_norm) for _ in range(self.num_blocks_stage1)]
-
-        # Transition: channel jump via 1×1 conv (preserve H×W)
-        if self.stage1_channels != self.stage2_channels:
-            trans_layers: list[nn.Module] = [
-                nn.Conv2d(self.stage1_channels, self.stage2_channels, kernel_size=1, bias=True)
-            ]
-            if self.use_norm:
-                trans_layers.append(nn.GroupNorm(1, self.stage2_channels))
-            trans_layers.append(nn.ReLU(inplace=False))
-            blocks.append(nn.Sequential(*trans_layers))
-
-        # Stage 2: residual blocks at stage2_channels
-        blocks += [ResidualBlock(self.stage2_channels, kernel_size, use_norm=self.use_norm) for _ in range(self.num_blocks_stage2)]
-
-        self.blocks = nn.Sequential(*blocks)
-
-        # Expose backbone output channels for downstream projection sizing
-        self.out_channels: int = self.stage2_channels
-
-        # Init weights: Kaiming for convs
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
-            elif isinstance(m, nn.GroupNorm):
-                if m.weight is not None:
-                    nn.init.constant_(m.weight, 1.0)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        return self.blocks(x)
-
-
+# Custom CNN feature extractor for the ResNet architecture
 class ResNetFeaturesExtractor(BaseFeaturesExtractor):
-    """ResNet-style extractor with residual blocks and global pooling.
+    def __init__(self, observation_space, num_blocks=9):
+        # Determine input dimensions (channel-first)
+        in_channels, height, width = observation_space.shape if observation_space.shape[0] <= 4 \
+                                     else (observation_space.shape[2], observation_space.shape[0], observation_space.shape[1])
+        super().__init__(observation_space, features_dim=1)  # placeholder, will set actual features_dim below
+        # Define the channel sizes per block (first 2 blocks 32 channels, rest 64 channels):contentReference[oaicite:6]{index=6}
+        if num_blocks <= 2:
+            channels_per_block = [32] * num_blocks
+        else:
+            channels_per_block = [32, 32] + [64] * (num_blocks - 2)
+        self.num_blocks = num_blocks
+        # Convolution layers for trunk and branches in each block
+        self.conv_trunk = nn.ModuleList()
+        self.conv_branch1 = nn.ModuleList()
+        self.conv_branch2 = nn.ModuleList()
+        prev_channels = in_channels
+        for out_ch in channels_per_block:
+            # Trunk convolution (4×4 conv)
+            self.conv_trunk.append(nn.Conv2d(prev_channels, out_ch, kernel_size=4, stride=1, padding=1))
+            # Two residual branch convolutions (each preceded by ReLU in forward pass)
+            self.conv_branch1.append(nn.Conv2d(out_ch, out_ch, kernel_size=4, stride=1, padding=1))
+            self.conv_branch2.append(nn.Conv2d(out_ch, out_ch, kernel_size=4, stride=1, padding=1))
+            prev_channels = out_ch
+        # Determine output feature dimension by running a dummy input through the conv layers
+        with th.no_grad():
+            dummy = th.zeros(1, in_channels, height, width)
+            out = dummy
+            for i in range(self.num_blocks):
+                t = self.conv_trunk[i](out)
+                b1 = self.conv_branch1[i](th.relu(t))
+                b2 = self.conv_branch2[i](th.relu(t))
+                out = th.relu(t + b1 + b2)  # residual addition
+            out_flat = out.view(1, -1)
+            self._features_dim = out_flat.shape[1]  # flattened spatial output size
 
-    The projection head maps pooled backbone features (`out_channels`) to
-    `features_dim` (default 256) for SB3 policy heads.
-    """
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        # Ensure input is channel-first (C×H×W)
+        x = observations
+        if x.dim() == 4 and x.shape[1] not in [1, 3] and x.shape[-1] in [1, 3]:
+            x = x.permute(0, 3, 1, 2)  # convert H×W×C to C×H×W
+        out = x
+        # Forward through each residual block
+        for i in range(self.num_blocks):
+            t = self.conv_trunk[i](out)
+            b1 = self.conv_branch1[i](th.relu(t))
+            b2 = self.conv_branch2[i](th.relu(t))
+            out = th.relu(t + b1 + b2)  # trunk + two sub-block outputs:contentReference[oaicite:7]{index=7}
+        return out.view(out.size(0), -1)  # flatten feature map
 
-    def __init__(self, observation_space: Box, features_dim: int = 256, kernel_size: int = 3) -> None:
-        super().__init__(observation_space, features_dim)
-        assert len(observation_space.shape) == 3, "Expected image observation (C,H,W)"
-        c_in, H, W = int(observation_space.shape[0]), int(observation_space.shape[1]), int(observation_space.shape[2])
-
-        self.backbone = ResNetBackbone(c_in, kernel_size)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.norm = nn.LayerNorm(self.backbone.out_channels)
-        self.proj = nn.Linear(self.backbone.out_channels, features_dim)
-        # Avoid in-place here as well for safe autograd on MPS/CUDA/CPU
-        self.act = nn.ReLU(inplace=False)
-        self._features_dim = int(features_dim)
-
-        # Init proj
-        nn.init.kaiming_normal_(self.proj.weight, mode="fan_in", nonlinearity="relu")
-        if self.proj.bias is not None:
-            nn.init.constant_(self.proj.bias, 0.0)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        x = self.backbone(observations)
-        x = self.pool(x).flatten(1)
-        x = self.norm(x)
-        return self.act(self.proj(x))
+# SB3 policy class using the ResNet feature extractor
+class ResNetPolicy(ActorCriticCnnPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
+        super(ResNetPolicy, self).__init__(
+            observation_space, action_space, lr_schedule,
+            features_extractor_class=ResNetFeaturesExtractor,
+            features_extractor_kwargs={'num_blocks': 9},
+            net_arch=[256],  # one hidden layer of size 256 (shared by policy & value):contentReference[oaicite:8]{index=8}
+            activation_fn=nn.ReLU,
+            **kwargs
+        )
