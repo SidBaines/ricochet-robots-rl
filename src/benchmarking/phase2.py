@@ -59,6 +59,11 @@ class Phase2Config:
     suite_per_stratum: int = 16
     max_steps: int = 10
     cell_obs_pixel_size: int = 40
+    obs_mode: str = "rgb_cell_image"
+    policy: str = "stock_cnn"
+    features_dim: int = 256
+    conv_channels: int = 64
+    n_conv_layers: int = 4
     training_seeds: tuple[int, ...] = (11, 29, 47)
     checkpoints: tuple[int, ...] = (0, 10_240, 25_600, 51_200)
     n_envs: int = 8
@@ -95,6 +100,12 @@ class Phase2Config:
             raise ValueError("overfit_puzzles_per_stratum must be positive")
         if self.overfit_stochastic_episodes_per_puzzle <= 0:
             raise ValueError("overfit_stochastic_episodes_per_puzzle must be positive")
+        if self.policy not in {"stock_cnn", "grid_cnn"}:
+            raise ValueError(f"Unsupported policy: {self.policy}")
+        if self.policy == "stock_cnn" and self.obs_mode not in {"rgb_image", "rgb_cell_image"}:
+            raise ValueError("stock_cnn requires an RGB observation mode")
+        if self.policy == "grid_cnn" and self.obs_mode != "image":
+            raise ValueError("grid_cnn requires the structured-plane 'image' observation mode")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "Phase2Config":
@@ -131,7 +142,7 @@ class Phase2Config:
             ensure_solvable=False,
             solver_max_depth=self.solver_max_depth,
             solver_max_nodes=self.solver_max_nodes,
-            obs_mode="rgb_cell_image",
+            obs_mode=self.obs_mode,
             channels_first=True,
             cell_obs_pixel_size=self.cell_obs_pixel_size,
         )
@@ -333,11 +344,31 @@ def build_split_manifest(bank: PuzzleBank, output_path: Path, config: Phase2Conf
     training_suite = select_suite(training)
     validation_suite = select_suite(validation)
     test_suite = select_suite(test)
-    expected_strata = {
-        f"optimal_length={length}|robots_moved={robots}"
-        for length in range(config.min_optimal_length, config.max_optimal_length + 1)
-        for robots in range(config.min_robots_moved, config.max_robots_moved + 1)
-    }
+    # Require the strata the generator actually produced rather than the
+    # Cartesian product of configured ranges: some combinations inside the
+    # ranges are impossible (e.g. optimal_length=1 with robots_moved=2), so
+    # the product would reject valid harder fixtures. Strata with plenty of
+    # fixture support must appear in every split; genuinely sparse strata are
+    # reported and tolerated.
+    fixture_histogram = Counter(_stratum(puzzle) for puzzle in [*training, *heldout])
+    membership_strata = (
+        {_stratum(puzzle) for puzzle in training}
+        & {_stratum(puzzle) for puzzle in validation}
+        & {_stratum(puzzle) for puzzle in test}
+    )
+    if not membership_strata:
+        raise RuntimeError("No stratum appears in all of train/validation/test")
+    sparse_threshold = 20
+    dropped = sorted(set(fixture_histogram) - membership_strata)
+    for stratum in dropped:
+        if fixture_histogram[stratum] >= sparse_threshold:
+            raise RuntimeError(
+                f"Stratum {stratum} has {fixture_histogram[stratum]} fixture puzzles "
+                "but is missing from a split"
+            )
+    if dropped:
+        print(f"[phase2] warning: sparse strata not present in every split: {dropped}", flush=True)
+    expected_strata = membership_strata
     for name, suite in (("training", training_suite), ("validation", validation_suite), ("test", test_suite)):
         present = {_stratum(puzzle) for puzzle in suite}
         missing = expected_strata - present
@@ -560,6 +591,50 @@ def evaluate_controller(
     return {"summary": summarize_records(records, elapsed), "records": records}
 
 
+def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) -> Any:
+    """Construct the PPO model selected by ``config.policy`` on ``vec_env``."""
+    from stable_baselines3 import PPO
+
+    if config.policy == "stock_cnn":
+        policy_name = "CnnPolicy"
+        policy_kwargs: Dict[str, Any] = {
+            "net_arch": dict(pi=[128, 128], vf=[128, 128]),
+            "normalize_images": True,
+        }
+    else:  # grid_cnn on structured planes (already float in [0, 1])
+        from src.models.grid_cnn import GridPlanesCnn
+
+        policy_name = "MlpPolicy"
+        policy_kwargs = {
+            "features_extractor_class": GridPlanesCnn,
+            "features_extractor_kwargs": {
+                "features_dim": config.features_dim,
+                "conv_channels": config.conv_channels,
+                "n_conv_layers": config.n_conv_layers,
+            },
+            "net_arch": dict(pi=[128, 128], vf=[128, 128]),
+            "normalize_images": False,
+        }
+    return PPO(
+        policy_name,
+        vec_env,
+        device=device,
+        seed=seed,
+        n_steps=config.n_steps,
+        batch_size=config.batch_size,
+        n_epochs=config.n_epochs,
+        learning_rate=config.learning_rate,
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+        ent_coef=config.ent_coef,
+        vf_coef=config.vf_coef,
+        max_grad_norm=config.max_grad_norm,
+        normalize_advantage=True,
+        policy_kwargs=policy_kwargs,
+        verbose=0,
+    )
+
+
 def _resolve_device(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -658,9 +733,8 @@ def train_overfit_milestone(
     device: str,
     output_dir: Path,
 ) -> Dict[str, Any]:
-    """Prove the stock CNN can memorize a deliberately tiny training suite."""
+    """Prove the selected policy can memorize a deliberately tiny training suite."""
     import torch
-    from stable_baselines3 import PPO
     from stable_baselines3.common.env_util import make_vec_env
 
     overfit_bank = _build_overfit_bank(output_dir / "overfit" / "bank", puzzles)
@@ -669,27 +743,7 @@ def train_overfit_milestone(
         n_envs=config.n_envs,
         seed=seed,
     )
-    model = PPO(
-        "CnnPolicy",
-        vec_env,
-        device=device,
-        seed=seed,
-        n_steps=config.n_steps,
-        batch_size=config.batch_size,
-        n_epochs=config.n_epochs,
-        learning_rate=config.learning_rate,
-        gamma=config.gamma,
-        gae_lambda=config.gae_lambda,
-        ent_coef=config.ent_coef,
-        vf_coef=config.vf_coef,
-        max_grad_norm=config.max_grad_norm,
-        normalize_advantage=True,
-        policy_kwargs={
-            "net_arch": dict(pi=[128, 128], vf=[128, 128]),
-            "normalize_images": True,
-        },
-        verbose=0,
-    )
+    model = _build_model(vec_env, config, seed=seed, device=device)
     curve: List[Dict[str, Any]] = []
     training_seconds = 0.0
     for checkpoint_index, checkpoint in enumerate(config.checkpoints):
@@ -766,31 +820,10 @@ def train_seed(
     output_dir: Path,
 ) -> Dict[str, Any]:
     import torch
-    from stable_baselines3 import PPO
     from stable_baselines3.common.env_util import make_vec_env
 
     vec_env = make_vec_env(_training_factory(bank, config, seed), n_envs=config.n_envs, seed=seed)
-    model = PPO(
-        "CnnPolicy",
-        vec_env,
-        device=device,
-        seed=seed,
-        n_steps=config.n_steps,
-        batch_size=config.batch_size,
-        n_epochs=config.n_epochs,
-        learning_rate=config.learning_rate,
-        gamma=config.gamma,
-        gae_lambda=config.gae_lambda,
-        ent_coef=config.ent_coef,
-        vf_coef=config.vf_coef,
-        max_grad_norm=config.max_grad_norm,
-        normalize_advantage=True,
-        policy_kwargs={
-            "net_arch": dict(pi=[128, 128], vf=[128, 128]),
-            "normalize_images": True,
-        },
-        verbose=0,
-    )
+    model = _build_model(vec_env, config, seed=seed, device=device)
     curve: List[Dict[str, Any]] = []
     training_seconds = 0.0
     for checkpoint_index, checkpoint in enumerate(config.checkpoints):

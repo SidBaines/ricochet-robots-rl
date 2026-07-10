@@ -1,0 +1,45 @@
+# Phase 2b: harder fixture on the exp1 grid_cnn recipe.
+# Adds interior walls (edge-T + central-L), optimal lengths up to 4, and
+# two-robot plans (robots_moved up to 2), with a larger deterministic fixture
+# and a longer training budget. Requires a fresh bank dir (new definition).
+height: 8
+width: 8
+num_robots: 2
+edge_t_per_quadrant: 1
+central_l_per_quadrant: 1
+fixture_attempts: 20000
+solver_max_depth: 6
+solver_max_nodes: 50000
+min_optimal_length: 1
+max_optimal_length: 4
+min_robots_moved: 1
+max_robots_moved: 2
+heldout_fraction: 0.25
+split_seed: 20260710
+validation_test_seed: 20260711
+suite_per_stratum: 8
+max_steps: 12
+cell_obs_pixel_size: 40
+obs_mode: image
+policy: grid_cnn
+features_dim: 256
+conv_channels: 64
+n_conv_layers: 4
+training_seeds: [11]
+checkpoints: [0, 51200, 102400, 204800, 409600]
+n_envs: 8
+n_steps: 128
+batch_size: 256
+n_epochs: 4
+learning_rate: 0.0003
+gamma: 0.99
+gae_lambda: 0.95
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+validation_episodes_per_puzzle: 1
+final_stochastic_episodes_per_puzzle: 5
+baseline_episodes_per_puzzle: 20
+overfit_puzzles_per_stratum: 4
+overfit_stochastic_episodes_per_puzzle: 20
+device: auto

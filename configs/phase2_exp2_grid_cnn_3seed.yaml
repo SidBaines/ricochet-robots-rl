@@ -1,0 +1,44 @@
+# Experiment 2: exp1 recipe at full three-seed protocol.
+# Identical fixture/split/baselines to phase2_benchmark.yaml; changes only the
+# observation encoding, the policy network, and the training budget.
+height: 8
+width: 8
+num_robots: 2
+edge_t_per_quadrant: 0
+central_l_per_quadrant: 0
+fixture_attempts: 4000
+solver_max_depth: 6
+solver_max_nodes: 50000
+min_optimal_length: 1
+max_optimal_length: 2
+min_robots_moved: 1
+max_robots_moved: 1
+heldout_fraction: 0.25
+split_seed: 20260710
+validation_test_seed: 20260711
+suite_per_stratum: 16
+max_steps: 10
+cell_obs_pixel_size: 40
+obs_mode: image
+policy: grid_cnn
+features_dim: 256
+conv_channels: 64
+n_conv_layers: 4
+training_seeds: [11, 29, 47]
+checkpoints: [0, 25600, 51200, 102400, 204800]
+n_envs: 8
+n_steps: 128
+batch_size: 256
+n_epochs: 4
+learning_rate: 0.0003
+gamma: 0.99
+gae_lambda: 0.95
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+validation_episodes_per_puzzle: 1
+final_stochastic_episodes_per_puzzle: 5
+baseline_episodes_per_puzzle: 20
+overfit_puzzles_per_stratum: 4
+overfit_stochastic_episodes_per_puzzle: 20
+device: auto
