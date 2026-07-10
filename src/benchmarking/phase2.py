@@ -66,6 +66,11 @@ class Phase2Config:
     n_conv_layers: int = 4
     two_robot_band_weight: float | None = None
     run_overfit_milestone: bool = True
+    curriculum_stage_max_lengths: tuple[int, ...] | None = None
+    curriculum_success_threshold: float = 0.7
+    curriculum_min_episodes: int = 5_000
+    curriculum_window: int = 500
+    curriculum_check_frequency: int = 100
     training_seeds: tuple[int, ...] = (11, 29, 47)
     checkpoints: tuple[int, ...] = (0, 10_240, 25_600, 51_200)
     n_envs: int = 8
@@ -108,12 +113,20 @@ class Phase2Config:
             raise ValueError("stock_cnn requires an RGB observation mode")
         if self.policy == "grid_cnn" and self.obs_mode != "image":
             raise ValueError("grid_cnn requires the structured-plane 'image' observation mode")
+        if self.curriculum_stage_max_lengths is not None:
+            stages = self.curriculum_stage_max_lengths
+            if tuple(sorted(set(stages))) != stages:
+                raise ValueError("curriculum_stage_max_lengths must be strictly increasing")
+            if stages[-1] != self.max_optimal_length:
+                raise ValueError("The final curriculum stage must cover max_optimal_length")
+            if stages[0] < self.min_optimal_length:
+                raise ValueError("Curriculum stages cannot start below min_optimal_length")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "Phase2Config":
         normalized = dict(values)
-        for key in ("training_seeds", "checkpoints"):
-            if key in normalized:
+        for key in ("training_seeds", "checkpoints", "curriculum_stage_max_lengths"):
+            if key in normalized and normalized[key] is not None:
                 normalized[key] = tuple(int(value) for value in normalized[key])
         unknown = set(normalized) - set(cls.__dataclass_fields__)
         if unknown:
@@ -176,13 +189,20 @@ def _stratum(puzzle: PuzzleMetadata) -> str:
     return f"optimal_length={int(puzzle.optimal_length)}|robots_moved={int(puzzle.robots_moved)}"
 
 
-def _level(config: Phase2Config) -> Dict[str, Any]:
+def _level(
+    config: Phase2Config,
+    *,
+    index: int = 0,
+    name: str = "phase2-fixed-easy",
+    max_optimal_length: int | None = None,
+) -> Dict[str, Any]:
+    top_length = config.max_optimal_length if max_optimal_length is None else max_optimal_length
     level: Dict[str, Any] = {
-        "level": 0,
-        "name": "phase2-fixed-easy",
+        "level": index,
+        "name": name,
         "spec_key": config.spec_key,
         "min_optimal_length": config.min_optimal_length,
-        "max_optimal_length": config.max_optimal_length,
+        "max_optimal_length": top_length,
         "min_robots_moved": config.min_robots_moved,
         "max_robots_moved": config.max_robots_moved,
     }
@@ -198,11 +218,25 @@ def _level(config: Phase2Config) -> Dict[str, Any]:
                 "max_robots_moved": robots,
                 "weight": config.two_robot_band_weight if robots >= 2 else 1.0,
             }
-            for length in range(config.min_optimal_length, config.max_optimal_length + 1)
+            for length in range(config.min_optimal_length, top_length + 1)
             for robots in range(config.min_robots_moved, config.max_robots_moved + 1)
             if robots <= length
         ]
     return level
+
+
+def _curriculum_levels(config: Phase2Config) -> List[Dict[str, Any]]:
+    if config.curriculum_stage_max_lengths is None:
+        return [_level(config)]
+    return [
+        _level(
+            config,
+            index=index,
+            name=f"phase-stage-{index}-len{config.min_optimal_length}-{stage_length}",
+            max_optimal_length=stage_length,
+        )
+        for index, stage_length in enumerate(config.curriculum_stage_max_lengths)
+    ]
 
 
 def _fixture_attempt(args: tuple[int, "Phase2Config"]) -> "PuzzleMetadata | None":
@@ -688,15 +722,27 @@ def _resolve_device(requested: str) -> str:
 
 
 def _training_factory(bank: PuzzleBank, config: Phase2Config, seed: int):
-    manager = create_bank_curriculum_manager(
-        bank=bank,
-        curriculum_levels=[_level(config)],
-        success_rate_threshold=1.0,
-        min_episodes_per_level=1_000_000,
-        success_rate_window_size=1_000,
-        advancement_check_frequency=1_000,
-        verbose=False,
-    )
+    staged = config.curriculum_stage_max_lengths is not None
+    if staged:
+        manager = create_bank_curriculum_manager(
+            bank=bank,
+            curriculum_levels=_curriculum_levels(config),
+            success_rate_threshold=config.curriculum_success_threshold,
+            min_episodes_per_level=config.curriculum_min_episodes,
+            success_rate_window_size=config.curriculum_window,
+            advancement_check_frequency=config.curriculum_check_frequency,
+            verbose=True,
+        )
+    else:
+        manager = create_bank_curriculum_manager(
+            bank=bank,
+            curriculum_levels=_curriculum_levels(config),
+            success_rate_threshold=1.0,
+            min_episodes_per_level=1_000_000,
+            success_rate_window_size=1_000,
+            advancement_check_frequency=1_000,
+            verbose=False,
+        )
     environment_spec = config.environment_spec(seed)
 
     def factory():
@@ -708,10 +754,11 @@ def _training_factory(bank: PuzzleBank, config: Phase2Config, seed: int):
             eval_fraction=config.heldout_fraction,
             split_seed=config.split_seed,
             split_key="layout_hash",
-            track_curriculum=False,
+            track_curriculum=staged,
             verbose=False,
         )
 
+    factory.curriculum_manager = manager
     return factory
 
 
@@ -862,7 +909,8 @@ def train_seed(
     import torch
     from stable_baselines3.common.env_util import make_vec_env
 
-    vec_env = make_vec_env(_training_factory(bank, config, seed), n_envs=config.n_envs, seed=seed)
+    factory = _training_factory(bank, config, seed)
+    vec_env = make_vec_env(factory, n_envs=config.n_envs, seed=seed)
     model = _build_model(vec_env, config, seed=seed, device=device)
     curve: List[Dict[str, Any]] = []
     training_seconds = 0.0
@@ -964,6 +1012,13 @@ def train_seed(
             "action_space": str(model.action_space),
         },
         "curve": curve,
+        "curriculum": {
+            "staged": config.curriculum_stage_max_lengths is not None,
+            "final_level": factory.curriculum_manager.get_current_level(),
+            "total_levels": len(factory.curriculum_manager.curriculum_levels),
+            "episodes_at_final_level": factory.curriculum_manager.get_episodes_at_level(),
+            "window_success_rate": factory.curriculum_manager.get_success_rate(),
+        },
         "test": {
             "deterministic": deterministic_test,
             "stochastic": stochastic_test,
