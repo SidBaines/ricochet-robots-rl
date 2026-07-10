@@ -1,0 +1,48 @@
+# Phase 3: real-game footprint. 16x16 board, four robots (16 actions),
+# interior walls, optimal lengths 1-6, one- and two-robot plans, on the
+# phase 2c recipe (structured planes + GridPlanesCnn, weighted bands).
+# Deeper CNN (6 layers) for the larger board. Overfit gate replaced by a
+# manual wiring check; solver node limit raised for 16x16 labelling.
+height: 16
+width: 16
+num_robots: 4
+edge_t_per_quadrant: 2
+central_l_per_quadrant: 2
+fixture_attempts: 10000
+solver_max_depth: 6
+solver_max_nodes: 200000
+min_optimal_length: 1
+max_optimal_length: 6
+min_robots_moved: 1
+max_robots_moved: 2
+heldout_fraction: 0.25
+split_seed: 20260710
+validation_test_seed: 20260711
+suite_per_stratum: 6
+max_steps: 16
+cell_obs_pixel_size: 40
+obs_mode: image
+policy: grid_cnn
+features_dim: 256
+conv_channels: 64
+n_conv_layers: 6
+two_robot_band_weight: 1.0
+run_overfit_milestone: false
+training_seeds: [11]
+checkpoints: [0, 204800, 409600, 819200, 1638400]
+n_envs: 8
+n_steps: 128
+batch_size: 256
+n_epochs: 4
+learning_rate: 0.0003
+gamma: 0.99
+gae_lambda: 0.95
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+validation_episodes_per_puzzle: 1
+final_stochastic_episodes_per_puzzle: 5
+baseline_episodes_per_puzzle: 20
+overfit_puzzles_per_stratum: 4
+overfit_stochastic_episodes_per_puzzle: 20
+device: auto
