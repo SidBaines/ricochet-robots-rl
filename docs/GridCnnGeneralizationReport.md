@@ -60,9 +60,37 @@ Held-out test: **87.0% det / 84.8% stoch**. Single-robot 100%/97%; two-robot **6
 - Two-robot blocker puzzles are the genuinely hard skill; they respond strongly to exposure reweighting and remain the frontier (68% vs 100% single-robot).
 - The measurement protocol (deterministic fixtures, layout-hash splits, baselines, gates) held up: every claim above is a like-for-like comparison on frozen suites.
 
-## Next gate — Phase 3 (in progress)
+## Phase 3 — 16×16, 4 robots: honest negative result and open problem
 
-Scale the identical recipe to the real game footprint: 16×16 board, 4 robots, 16 actions, interior walls, optimal lengths 1–6 (`configs/phase3_16x16_grid_cnn.yaml`, bank `artifacts/phase3_bank`), 6-layer GridPlanesCnn (~4.5M parameters, ~1.4k steps/s on MPS), 1.64M-step budget. Acceptance: mean stochastic held-out success ≥ the target-robot-only baseline, with stratified reporting as above.
+Scaling the identical recipe to the real game footprint (16×16, 4 robots, 16 actions, interior walls, lengths 1–6; `configs/phase3_16x16_grid_cnn.yaml`, bank `artifacts/phase3_bank`, 6,588 puzzles; baselines random 6.3% / target-only 12.3%) did **not** clear the gate within this session's scale:
+
+| Run | Budget | Held-out test | Gate (12.3%) |
+|---|---|---|---|
+| No curriculum (`phase3_16x16_grid_cnn`) | 1.64M steps | 1.6% det / 5.1% stoch | failed — flat throughout |
+| Staged curriculum (`phase3b_16x16_staged`, lengths 1–2 → 1–4 → 1–6) | 1.64M steps | 3.2% det / 7.0% stoch | failed |
+
+The staged mechanism itself works: stage 0 reached the 70% training-success threshold and advanced at ~400k steps, and length-1 held-out success reached 53% stochastic. But training-suite gains did not transfer beyond that (lengths 3+ at 0%): with only ~600 stage-0 training layouts, the model memorizes rather than generalizes, and the run ended stuck mid-stage-1.
+
+**Diagnosis: data/scale starvation, not a broken mechanism.** Recommended next steps, in order:
+
+1. **10–50× fixture size** — the parallel deterministic builder makes this cheap (10k attempts ≈ 3 min at 8 workers; 100k+ attempts is practical).
+2. **Wider/deeper residual grid CNN** — 6×64-channel same-padded convs is likely undersized for 16×16 pattern diversity.
+3. **10M+ step budget** with per-stage held-out evaluation so memorize-vs-generalize is visible during training.
+4. **Behaviour-cloning warmstart** from the bank's stored optimal plans (every fixture puzzle carries its BFS-optimal action sequence).
+5. Multi-seed formal gating only after a single seed clears.
+
+## Reproduction (16×16 fixture)
+
+```bash
+# Parallel deterministic fixture build (identical fingerprints to sequential):
+.venv-phase2/bin/python - <<'PY'
+from pathlib import Path
+import yaml
+from src.benchmarking.phase2 import Phase2Config, build_fixture_bank
+config = Phase2Config.from_mapping(yaml.safe_load(Path("configs/phase3_16x16_grid_cnn.yaml").read_text()))
+build_fixture_bank(Path("artifacts/phase3_bank"), config, workers=8)
+PY
+```
 
 ## Reproduction
 

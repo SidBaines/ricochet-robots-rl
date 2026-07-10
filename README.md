@@ -8,9 +8,17 @@ This repository trains reinforcement learning agents to solve Ricochet Robots wh
 <!-- **but** not always... -->
 <!-- !['Unsensible things'](examples/rollout_gifs/unsensible.gif) -->
 
-The current supported baseline is PPO with SB3's stock CNN on RGB observations.
-The historical ResNet/DRC implementations remain in the repository for reference,
-but training configuration rejects them until their model contracts are repaired and tested.
+The current best recipe is PPO with the `grid_cnn` policy (a stride-1,
+same-padded CNN in `src/models/grid_cnn.py`) on structured-plane `image`
+observations. On the held-out Phase 2 benchmarks it reaches 69.8% ± 6.5%
+deterministic success on the easy fixture (three seeds) and 87.0%
+deterministic on the harder walls/two-robot fixture, versus 3.1% for the
+previous stock-CNN baseline and 16.6% for the best heuristic; see
+[docs/GridCnnGeneralizationReport.md](docs/GridCnnGeneralizationReport.md).
+The 16×16 four-robot game remains open (data/scale-starved; next steps in
+the report). SB3's stock CNN on RGB observations remains available; the
+historical ResNet/DRC implementations remain for reference but training
+configuration rejects them until their model contracts are repaired and tested.
 
 Sensible             |  Not sensible
 :-------------------------:|:-------------------------:
@@ -84,7 +92,7 @@ A (badly-performing) pre-trained model exists in `examples/`.
 - `configs/train_defaults.yaml` is the supported stock-CNN baseline. Older ResNet/DRC configs are retained as historical inputs and now fail clearly rather than selecting a different model.
 - `bank_dir`, `log_dir`, and `save_path` defaults now point into `artifacts/` to keep generated data out of the source tree.
 - Device selection defaults to `auto`; M-series Macs will pick `mps` when available.
-- Supported model types are `stock_cnn` for `rgb_image`/`rgb_cell_image` and `mlp` for symbolic or legacy plane observations.
+- Supported model types are `grid_cnn` for structured-plane `image` observations (the current best recipe), `stock_cnn` for `rgb_image`/`rgb_cell_image`, and `mlp` for symbolic or legacy plane observations.
 - Bank training and evaluation use stable hash-based, disjoint splits. Configure the evaluation fraction, seed, and fingerprint field in the curriculum block.
 
 ### Resume and Warmstart
@@ -128,7 +136,7 @@ For curated rollouts, open `src/scripts/initial_visualisation_cells.py`. It load
 1. **Environment & Generator (stabilized baseline)** – Gymnasium reset streams and layout-dependent RGB caches have regression coverage; broader generator-rule validation remains ongoing.
 2. **Solver & Bank Precomputation (usable prototype)** – BFS/A* and bank metadata are useful; bank durability/deduplication is future hardening work.
 3. **Training Framework (Phase 1 baseline)** – Explicit stock-CNN/MLP selection, validated environment propagation, diagnostic run manifests, vector-aware callbacks, pinned direct CI dependencies, and an end-to-end smoke test on the Python 3.11 reference environment.
-4. **Curriculum Training & Evaluation (Phase 2 measured baseline)** – The reproducible three-seed MPS benchmark, baselines, fixed suites, and overfit gate are implemented. The tiny overfit gate passes, but the first stock-CNN run does not clear the held-out target-robot-only baseline; see the Phase 2 report.
+4. **Curriculum Training & Evaluation (Phase 2 held-out milestone passed)** – The reproducible three-seed MPS benchmark, baselines, fixed suites, and overfit gate are implemented. The `grid_cnn` + structured-plane recipe clears the held-out gate decisively on the easy (75.0% vs 46.7% required) and hard (84.8% vs 16.6%) 8×8 fixtures; staged bank curricula and weighted difficulty bands are supported. The 16×16 four-robot benchmark is defined and remains open; see `docs/GridCnnGeneralizationReport.md`.
 5. **Mechanistic Interpretability Suite (planned)** – Activation capture, linear probes, saliency/attribution, feature visualisation, activation patching; summarise findings on plan representations and causal features.
 6. **Profiling & Monitoring (stabilized baseline)** – Profiling is opt-in; SB3/custom metrics share a configured logger lifecycle and backends close cleanly. Consolidation remains useful future work.
 7. **Documentation & Repo Hygiene (in progress)** – Keep `WorkInProgress.md` current, ensure README/examples stay aligned with the new `src/` + `artifacts/` structure, and consolidate progress notes under `docs/`.
