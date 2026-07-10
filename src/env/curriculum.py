@@ -553,6 +553,7 @@ def create_bank_curriculum_manager(
     min_episodes_per_level: int = 100,
     success_rate_window_size: int = 200,
     advancement_check_frequency: int = 50,
+    max_episodes_per_level: Optional[int] = None,
     verbose: bool = True
 ) -> BankCurriculumManager:
     """Create a bank-based curriculum manager.
@@ -579,6 +580,7 @@ def create_bank_curriculum_manager(
         min_episodes_per_level=min_episodes_per_level,
         success_rate_window_size=success_rate_window_size,
         advancement_check_frequency=advancement_check_frequency,
+        max_episodes_per_level=max_episodes_per_level,
         verbose=verbose
     )
 

@@ -414,6 +414,7 @@ class BankCurriculumManager:
         min_episodes_per_level: int = 100,
         success_rate_window_size: int = 200,
         advancement_check_frequency: int = 50,
+        max_episodes_per_level: Optional[int] = None,
         verbose: bool = True
     ):
         """Initialize bank-based curriculum manager.
@@ -433,6 +434,9 @@ class BankCurriculumManager:
         self.min_episodes_per_level = min_episodes_per_level
         self.success_rate_window_size = success_rate_window_size
         self.advancement_check_frequency = advancement_check_frequency
+        # Optional stall safety-valve: force advancement after this many
+        # episodes at a level even if the success threshold was never met.
+        self.max_episodes_per_level = max_episodes_per_level
         self.verbose = verbose
         
         # Current state
@@ -501,6 +505,21 @@ class BankCurriculumManager:
         # Check for advancement
         if self._should_check_advancement():
             self._check_advancement()
+
+        # Stall safety-valve: advance regardless of success rate once a level
+        # has consumed its episode budget.
+        if (
+            self.max_episodes_per_level is not None
+            and self.current_level < len(self.curriculum_levels) - 1
+            and (self.episode_count - self.level_start_episode) >= self.max_episodes_per_level
+        ):
+            if self.verbose:
+                print(
+                    f"Curriculum stall safety-valve triggered at level {self.current_level} "
+                    f"after {self.episode_count - self.level_start_episode} episodes "
+                    f"(window success {self.get_success_rate():.1%})"
+                )
+            self._advance_level()
     
     def _should_check_advancement(self) -> bool:
         """Check if it's time to evaluate advancement."""

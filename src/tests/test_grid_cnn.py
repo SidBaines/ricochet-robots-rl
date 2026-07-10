@@ -6,7 +6,7 @@ import torch
 from gymnasium.spaces import Box
 
 from src.benchmarking.phase2 import Phase2Config
-from src.models.grid_cnn import GridPlanesCnn
+from src.models.grid_cnn import GridPlanesCnn, GridPlanesResNet
 
 
 def _planes_space(channels: int = 8, height: int = 8, width: int = 8) -> Box:
@@ -53,6 +53,57 @@ def test_phase2_config_accepts_grid_cnn_on_planes() -> None:
     config = Phase2Config(policy="grid_cnn", obs_mode="image")
     spec = config.environment_spec(seed=0)
     assert spec.obs_mode == "image"
+
+
+def test_grid_resnet_preserves_batch_and_feature_dims() -> None:
+    space = _planes_space(channels=10, height=16, width=16)
+    extractor = GridPlanesResNet(space, features_dim=512, conv_channels=64, n_blocks=3)
+    batch = torch.zeros((4, *space.shape), dtype=torch.float32)
+    features = extractor(batch)
+    assert features.shape == (4, 512)
+    assert torch.isfinite(features).all()
+
+
+def test_grid_resnet_distinguishes_robot_positions() -> None:
+    space = _planes_space(channels=10, height=16, width=16)
+    extractor = GridPlanesResNet(space, features_dim=64, conv_channels=32, n_blocks=2)
+    board_a = torch.zeros((1, *space.shape), dtype=torch.float32)
+    board_b = board_a.clone()
+    board_a[0, 6, 2, 3] = 1.0
+    board_b[0, 6, 12, 9] = 1.0
+    assert not torch.allclose(extractor(board_a), extractor(board_b))
+
+
+def test_phase2_config_accepts_grid_resnet_on_planes() -> None:
+    config = Phase2Config(policy="grid_resnet", obs_mode="image")
+    assert config.environment_spec(seed=0).obs_mode == "image"
+    with pytest.raises(ValueError, match="grid_resnet requires"):
+        Phase2Config(policy="grid_resnet", obs_mode="rgb_cell_image")
+
+
+def test_curriculum_stall_safety_valve_forces_advancement() -> None:
+    from src.env.criteria_env import BankCurriculumManager
+
+    levels = [{"name": f"level-{i}", "spec_key": None} for i in range(2)]
+    manager = BankCurriculumManager(
+        bank=None,
+        curriculum_levels=levels,
+        success_rate_threshold=1.0,
+        min_episodes_per_level=10_000,
+        success_rate_window_size=100,
+        advancement_check_frequency=10,
+        max_episodes_per_level=50,
+        verbose=False,
+    )
+    for _ in range(49):
+        manager.record_episode_result(False)
+    assert manager.get_current_level() == 0
+    manager.record_episode_result(False)
+    assert manager.get_current_level() == 1
+    # Final level: the valve must not advance past the end.
+    for _ in range(200):
+        manager.record_episode_result(False)
+    assert manager.get_current_level() == 1
 
 
 def test_train_agent_select_policy_supports_grid_cnn() -> None:

@@ -163,7 +163,7 @@ def build_training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--traj-record-freq", type=int, default=2000)
     parser.add_argument("--traj-record-episodes", type=int, default=10)
     # Model options
-    parser.add_argument("--model-type", choices=["stock_cnn", "mlp", "grid_cnn"], default="stock_cnn")
+    parser.add_argument("--model-type", choices=["stock_cnn", "mlp", "grid_cnn", "grid_resnet"], default="stock_cnn")
     parser.add_argument("--small-cnn", action="store_true", help="Use custom SmallCNN feature extractor for image obs")
     parser.add_argument("--convlstm", action="store_true", help="Use sb3-contrib CnnLstmPolicy (baseline recurrent)")
     parser.add_argument("--drc", action="store_true", help="Use sb3-contrib RecurrentPPO with recurrent policy (DRC settings)")
@@ -281,10 +281,10 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(model_type, str):
             raise ValueError("model.type must be a string")
         normalized_model_type = model_type.strip().lower()
-        if normalized_model_type not in {"stock_cnn", "mlp", "grid_cnn"}:
+        if normalized_model_type not in {"stock_cnn", "mlp", "grid_cnn", "grid_resnet"}:
             raise ValueError(
                 f"Unsupported model.type '{model_type}'; "
-                "supported values are stock_cnn, mlp, and grid_cnn"
+                "supported values are stock_cnn, mlp, grid_cnn, and grid_resnet"
             )
         flat["model_type"] = normalized_model_type
         params = model.get("params") or {}
@@ -688,14 +688,27 @@ def select_policy(args: argparse.Namespace, observation_space: Any) -> tuple[str
             "normalize_images": False,
         }
 
-    if model_type == "grid_cnn":
+    if model_type in {"grid_cnn", "grid_resnet"}:
         if args.obs_mode != "image":
             raise ValueError(
-                "grid_cnn requires the structured-plane 'image' observation mode"
+                f"{model_type} requires the structured-plane 'image' observation mode"
             )
         shape = tuple(int(v) for v in observation_space.shape)
         if len(shape) != 3:
-            raise ValueError(f"grid_cnn requires (C, H, W) observations, got {shape}")
+            raise ValueError(f"{model_type} requires (C, H, W) observations, got {shape}")
+        if model_type == "grid_resnet":
+            from src.models.grid_cnn import GridPlanesResNet
+
+            return "MlpPolicy", {
+                "features_extractor_class": GridPlanesResNet,
+                "features_extractor_kwargs": {
+                    "features_dim": 512,
+                    "conv_channels": 128,
+                    "n_blocks": 6,
+                },
+                "net_arch": dict(pi=[128, 128], vf=[128, 128]),
+                "normalize_images": False,
+            }
         from src.models.grid_cnn import GridPlanesCnn
 
         return "MlpPolicy", {
@@ -873,11 +886,13 @@ def validate_and_describe_model(
         "stock_cnn": "NatureCNN",
         "mlp": "FlattenExtractor",
         "grid_cnn": "GridPlanesCnn",
+        "grid_resnet": "GridPlanesResNet",
     }.get(model_type)
     expected_policy = {
         "stock_cnn": "ActorCriticCnnPolicy",
         "mlp": "ActorCriticPolicy",
         "grid_cnn": "ActorCriticPolicy",
+        "grid_resnet": "ActorCriticPolicy",
     }.get(model_type)
     if expected_extractor is None:
         raise ValueError(f"Unsupported model type: {model_type}")

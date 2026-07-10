@@ -71,6 +71,7 @@ class Phase2Config:
     curriculum_min_episodes: int = 5_000
     curriculum_window: int = 500
     curriculum_check_frequency: int = 100
+    curriculum_max_episodes_per_stage: int | None = None
     training_seeds: tuple[int, ...] = (11, 29, 47)
     checkpoints: tuple[int, ...] = (0, 10_240, 25_600, 51_200)
     n_envs: int = 8
@@ -107,12 +108,12 @@ class Phase2Config:
             raise ValueError("overfit_puzzles_per_stratum must be positive")
         if self.overfit_stochastic_episodes_per_puzzle <= 0:
             raise ValueError("overfit_stochastic_episodes_per_puzzle must be positive")
-        if self.policy not in {"stock_cnn", "grid_cnn"}:
+        if self.policy not in {"stock_cnn", "grid_cnn", "grid_resnet"}:
             raise ValueError(f"Unsupported policy: {self.policy}")
         if self.policy == "stock_cnn" and self.obs_mode not in {"rgb_image", "rgb_cell_image"}:
             raise ValueError("stock_cnn requires an RGB observation mode")
-        if self.policy == "grid_cnn" and self.obs_mode != "image":
-            raise ValueError("grid_cnn requires the structured-plane 'image' observation mode")
+        if self.policy in {"grid_cnn", "grid_resnet"} and self.obs_mode != "image":
+            raise ValueError(f"{self.policy} requires the structured-plane 'image' observation mode")
         if self.curriculum_stage_max_lengths is not None:
             stages = self.curriculum_stage_max_lengths
             if tuple(sorted(set(stages))) != stages:
@@ -675,6 +676,20 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
             "net_arch": dict(pi=[128, 128], vf=[128, 128]),
             "normalize_images": True,
         }
+    elif config.policy == "grid_resnet":  # residual variant on structured planes
+        from src.models.grid_cnn import GridPlanesResNet
+
+        policy_name = "MlpPolicy"
+        policy_kwargs = {
+            "features_extractor_class": GridPlanesResNet,
+            "features_extractor_kwargs": {
+                "features_dim": config.features_dim,
+                "conv_channels": config.conv_channels,
+                "n_blocks": config.n_conv_layers,
+            },
+            "net_arch": dict(pi=[128, 128], vf=[128, 128]),
+            "normalize_images": False,
+        }
     else:  # grid_cnn on structured planes (already float in [0, 1])
         from src.models.grid_cnn import GridPlanesCnn
 
@@ -731,6 +746,7 @@ def _training_factory(bank: PuzzleBank, config: Phase2Config, seed: int):
             min_episodes_per_level=config.curriculum_min_episodes,
             success_rate_window_size=config.curriculum_window,
             advancement_check_frequency=config.curriculum_check_frequency,
+            max_episodes_per_level=config.curriculum_max_episodes_per_stage,
             verbose=True,
         )
     else:
@@ -970,11 +986,16 @@ def train_seed(
                 "stochastic": stochastic_eval["summary"],
             }
         )
+        by_length = {
+            length: f"{summary['success_rate']:.0%}"
+            for length, summary in stochastic_eval["summary"]["by_optimal_length"].items()
+        }
         print(
             f"[phase2 seed={seed}] timesteps={int(model.num_timesteps)} "
             f"training={training_stochastic_eval['summary']['success_rate']:.1%} "
             f"validation deterministic={deterministic_eval['summary']['success_rate']:.1%} "
-            f"stochastic={stochastic_eval['summary']['success_rate']:.1%}",
+            f"stochastic={stochastic_eval['summary']['success_rate']:.1%} "
+            f"val-stoch-by-length={by_length}",
             flush=True,
         )
 
