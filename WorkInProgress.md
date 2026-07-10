@@ -165,3 +165,11 @@ How to enable and where to look:
 - To log to wandb (recommended): in your YAML under `monitoring:` set `wandb: true`, and set `wandb_project`, `wandb_entity` (and optionally `wandb_run_name`). Metrics appear under the Charts tab with keys like `train/*`, `rollout/*`, `time/*`, `eval/*`. Videos/images appear in the Media tab (Videos/Images) as `eval/trajectories/*`.
 - To log to TensorBoard: set `tensorboard: true` in `monitoring:`. Launch TB pointing to `monitoring.log_dir` (default `artifacts/runs/ppo`). Metrics appear under Scalars; videos under the Videos plugin; images under Images.
 - Ensure `eval.traj_record_freq > 0` to emit trajectory media periodically (default 2000). This uses a lightweight matplotlib renderer if env RGB is unavailable.
+
+### Phase 2 reproducible benchmark (2026-07-10)
+
+- Audited the local MPS path and moved the benchmark into an isolated Python 3.11.15 environment. Fixed the incompatible Python 3.11 NumPy pin, passed the configured PPO seed through fresh training, corrected asynchronous accelerator timing, and added a real MPS train/save/reload test.
+- Added `configs/phase2_benchmark.yaml` and `src/scripts/run_phase2_benchmark.py`. The runner deterministically builds a BFS-labelled easy-puzzle fixture, freezes disjoint layout-hash train/validation/test suites, records exact fingerprints and runtime provenance, evaluates random/target-only/oracle controls, and runs three stock-CNN PPO seeds.
+- Added fixed-budget training and validation curves, optimal-length/robots-moved strata, deterministic and stochastic results, Wilson intervals, action/no-movement diagnostics, throughput, an isolated evaluation RNG, and tiny-overfit and held-out acceptance gates.
+- Clean MPS run at commit `1523008`: the eight-puzzle overfit gate passed at 82.5% stochastic success, but broad held-out PPO averaged 31.7%, below the 46.7% target-robot-only baseline. Deterministic PPO averaged 3.1% and collapsed toward no-movement actions.
+- Full findings and reproduction instructions are in `docs/Phase2BenchmarkReport.md`. Phase 2 measurement infrastructure is complete; the held-out agent milestone remains failed, so this baseline should not yet be called successful or advanced unchanged into a larger curriculum.

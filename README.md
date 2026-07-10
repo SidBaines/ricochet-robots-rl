@@ -45,7 +45,15 @@ python src/scripts/train_agent.py configs/train_defaults.yaml
 ```
 Copy `configs/train_defaults.yaml`, change the structured fields you need, and pass the new file to the same command. Unknown or unsupported fields fail validation instead of being silently ignored. Every run records a diagnostic manifest containing requested/effective environment settings, model/spaces, installed package versions, Git state, seed derivation, bank split configuration, and timestep accounting in its timestamped log directory. A fully hash-locked cross-platform environment and immutable bank content manifest remain future hardening work.
 
-### 4. Observe a models' gameplay
+### 4. Run the Phase 2 benchmark
+
+```bash
+python src/scripts/run_phase2_benchmark.py
+```
+
+This builds a deterministic easy-puzzle fixture under `artifacts/phase2_bank`, freezes disjoint layout-hash train/validation/test suites, runs heuristic and oracle baselines, checks a tiny-set overfit milestone, and trains three stock-CNN PPO seeds. Results and checkpoints are written to `artifacts/phase2_benchmark`. See [the Phase 2 report](docs/Phase2BenchmarkReport.md) for the protocol and first MPS results.
+
+### 5. Observe a model's gameplay
 Notebook-style scripts with `#%%` cells live in `src/scripts/`; `bank_agent_rollout_cells.py` is particularly useful for loading a model.
 A (badly-performing) pre-trained model exists in `examples/`.
 
@@ -66,6 +74,7 @@ A (badly-performing) pre-trained model exists in `examples/`.
 ## Key Scripts & Pipelines
 - `src/scripts/train_agent.py`: Main training entry point; consumes a YAML config
 - `src/scripts/evaluate_agent.py`: Evaluate PPO checkpoints on fixed layouts or random boards
+- `src/scripts/run_phase2_benchmark.py`: Reproduce the fixed Phase 2 baseline and held-out evaluation
 - `src/scripts/generate_curriculum_bank.py`: Build/refresh the curriculum puzzle bank (band-first controller)
 - `src/scripts/precompute_bank.py`: Lower-level precomputation driver for bespoke experiments
 - `src/scripts/bank_agent_rollout_cells.py`: Jupyter-style curriculum rollout visualiser
@@ -119,7 +128,7 @@ For curated rollouts, open `src/scripts/initial_visualisation_cells.py`. It load
 1. **Environment & Generator (stabilized baseline)** – Gymnasium reset streams and layout-dependent RGB caches have regression coverage; broader generator-rule validation remains ongoing.
 2. **Solver & Bank Precomputation (usable prototype)** – BFS/A* and bank metadata are useful; bank durability/deduplication is future hardening work.
 3. **Training Framework (Phase 1 baseline)** – Explicit stock-CNN/MLP selection, validated environment propagation, diagnostic run manifests, vector-aware callbacks, pinned direct CI dependencies, and an end-to-end smoke test on the Python 3.11 reference environment.
-4. **Curriculum Training & Evaluation (Phase 1 baseline)** – Deterministic held-out bank splits and non-mutating evaluation are implemented; benchmark-scale multi-seed results are Phase 2.
+4. **Curriculum Training & Evaluation (Phase 2 measured baseline)** – The reproducible three-seed MPS benchmark, baselines, fixed suites, and overfit gate are implemented. The tiny overfit gate passes, but the first stock-CNN run does not clear the held-out target-robot-only baseline; see the Phase 2 report.
 5. **Mechanistic Interpretability Suite (planned)** – Activation capture, linear probes, saliency/attribution, feature visualisation, activation patching; summarise findings on plan representations and causal features.
 6. **Profiling & Monitoring (stabilized baseline)** – Profiling is opt-in; SB3/custom metrics share a configured logger lifecycle and backends close cleanly. Consolidation remains useful future work.
 7. **Documentation & Repo Hygiene (in progress)** – Keep `WorkInProgress.md` current, ensure README/examples stay aligned with the new `src/` + `artifacts/` structure, and consolidate progress notes under `docs/`.
@@ -127,4 +136,5 @@ For curated rollouts, open `src/scripts/initial_visualisation_cells.py`. It load
 ## Additional Resources
 - `docs/ProgressNotes/`: Day-by-day engineering updates
 - `docs/ComponentSpecifications/`: Detailed component-level specs
+- `docs/Phase2BenchmarkReport.md`: Reproducible benchmark protocol, MPS audit, results, and next gate
 - `docs/AiChatLogs/`: Conversations and decision logs
