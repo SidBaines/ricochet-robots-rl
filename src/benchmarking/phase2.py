@@ -64,6 +64,8 @@ class Phase2Config:
     features_dim: int = 256
     conv_channels: int = 64
     n_conv_layers: int = 4
+    two_robot_band_weight: float | None = None
+    run_overfit_milestone: bool = True
     training_seeds: tuple[int, ...] = (11, 29, 47)
     checkpoints: tuple[int, ...] = (0, 10_240, 25_600, 51_200)
     n_envs: int = 8
@@ -175,7 +177,7 @@ def _stratum(puzzle: PuzzleMetadata) -> str:
 
 
 def _level(config: Phase2Config) -> Dict[str, Any]:
-    return {
+    level: Dict[str, Any] = {
         "level": 0,
         "name": "phase2-fixed-easy",
         "spec_key": config.spec_key,
@@ -184,6 +186,23 @@ def _level(config: Phase2Config) -> Dict[str, Any]:
         "min_robots_moved": config.min_robots_moved,
         "max_robots_moved": config.max_robots_moved,
     }
+    if config.two_robot_band_weight is not None:
+        # One band per achievable (optimal_length, robots_moved) pair, with
+        # multi-robot plans up-weighted so they are not drowned out by the
+        # fixture's single-robot majority.
+        level["bands"] = [
+            {
+                "min_optimal_length": length,
+                "max_optimal_length": length,
+                "min_robots_moved": robots,
+                "max_robots_moved": robots,
+                "weight": config.two_robot_band_weight if robots >= 2 else 1.0,
+            }
+            for length in range(config.min_optimal_length, config.max_optimal_length + 1)
+            for robots in range(config.min_robots_moved, config.max_robots_moved + 1)
+            if robots <= length
+        ]
+    return level
 
 
 def build_fixture_bank(bank_dir: Path, config: Phase2Config) -> Dict[str, Any]:
@@ -1009,16 +1028,22 @@ def render_markdown_report(result: Mapping[str, Any]) -> str:
             f"{summary['mean_episode_length']:.2f} |"
         )
     overfit = result["overfit"]
-    overfit_final = overfit["curve"][-1]
+    if overfit.get("skipped"):
+        overfit_lines = ["Skipped by configuration."]
+    else:
+        overfit_final = overfit["curve"][-1]
+        overfit_lines = [
+            f"The model trained on {len(overfit['puzzle_ids'])} training puzzles reached "
+            f"**{overfit_final['deterministic']['success_rate']:.1%} deterministic** and "
+            f"**{overfit_final['stochastic']['success_rate']:.1%} stochastic** success at "
+            f"{overfit['actual_timesteps']} timesteps. Acceptance (≥80% stochastic): "
+            f"**{'passed' if overfit['passed'] else 'failed'}**.",
+        ]
     lines.extend([
         "",
         "## Tiny-set overfit milestone",
         "",
-        f"The model trained on {len(overfit['puzzle_ids'])} training puzzles reached "
-        f"**{overfit_final['deterministic']['success_rate']:.1%} deterministic** and "
-        f"**{overfit_final['stochastic']['success_rate']:.1%} stochastic** success at "
-        f"{overfit['actual_timesteps']} timesteps. Acceptance (≥80% stochastic): "
-        f"**{'passed' if overfit['passed'] else 'failed'}**.",
+        *overfit_lines,
         "",
         "## Multi-seed PPO result",
         "",
@@ -1127,23 +1152,27 @@ def run_phase2_benchmark(
         ),
         flush=True,
     )
-    training_lookup = [lookup[puzzle_id] for puzzle_id in split_manifest["memberships"]["train"]]
-    overfit_groups: Dict[str, List[PuzzleMetadata]] = defaultdict(list)
-    for puzzle in training_lookup:
-        overfit_groups[_stratum(puzzle)].append(puzzle)
-    overfit_suite: List[PuzzleMetadata] = []
-    for stratum in sorted(overfit_groups):
-        overfit_suite.extend(
-            sorted(overfit_groups[stratum], key=_puzzle_id)[: config.overfit_puzzles_per_stratum]
+    if config.run_overfit_milestone:
+        training_lookup = [lookup[puzzle_id] for puzzle_id in split_manifest["memberships"]["train"]]
+        overfit_groups: Dict[str, List[PuzzleMetadata]] = defaultdict(list)
+        for puzzle in training_lookup:
+            overfit_groups[_stratum(puzzle)].append(puzzle)
+        overfit_suite: List[PuzzleMetadata] = []
+        for stratum in sorted(overfit_groups):
+            overfit_suite.extend(
+                sorted(overfit_groups[stratum], key=_puzzle_id)[: config.overfit_puzzles_per_stratum]
+            )
+        print(f"[phase2] starting overfit milestone on {len(overfit_suite)} puzzles", flush=True)
+        overfit = train_overfit_milestone(
+            overfit_suite,
+            config,
+            seed=config.training_seeds[0] + 1_000,
+            device=device,
+            output_dir=output_dir,
         )
-    print(f"[phase2] starting overfit milestone on {len(overfit_suite)} puzzles", flush=True)
-    overfit = train_overfit_milestone(
-        overfit_suite,
-        config,
-        seed=config.training_seeds[0] + 1_000,
-        device=device,
-        output_dir=output_dir,
-    )
+    else:
+        print("[phase2] overfit milestone skipped by config", flush=True)
+        overfit = {"skipped": True}
     seed_results = []
     for seed in config.training_seeds:
         print(f"[phase2] starting training seed {seed}", flush=True)

@@ -185,3 +185,11 @@ How to enable and where to look:
   - Validation curve rose monotonically after 25k steps (9.4% → 71.9% deterministic), i.e. genuine distribution learning, not memorization.
 - Conclusion: the earlier failure was an observation-encoding × architecture mismatch, not a task/reward/PPO problem. Sparse reward, 51k budget, and the bank pipeline were all fine once the network could see the board.
 - Experiment 2 (`configs/phase2_exp2_grid_cnn_3seed.yaml`, same recipe, full three-seed protocol): held-out test success **69.8% ± 6.5% deterministic / 75.0% ± 7.8% stochastic** across seeds 11/29/47 (per-seed stochastic 66.9%/82.5%/75.6%; pooled Wilson 70.9%–78.7%). Every seed individually clears the 46.7% target-robot-only gate; the formal held-out milestone is **passed** (`artifacts/phase2_experiments/exp2_grid_cnn_3seed/`).
+
+### Phase 2b: harder fixture also cleared (2026-07-10)
+
+- New deterministic fixture (`configs/phase2b_grid_cnn.yaml`, bank `artifacts/phase2b_bank`): 8×8, two robots, interior walls (1 edge-T + 1 central-L per quadrant), optimal lengths 1–4, robots_moved 1–2 — 8,922 puzzles across 7 strata (1,166 two-robot-plan puzzles), layout-hash split 6,736/1,096/1,090. Split-manifest strata checks now derive from the fixture's achievable strata instead of the Cartesian product (which would wrongly require impossible combos like length-1/robots-2).
+- Baselines collapse on this distribution: random 14.1%, target-robot-only 16.6% (0% on two-robot puzzles) — real headroom for demonstrating skill.
+- Overfit gate (28 puzzles): 89.3% stochastic — passed.
+- Seed 11, 409,600 steps: held-out test **68.5% deterministic / 70.7% stochastic** (gate passed, 70.7% vs 16.6%). By stratum: single-robot plans essentially solved (**99–100%** at every length); two-robot blocker puzzles **23–30%** (vs 0–8% baselines). Validation still rising at the final checkpoint (47.3% → 63.6% deterministic between 205k and 410k).
+- Next lever (phase 2c, running): two-robot bands were only ~13% of uniform training exposure; explicit band weights now lift them to ~41%, budget doubled to 819,200 steps, overfit gate skipped (already proven). Curriculum manager honours explicit `bands` on a level spec; `Phase2Config` gains `two_robot_band_weight` and `run_overfit_milestone`.

@@ -451,9 +451,10 @@ class BankCurriculumManager:
             PuzzleCriteria for current level
         """
         level_spec = self.curriculum_levels[self.current_level]
-        # Build simple bands across discrete optimal lengths within range
-        bands: Optional[List[Dict[str, Any]]] = None
-        if (
+        # Explicit bands on the level take priority; otherwise build simple
+        # equal-weight bands across discrete optimal lengths within range.
+        bands: Optional[List[Dict[str, Any]]] = level_spec.get("bands")
+        if bands is None and (
             level_spec.get("min_optimal_length") is not None and
             level_spec.get("max_optimal_length") is not None
         ):
