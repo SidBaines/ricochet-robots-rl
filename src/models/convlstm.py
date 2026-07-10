@@ -242,7 +242,11 @@ class ConvLSTMFeaturesExtractor(BaseFeaturesExtractor):
             device_type = x.device.type
             use_amp = device_type in ("cuda", "mps")
             try:
-                autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.float16) if use_amp else torch.cpu.amp.autocast(enabled=False)
+                autocast_ctx = (
+                    torch.autocast(device_type=device_type, dtype=torch.float16)
+                    if use_amp
+                    else torch.amp.autocast(device_type="cpu", enabled=False)
+                )
             except Exception:
                 # Fallback if autocast not supported on backend
                 class _NullCtx:

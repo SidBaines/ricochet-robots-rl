@@ -179,8 +179,6 @@ class RicochetRobotsEnv(GymEnvBase):
         except NameError:
             self.np_random = np.random.default_rng(seed)
             self._episode_seed = int(seed) if seed is not None else None
-        # Preserve a base seed to enforce deterministic resets when no new seed is provided
-        self._base_seed: Optional[int] = int(seed) if seed is not None else self._episode_seed
         self._board: Optional[Board] = None
         self._num_steps = 0
         self._cached_wall_obs: Optional[np.ndarray] = None  # (H,W,4) float32 for wall channels
@@ -287,20 +285,13 @@ class RicochetRobotsEnv(GymEnvBase):
             except NameError:
                 self.np_random = np.random.default_rng(seed)
                 self._episode_seed = int(seed)
-            self._base_seed = int(self._episode_seed) if self._episode_seed is not None else None
-        else:
-            # Re-seed with base seed so that resets are deterministic when no new seed is provided
-            if self._base_seed is not None:
-                try:
-                    self.np_random, used_seed = _seeding.np_random(self._base_seed)  # type: ignore[name-defined]
-                    self._episode_seed = int(used_seed) if used_seed is not None else int(self._base_seed)
-                except NameError:
-                    self.np_random = np.random.default_rng(self._base_seed)
-                    self._episode_seed = int(self._base_seed)
         _ = options  # silence unused
         self._num_steps = 0
-        # clear cached walls in case layout changes
+        # All three overlays depend on the current layout, not merely its
+        # dimensions. A same-sized board must never reuse the previous walls.
         self._cached_wall_obs = None
+        self._rgb_internal_walls_overlay = None
+        self._cell_internal_walls_overlay = None
 
         if self.fixed_layout is not None:
             with profile("env_reset_fixed_layout", track_memory=True):

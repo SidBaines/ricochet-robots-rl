@@ -8,7 +8,9 @@ This repository trains reinforcement learning agents to solve Ricochet Robots wh
 <!-- **but** not always... -->
 <!-- !['Unsensible things'](examples/rollout_gifs/unsensible.gif) -->
 
-Current status: ResNet-based models are trained to do sensible things sometimes, but also do very un-sensible things sometimes:
+The current supported baseline is PPO with SB3's stock CNN on RGB observations.
+The historical ResNet/DRC implementations remain in the repository for reference,
+but training configuration rejects them until their model contracts are repaired and tested.
 
 Sensible             |  Not sensible
 :-------------------------:|:-------------------------:
@@ -24,7 +26,7 @@ Sensible             |  Not sensible
 
 ### 1. Set up a Python environment and install dependencies
 ```bash
-python -m venv rlenv
+python3.11 -m venv rlenv
 source rlenv/bin/activate
 pip install -r requirements.txt
 ```
@@ -41,7 +43,7 @@ python src/scripts/generate_curriculum_bank.py \
 ```bash
 python src/scripts/train_agent.py configs/train_defaults.yaml
 ```
-Copy `configs/train_defaults.yaml`, tweak any keys you need (all CLI options map directly to YAML fields), and pass the new file to the same command for customised runs.
+Copy `configs/train_defaults.yaml`, change the structured fields you need, and pass the new file to the same command. Unknown or unsupported fields fail validation instead of being silently ignored. Every run records a diagnostic manifest containing requested/effective environment settings, model/spaces, installed package versions, Git state, seed derivation, bank split configuration, and timestep accounting in its timestamped log directory. A fully hash-locked cross-platform environment and immutable bank content manifest remain future hardening work.
 
 ### 4. Observe a models' gameplay
 Notebook-style scripts with `#%%` cells live in `src/scripts/`; `bank_agent_rollout_cells.py` is particularly useful for loading a model.
@@ -70,10 +72,11 @@ A (badly-performing) pre-trained model exists in `examples/`.
 - `src/scripts/initial_testing_cells.py`: Smoke-test utilities for the environment and solver
 
 ## Configuration & Training Notes
-- Every CLI option in `build_training_parser()` is mirrored as a YAML key. Check `configs/train_defaults.yaml` and `configs/resnet_rgb.yaml` for annotated examples.
+- `configs/train_defaults.yaml` is the supported stock-CNN baseline. Older ResNet/DRC configs are retained as historical inputs and now fail clearly rather than selecting a different model.
 - `bank_dir`, `log_dir`, and `save_path` defaults now point into `artifacts/` to keep generated data out of the source tree.
 - Device selection defaults to `auto`; M-series Macs will pick `mps` when available.
-- Recurrent policies (`--convlstm`, `--drc`) and `--resnet` are mutually exclusive. Set only one of the flags (or none for the default SmallCNN).
+- Supported model types are `stock_cnn` for `rgb_image`/`rgb_cell_image` and `mlp` for symbolic or legacy plane observations.
+- Bank training and evaluation use stable hash-based, disjoint splits. Configure the evaluation fraction, seed, and fingerprint field in the curriculum block.
 
 ### Resume and Warmstart
 Control run initialisation via YAML:
@@ -97,7 +100,7 @@ python src/scripts/generate_curriculum_bank.py \
   --max_puzzles_global 200000 \
   --chunk_per_spec 200
 ```
-The controller consults manifest histograms, making it safe to rerun incrementally without duplicating layouts. Adjust `--solver`, `--max_depth`, and `--max_nodes` to trade off coverage vs computation.
+The controller consults manifest histograms when topping up coverage. It does not yet provide transactional writes or complete deduplication, so validate and back up valuable banks before large incremental jobs. Adjust `--solver`, `--max_depth`, and `--max_nodes` to trade off coverage vs computation.
 
 ## Testing
 Use pytest from the project root (ensure `pytest` is installed in your environment):
@@ -113,16 +116,15 @@ Offline renderers live under `src/env/visuals/`:
 For curated rollouts, open `src/scripts/initial_visualisation_cells.py`. It loads curriculum configs, banks from `artifacts/puzzle_bank`, and checkpoints from `artifacts/checkpoints/` to record or display trajectories with the renderers above.
 
 ## Current Status Overview
-1. **Environment & Generator (complete)** – Canonical edge-wall mechanics, sliding dynamics, Gymnasium API; deterministic seeding; ASCII/RGB rendering; optional no-op action.
-2. **Solver & Bank Precomputation (complete)** – BFS/A* solvers for optimal lengths; offline puzzle bank with metadata; curriculum sampling without online solving.
-3. **Training Framework (complete)** – SB3 PPO with vectorised envs, YAML config loader, logging, checkpoints; policies include MLP (symbolic), SmallCNN (image), ConvLSTM (DRC-lite prototype).
-4. **Curriculum Training & Evaluation (in progress)** – Run staged curricula on fixed-size RGB observations; evaluate success rate and optimality gap vs solver on held-out sets; produce rollouts/videos.
+1. **Environment & Generator (stabilized baseline)** – Gymnasium reset streams and layout-dependent RGB caches have regression coverage; broader generator-rule validation remains ongoing.
+2. **Solver & Bank Precomputation (usable prototype)** – BFS/A* and bank metadata are useful; bank durability/deduplication is future hardening work.
+3. **Training Framework (Phase 1 baseline)** – Explicit stock-CNN/MLP selection, validated environment propagation, diagnostic run manifests, vector-aware callbacks, pinned direct CI dependencies, and an end-to-end smoke test on the Python 3.11 reference environment.
+4. **Curriculum Training & Evaluation (Phase 1 baseline)** – Deterministic held-out bank splits and non-mutating evaluation are implemented; benchmark-scale multi-seed results are Phase 2.
 5. **Mechanistic Interpretability Suite (planned)** – Activation capture, linear probes, saliency/attribution, feature visualisation, activation patching; summarise findings on plan representations and causal features.
-6. **Profiling & Monitoring (complete)** – Lightweight profiler across env rendering/model forward; monitoring hooks and TensorBoard/W&B metrics to track throughput and resource use.
+6. **Profiling & Monitoring (stabilized baseline)** – Profiling is opt-in; SB3/custom metrics share a configured logger lifecycle and backends close cleanly. Consolidation remains useful future work.
 7. **Documentation & Repo Hygiene (in progress)** – Keep `WorkInProgress.md` current, ensure README/examples stay aligned with the new `src/` + `artifacts/` structure, and consolidate progress notes under `docs/`.
 
 ## Additional Resources
 - `docs/ProgressNotes/`: Day-by-day engineering updates
 - `docs/ComponentSpecifications/`: Detailed component-level specs
 - `docs/AiChatLogs/`: Conversations and decision logs
-

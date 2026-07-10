@@ -9,7 +9,7 @@ def _make_metadata(spec_key: SpecKey, seed: int, optimal_length: int, robots_mov
         seed=seed,
         spec_key=spec_key,
         solver_key=SolverKey(),
-        board_hash=b"0" * 32,
+        board_hash=seed.to_bytes(32, "big"),
         optimal_length=optimal_length,
         robots_moved=robots_moved,
         nodes_expanded=0,
@@ -21,7 +21,7 @@ def _make_metadata(spec_key: SpecKey, seed: int, optimal_length: int, robots_mov
         created_at=0.0,
         run_id="test",
         board_seed=seed,
-        layout_hash=b"1" * 32,
+        layout_hash=(seed + 1).to_bytes(32, "big"),
         layout_blob=None,
     )
 
@@ -116,3 +116,57 @@ def test_stratified_falls_back_to_other_bands_when_requested_band_empty():
         # First band should report the redistributed draw
         assert plan["bands"][0].get("extra_sampled") == 1
 
+
+def test_sampler_seed_replays_and_hash_splits_are_disjoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        bank = PuzzleBank(tmp)
+        spec = SpecKey(16, 16, 4, 2, 2)
+        bank.add_puzzles([
+            _make_metadata(spec, 10_000 + i, optimal_length=1, robots_moved=1)
+            for i in range(100)
+        ])
+
+        sampler = BankSampler(bank, seed=123)
+        first = [sampler.sample_puzzle(spec).seed for _ in range(12)]
+        sampler.reseed(123)
+        replay = [sampler.sample_puzzle(spec).seed for _ in range(12)]
+        assert replay == first
+
+        train = BankSampler(bank, split="train", eval_fraction=0.25, split_seed=9)
+        evaluation = BankSampler(bank, split="eval", eval_fraction=0.25, split_seed=9)
+        train_seeds = {p.seed for p in train.sample_puzzles(spec, 100)}
+        eval_seeds = {p.seed for p in evaluation.sample_puzzles(spec, 100)}
+
+        assert train_seeds
+        assert eval_seeds
+        assert train_seeds.isdisjoint(eval_seeds)
+        assert train_seeds | eval_seeds == {10_000 + i for i in range(100)}
+
+
+def test_append_invalidates_partition_read_cache():
+    with tempfile.TemporaryDirectory() as tmp:
+        bank = PuzzleBank(tmp)
+        spec = SpecKey(16, 16, 4, 2, 2)
+        bank.add_puzzles([_make_metadata(spec, 1, 1, 1)])
+        assert len(bank.get_partition_dataframe(spec)) == 1
+
+        bank.add_puzzles([_make_metadata(spec, 2, 1, 1)])
+
+        assert len(bank.get_partition_dataframe(spec)) == 2
+
+
+def test_layout_split_refuses_rows_without_layout_hash():
+    with tempfile.TemporaryDirectory() as tmp:
+        bank = PuzzleBank(tmp)
+        spec = SpecKey(16, 16, 4, 2, 2)
+        metadata = _make_metadata(spec, 1, 1, 1)
+        metadata.layout_hash = None
+        bank.add_puzzles([metadata])
+
+        sampler = BankSampler(bank, split="train", split_key="layout_hash")
+        try:
+            sampler.sample_puzzle(spec)
+        except ValueError as exc:
+            assert "requires a valid layout_hash" in str(exc)
+        else:
+            raise AssertionError("missing layout_hash should not silently fall back")

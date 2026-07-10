@@ -75,6 +75,9 @@ class TensorBoardBackend:
     def flush(self) -> None:
         self._writer.flush()
 
+    def close(self) -> None:
+        self._writer.close()
+
 
 class WandbBackend:
     def __init__(self, project: str, entity: Optional[str] = None, run_name: Optional[str] = None, tags: Optional[List[str]] = None, config: Optional[dict] = None) -> None:
@@ -159,4 +162,6 @@ class WandbBackend:
         # wandb flushes on log
         return None
 
+    def close(self) -> None:
+        self._wandb.finish()
 

@@ -18,16 +18,21 @@ import json
 import math
 import numbers
 import copy
+import hashlib
+import uuid
+from dataclasses import replace
 import yaml
 from datetime import datetime
 
 from src.env import RicochetRobotsEnv, fixed_layout_v0_one_move, fixed_layouts_v1_four_targets
+from src.env.environment_spec import EnvironmentSpec
 from src.env.curriculum import (
-    create_curriculum_wrapper, create_curriculum_manager, create_default_curriculum, CurriculumConfig,
-    create_bank_curriculum_manager, BankCurriculumWrapper
+    create_curriculum_wrapper, create_curriculum_manager, create_default_curriculum, CurriculumConfig, CurriculumLevel,
+    create_bank_curriculum_manager, create_bank_curriculum_levels, BankCurriculumWrapper
 )
 from src.env.criteria_env import CriteriaFilteredEnv
-from src.env.puzzle_bank import PuzzleBank
+from src.env.puzzle_bank import BankSampler, PuzzleBank
+from src.training.run_manifest import create_run_manifest, write_run_manifest
 try:
     from src.models.policies import SmallCNN  # type: ignore
 except ImportError:
@@ -71,6 +76,9 @@ def build_training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning")
     parser.add_argument("--use_bank_curriculum", action="store_true", help="Use precomputed bank-based curriculum instead of online filtering")
     parser.add_argument("--bank_dir", type=str, default=str(ARTIFACTS_ROOT / "puzzle_bank"), help="Directory of the precomputed puzzle bank")
+    parser.add_argument("--bank-eval-fraction", type=float, default=0.2, help="Stable fraction of bank layouts reserved for evaluation")
+    parser.add_argument("--bank-split-seed", type=int, default=0, help="Seed used for stable hash-based bank splits")
+    parser.add_argument("--bank-split-key", choices=["layout_hash", "board_hash"], default="layout_hash")
     parser.add_argument("--curriculum-config", type=str, help="Path to custom curriculum configuration JSON file")
     parser.add_argument("--curriculum-initial-level", type=int, default=0, help="Initial curriculum level (0-4)")
     parser.add_argument("--curriculum-verbose", action="store_true", default=True, help="Print curriculum progression messages")
@@ -155,6 +163,7 @@ def build_training_parser() -> argparse.ArgumentParser:
     parser.add_argument("--traj-record-freq", type=int, default=2000)
     parser.add_argument("--traj-record-episodes", type=int, default=10)
     # Model options
+    parser.add_argument("--model-type", choices=["stock_cnn", "mlp"], default="stock_cnn")
     parser.add_argument("--small-cnn", action="store_true", help="Use custom SmallCNN feature extractor for image obs")
     parser.add_argument("--convlstm", action="store_true", help="Use sb3-contrib CnnLstmPolicy (baseline recurrent)")
     parser.add_argument("--drc", action="store_true", help="Use sb3-contrib RecurrentPPO with recurrent policy (DRC settings)")
@@ -198,6 +207,17 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     flat: Dict[str, Any] = {}
 
+    def _mapped_section(name: str, mapping: Dict[str, str]) -> Dict[str, Any]:
+        section = data.get(name) or {}
+        if not isinstance(section, dict):
+            raise ValueError(f"'{name}' config must be a mapping")
+        normalized = {_normalize_key(k): v for k, v in section.items()}
+        unknown = set(normalized) - set(mapping)
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise ValueError(f"Unknown {name} configuration keys: {names}")
+        return normalized
+
     # Pass through existing top-level simple keys first (will be overridden by sections if present)
     for k, v in data.items():
         if isinstance(v, dict) and k in ("env", "algo", "model", "curriculum", "eval", "monitoring", "training", "paths"):
@@ -208,9 +228,7 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
         flat[_normalize_key(k)] = v
 
     # env section
-    env = data.get("env") or {}
-    if isinstance(env, dict):
-        mapping = {
+    env_mapping = {
             "mode": "env_mode",
             "height": "height",
             "width": "width",
@@ -227,15 +245,11 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
             "obs_mode": "obs_mode",
             "cell_obs_pixel_size": "cell_obs_pixel_size",
         }
-        for k, v in env.items():
-            dst = mapping.get(_normalize_key(k))
-            if dst:
-                flat[dst] = v
+    for k, v in _mapped_section("env", env_mapping).items():
+        flat[env_mapping[k]] = v
 
     # algo section
-    algo = data.get("algo") or {}
-    if isinstance(algo, dict):
-        mapping = {
+    algo_mapping = {
             "algo": "algo",
             "name": "algo",
             "timesteps": "timesteps",
@@ -257,38 +271,30 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
             "normalize_advantage": "normalize_advantage",
             "device": "device",
         }
-        for k, v in algo.items():
-            dst = mapping.get(_normalize_key(k))
-            if dst:
-                flat[dst] = v
+    for k, v in _mapped_section("algo", algo_mapping).items():
+        flat[algo_mapping[k]] = v
 
     # model section
-    model = data.get("model") or {}
-    if isinstance(model, dict):
-        model_type = model.get("type")
-        if isinstance(model_type, str):
-            mt = model_type.strip().lower()
-            if mt in ("resnet", "convlstm", "drc", "small_cnn"):
-                flat[mt] = True
+    model = _mapped_section("model", {"type": "model_type", "params": "params"})
+    if model:
+        model_type = model.get("type", "stock_cnn")
+        if not isinstance(model_type, str):
+            raise ValueError("model.type must be a string")
+        normalized_model_type = model_type.strip().lower()
+        if normalized_model_type not in {"stock_cnn", "mlp"}:
+            raise ValueError(
+                f"Unsupported model.type '{model_type}' in the Phase 1 baseline; "
+                "supported values are stock_cnn and mlp"
+            )
+        flat["model_type"] = normalized_model_type
         params = model.get("params") or {}
-        if isinstance(params, dict):
-            param_mapping = {
-                "features_dim": "features_dim",
-                "conv_channels": "conv_channels",
-                "lstm_channels": "lstm_channels",
-                "lstm_layers": "lstm_layers",
-                "lstm_repeats": "lstm_repeats",
-            }
-            for k, v in params.items():
-                nk = _normalize_key(k)
-                dst = param_mapping.get(nk)
-                if dst:
-                    flat[dst] = v
+        if not isinstance(params, dict):
+            raise ValueError("model.params must be a mapping")
+        if params:
+            raise ValueError("model.params is not supported by the Phase 1 baseline")
 
     # curriculum section
-    cur = data.get("curriculum") or {}
-    if isinstance(cur, dict):
-        mapping = {
+    curriculum_mapping = {
             "enabled": "curriculum",
             "use_bank": "use_bank_curriculum",
             "bank_dir": "bank_dir",
@@ -299,16 +305,15 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
             "window_size": "curriculum_window_size",
             "check_freq": "curriculum_check_freq",
             "verbose": "curriculum_verbose",
+            "eval_fraction": "bank_eval_fraction",
+            "split_seed": "bank_split_seed",
+            "split_key": "bank_split_key",
         }
-        for k, v in cur.items():
-            dst = mapping.get(_normalize_key(k))
-            if dst:
-                flat[dst] = v
+    for k, v in _mapped_section("curriculum", curriculum_mapping).items():
+        flat[curriculum_mapping[k]] = v
 
     # eval section
-    ev = data.get("eval") or {}
-    if isinstance(ev, dict):
-        mapping = {
+    eval_mapping = {
             "eval_freq": "eval_freq",
             "eval_episodes": "eval_episodes",
             "fixedset": "eval_fixedset",
@@ -316,15 +321,11 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
             "traj_record_freq": "traj_record_freq",
             "traj_record_episodes": "traj_record_episodes",
         }
-        for k, v in ev.items():
-            dst = mapping.get(_normalize_key(k))
-            if dst:
-                flat[dst] = v
+    for k, v in _mapped_section("eval", eval_mapping).items():
+        flat[eval_mapping[k]] = v
 
     # monitoring section
-    mon = data.get("monitoring") or {}
-    if isinstance(mon, dict):
-        mapping = {
+    monitoring_mapping = {
             "log_dir": "log_dir",
             "save_path": "save_path",
             "save_freq": "save_freq",
@@ -335,19 +336,14 @@ def flatten_structured_config(data: Dict[str, Any]) -> Dict[str, Any]:
             "wandb_run_name": "wandb_run_name",
             "wandb_tags": "wandb_tags",
         }
-        for k, v in mon.items():
-            dst = mapping.get(_normalize_key(k))
-            if dst:
-                flat[dst] = v
+    for k, v in _mapped_section("monitoring", monitoring_mapping).items():
+        flat[monitoring_mapping[k]] = v
 
     # optional training/paths sections as aliases
     for sec_name in ("training", "paths"):
-        sec = data.get(sec_name) or {}
-        if isinstance(sec, dict):
-            for k, v in sec.items():
-                nk = _normalize_key(k)
-                if nk in ("log_dir", "save_path", "save_freq", "profile"):
-                    flat[nk] = v
+        aliases = {key: key for key in ("log_dir", "save_path", "save_freq", "profile")}
+        for k, v in _mapped_section(sec_name, aliases).items():
+            flat[aliases[k]] = v
 
     return flat
 def apply_profile_presets(args_dict: Dict[str, Any], profile: str, defaults: Dict[str, Any]) -> None:
@@ -399,6 +395,14 @@ def apply_initialization_overrides(args: argparse.Namespace, init_block: Any) ->
     if not isinstance(init_block, dict):
         raise ValueError("'initialization' config must be a mapping")
 
+    allowed_initialization = {"mode", "vecnormalize_path", "resume", "warmstart"}
+    unknown_initialization = set(init_block) - allowed_initialization
+    if unknown_initialization:
+        raise ValueError(
+            "Unknown initialization configuration keys: "
+            + ", ".join(sorted(unknown_initialization))
+        )
+
     valid_modes = {"fresh", "resume", "warmstart"}
 
     def _clean_optional_path(value: Any, field_name: str) -> str | None:
@@ -422,6 +426,14 @@ def apply_initialization_overrides(args: argparse.Namespace, init_block: Any) ->
     if resume_cfg is not None:
         if not isinstance(resume_cfg, dict):
             raise ValueError("initialization.resume must be a mapping")
+        unknown_resume = set(resume_cfg) - {
+            "checkpoint_path", "vecnormalize_path", "target_total_timesteps", "additional_timesteps"
+        }
+        if unknown_resume:
+            raise ValueError(
+                "Unknown initialization.resume configuration keys: "
+                + ", ".join(sorted(unknown_resume))
+            )
         if "checkpoint_path" in resume_cfg:
             args.resume_checkpoint_path = _clean_optional_path(resume_cfg["checkpoint_path"], "initialization.resume.checkpoint_path")
         if "vecnormalize_path" in resume_cfg:
@@ -443,6 +455,12 @@ def apply_initialization_overrides(args: argparse.Namespace, init_block: Any) ->
     if warmstart_cfg is not None:
         if not isinstance(warmstart_cfg, dict):
             raise ValueError("initialization.warmstart must be a mapping")
+        unknown_warmstart = set(warmstart_cfg) - {"params_path", "vecnormalize_path"}
+        if unknown_warmstart:
+            raise ValueError(
+                "Unknown initialization.warmstart configuration keys: "
+                + ", ".join(sorted(unknown_warmstart))
+            )
         if "params_path" in warmstart_cfg:
             args.warmstart_params_path = _clean_optional_path(warmstart_cfg["params_path"], "initialization.warmstart.params_path")
         if "vecnormalize_path" in warmstart_cfg:
@@ -451,23 +469,12 @@ def apply_initialization_overrides(args: argparse.Namespace, init_block: Any) ->
 def make_env_factory(args: argparse.Namespace) -> Callable[[], RicochetRobotsEnv]:
     """Return a thunk to create an environment instance based on CLI args."""
     mode = args.env_mode
+    environment_spec = EnvironmentSpec.from_namespace(args)
 
     if mode == "v0":
         layout = fixed_layout_v0_one_move()
         def _fn():
-            return RicochetRobotsEnv(
-                height=layout.height,
-                width=layout.width,
-                num_robots=len(layout.robot_positions),
-                fixed_layout=layout,
-                include_noop=args.include_noop,
-                step_penalty=args.step_penalty,
-                goal_reward=args.goal_reward,
-                max_steps=args.max_steps,
-                obs_mode=args.obs_mode,
-                channels_first=True,
-                cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
-            )
+            return RicochetRobotsEnv(**environment_spec.to_env_kwargs(fixed_layout=layout))
         return _fn
 
     if mode == "v1":
@@ -477,40 +484,12 @@ def make_env_factory(args: argparse.Namespace) -> Callable[[], RicochetRobotsEnv
         def _fn():
             counter["i"] = (counter["i"] + 1) % len(layouts)
             layout = layouts[counter["i"]]
-            return RicochetRobotsEnv(
-                height=layout.height,
-                width=layout.width,
-                num_robots=len(layout.robot_positions),
-                fixed_layout=layout,
-                include_noop=args.include_noop,
-                step_penalty=args.step_penalty,
-                goal_reward=args.goal_reward,
-                max_steps=args.max_steps,
-                obs_mode=args.obs_mode,
-                channels_first=True,
-                cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
-            )
+            return RicochetRobotsEnv(**environment_spec.to_env_kwargs(fixed_layout=layout))
         return _fn
 
     # default: random env sampling per episode
     def _fn():
-        return RicochetRobotsEnv(
-            height=args.height,
-            width=args.width,
-            num_robots=args.num_robots,
-            include_noop=args.include_noop,
-            step_penalty=args.step_penalty,
-            goal_reward=args.goal_reward,
-            noop_penalty=args.noop_penalty,
-            max_steps=args.max_steps,
-            seed=args.seed,
-            ensure_solvable=args.ensure_solvable,
-            solver_max_depth=args.solver_max_depth,
-            solver_max_nodes=args.solver_max_nodes,
-            obs_mode=args.obs_mode,
-            channels_first=True,
-            cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
-        )
+        return RicochetRobotsEnv(**environment_spec.to_env_kwargs())
     return _fn
 
 
@@ -518,13 +497,25 @@ def make_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable[[], 
     """Return a thunk to create a curriculum environment instance based on CLI args."""
     # Create base environment factory for curriculum
     base_env_factory = make_env_factory(args)
+    environment_spec = EnvironmentSpec.from_namespace(args)
     
     # Create curriculum configuration
     if args.curriculum_config is not None:
         # Load custom curriculum config from file
         with open(args.curriculum_config, 'r', encoding='utf-8') as f:
             config_data = json.load(f)
-        curriculum_config = CurriculumConfig(**config_data)
+        levels = [
+            level if hasattr(level, "height") else CurriculumLevel(**level)
+            for level in config_data.get("levels", [])
+        ]
+        curriculum_config = CurriculumConfig(
+            levels=levels,
+            success_rate_threshold=config_data.get("success_rate_threshold", 0.8),
+            min_episodes_per_level=config_data.get("min_episodes_per_level", 100),
+            success_rate_window_size=config_data.get("success_rate_window_size", 200),
+            advancement_check_frequency=config_data.get("advancement_check_frequency", 50),
+            max_level=config_data.get("max_level"),
+        )
     else:
         # Use default curriculum with CLI overrides
         curriculum_config = create_default_curriculum()
@@ -533,6 +524,17 @@ def make_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable[[], 
         curriculum_config.min_episodes_per_level = args.curriculum_min_episodes
         curriculum_config.success_rate_window_size = args.curriculum_window_size
         curriculum_config.advancement_check_frequency = args.curriculum_check_freq
+
+    space_signatures = {
+        (level.height, level.width, level.num_robots)
+        for level in curriculum_config.levels
+    }
+    if len(space_signatures) != 1:
+        raise ValueError(
+            "Online curriculum changes board or robot dimensions across levels. "
+            "Phase 1 requires fixed observation and action spaces; use a bank "
+            "curriculum or provide levels with one geometry/robot signature."
+        )
     
     # Create shared curriculum manager
     curriculum_manager = create_curriculum_manager(
@@ -546,6 +548,7 @@ def make_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable[[], 
         return create_curriculum_wrapper(
             base_env_factory=base_env_factory,
             curriculum_manager=curriculum_manager,
+            environment_spec=environment_spec,
             verbose=args.curriculum_verbose
         )
     
@@ -556,6 +559,7 @@ def make_bank_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable
     """Return a thunk to create a bank-based curriculum environment instance based on CLI args."""
     # Initialize puzzle bank
     bank = PuzzleBank(args.bank_dir)
+    environment_spec = EnvironmentSpec.from_namespace(args)
     
     # Load curriculum levels from config file or use defaults
     curriculum_levels = None
@@ -582,6 +586,7 @@ def make_bank_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable
         print(f"Loaded custom curriculum config from {args.curriculum_config} with {len(curriculum_levels)} levels")
     else:
         print("Using default curriculum levels")
+        curriculum_levels = create_bank_curriculum_levels()
     
     # Create bank curriculum manager with CLI thresholds
     print(f"Initial level: {args.curriculum_initial_level}")
@@ -589,6 +594,47 @@ def make_bank_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable
     if args.curriculum_initial_level is not None:
         curriculum_levels = curriculum_levels[args.curriculum_initial_level:]
     print(f"Curriculum levels: {curriculum_levels}")
+    if not curriculum_levels:
+        raise ValueError("Bank curriculum has no levels after applying initial_level")
+    bank_signatures = {
+        (
+            level["spec_key"].num_robots,
+            None if args.obs_mode in {"rgb_image", "rgb_cell_image"} else level["spec_key"].height,
+            None if args.obs_mode in {"rgb_image", "rgb_cell_image"} else level["spec_key"].width,
+        )
+        for level in curriculum_levels
+    }
+    if len(bank_signatures) != 1:
+        raise ValueError(
+            "Bank curriculum levels change the observation or action space. "
+            "Phase 1 requires one robot count and a fixed space for the selected observation mode."
+        )
+    coverage_failures = []
+    for level_index, level in enumerate(curriculum_levels):
+        for split in ("train", "eval"):
+            sampler = BankSampler(
+                bank,
+                seed=args.seed,
+                split=split,
+                eval_fraction=args.bank_eval_fraction,
+                split_seed=args.bank_split_seed,
+                split_key=args.bank_split_key,
+            )
+            sample = sampler.sample_puzzle(
+                spec_key=level["spec_key"],
+                min_optimal_length=level.get("min_optimal_length"),
+                max_optimal_length=level.get("max_optimal_length"),
+                min_robots_moved=level.get("min_robots_moved"),
+                max_robots_moved=level.get("max_robots_moved"),
+            )
+            if sample is None:
+                coverage_failures.append(f"level {level_index} ({level.get('name', 'unnamed')}), split={split}")
+    if coverage_failures:
+        raise ValueError(
+            "Bank split coverage is empty for "
+            + "; ".join(coverage_failures)
+            + ". Generate more puzzles or adjust the split configuration."
+        )
     bank_manager = create_bank_curriculum_manager(
         bank=bank,
         curriculum_levels=curriculum_levels,  # use custom or defaults
@@ -607,10 +653,104 @@ def make_bank_curriculum_env_factory(args: argparse.Namespace) -> tuple[Callable
             channels_first=True,
             render_mode=None,
             cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
+            environment_spec=environment_spec,
+            split="train",
+            eval_fraction=args.bank_eval_fraction,
+            split_seed=args.bank_split_seed,
+            split_key=args.bank_split_key,
             verbose=args.curriculum_verbose,
         )
     
     return _fn, bank_manager
+
+
+def select_policy(args: argparse.Namespace, observation_space: Any) -> tuple[str, Dict[str, Any]]:
+    """Select one explicitly supported Phase 1 policy from the actual space."""
+    legacy = [
+        name
+        for name in ("resnet", "drc", "convlstm", "small_cnn")
+        if bool(getattr(args, name, False))
+    ]
+    if legacy:
+        raise ValueError(
+            "Unsupported legacy model flags in the Phase 1 baseline: " + ", ".join(legacy)
+        )
+
+    model_type = str(getattr(args, "model_type", "stock_cnn"))
+    if model_type == "mlp":
+        if args.obs_mode not in {"symbolic", "image"}:
+            raise ValueError(
+                "mlp is limited to symbolic or legacy plane observations; "
+                "flattened RGB inputs are not a supported Phase 1 baseline"
+            )
+        return "MlpPolicy", {
+            "net_arch": dict(pi=[128, 128], vf=[128, 128]),
+            "normalize_images": False,
+        }
+
+    if model_type != "stock_cnn":
+        raise ValueError(f"Unsupported model type: {model_type}")
+    if args.obs_mode not in {"rgb_image", "rgb_cell_image"}:
+        raise ValueError(
+            "stock_cnn requires rgb_image or rgb_cell_image observations; "
+            "use model.type=mlp for symbolic or legacy plane observations"
+        )
+    shape = tuple(int(v) for v in observation_space.shape)
+    if len(shape) != 3:
+        raise ValueError(f"stock_cnn requires a three-dimensional image space, got {shape}")
+    spatial = shape[1:] if shape[0] in {1, 3, 4} else shape[:2]
+    if min(spatial) < 36:
+        raise ValueError(
+            f"stock_cnn requires image dimensions of at least 36 pixels, got {shape}"
+        )
+    return "CnnPolicy", {
+        "net_arch": dict(pi=[128, 128], vf=[128, 128]),
+        "normalize_images": True,
+    }
+
+
+def callback_frequency(aggregate_timesteps: int, n_envs: int) -> int:
+    """Convert an aggregate-timestep interval to SB3 callback calls.
+
+    Ceiling division ensures the callback is never invoked earlier than the
+    interval requested in configuration.
+    """
+    if aggregate_timesteps <= 0:
+        return 0
+    if n_envs <= 0:
+        raise ValueError("n_envs must be positive")
+    return max(1, math.ceil(aggregate_timesteps / n_envs))
+
+
+def effective_environment_spec(
+    args: argparse.Namespace, curriculum_manager: Any = None
+) -> EnvironmentSpec:
+    """Resolve geometry that wrappers/layouts apply to the experiment spec."""
+    spec = EnvironmentSpec.from_namespace(args)
+    if curriculum_manager is not None:
+        if hasattr(curriculum_manager, "get_current_criteria"):
+            generation = curriculum_manager.get_current_criteria().spec_key
+            return replace(
+                spec,
+                height=generation.height,
+                width=generation.width,
+                num_robots=generation.num_robots,
+            )
+        if hasattr(curriculum_manager, "config"):
+            level = curriculum_manager.config.levels[curriculum_manager.current_level]
+            return replace(
+                spec,
+                height=level.height,
+                width=level.width,
+                num_robots=level.num_robots,
+            )
+    if args.env_mode == "v0":
+        layout = fixed_layout_v0_one_move()
+        return replace(spec, height=layout.height, width=layout.width, num_robots=len(layout.robot_positions))
+    if args.env_mode == "v1":
+        layout = fixed_layouts_v1_four_targets()[0]
+        return replace(spec, height=layout.height, width=layout.width, num_robots=len(layout.robot_positions))
+    return spec
 
 
 def main() -> None:
@@ -743,7 +883,8 @@ def main() -> None:
     make_vec_env = vec_env_mod.make_vec_env
 
     # Timestamp the run and prefix WandB run name and save/checkpoint files
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{uuid.uuid4().hex[:8]}"
+    args.log_dir = os.path.join(args.log_dir, run_timestamp)
     # Prefix wandb run name
     try:
         existing_name = getattr(args, "wandb_run_name", None)
@@ -772,9 +913,6 @@ def main() -> None:
         if args.use_bank_curriculum:
             env_factory, curriculum_manager = make_bank_curriculum_env_factory(args)
             print(f"Bank curriculum enabled (bank_dir={args.bank_dir}) - no solver during training")
-            # Force rgb_image if varying board sizes to keep obs shape fixed
-            if args.obs_mode != "rgb_image":
-                print("Note: For bank curriculum with varying sizes, obs_mode is recommended as 'rgb_image'.")
         else:
             env_factory, curriculum_manager = make_curriculum_env_factory(args)
             print("Online curriculum enabled - will progressively increase difficulty with solver gating")
@@ -849,84 +987,12 @@ def main() -> None:
             )
             vecnorm_used = True
 
-    # Choose policy: for tiny grids (<8), prefer MlpPolicy to avoid NatureCNN kernel issues
-    tiny_grid = False
-    if args.env_mode in ("v0", "v1"):
-        tiny_grid = True
-    else:
-        tiny_grid = min(args.height, args.width) < 8
-    
-    # Validate observation mode and policy compatibility
-    if args.obs_mode == "symbolic" and args.convlstm:
-        raise ValueError("ConvLSTM requires image observations, but symbolic mode was selected")
-    
-    # Policy selection based on observation mode and requirements
-    if args.obs_mode in ["image", "rgb_image", "rgb_cell_image"]:
-        if args.drc:
-            if RecurrentPPO is None:
-                raise ImportError("sb3-contrib is required for recurrent PPO. Please install sb3-contrib.")
-            if DRCRecurrentPolicy is None:
-                raise ImportError("DRC policy class not importable. Ensure models/drc_policy.py is available.")
-            policy = DRCRecurrentPolicy  # type: ignore[assignment]
-            policy_kwargs = dict(
-                features_extractor_kwargs=dict(
-                    # features_dim=args.features_dim,
-                    # conv_channels=args.conv_channels,
-                    # lstm_channels=args.lstm_channels,
-                    # num_lstm_layers=args.lstm_layers,
-                    # num_repeats=args.lstm_repeats,
-                    # use_pool_and_inject=True,
-                ),
-                net_arch=dict(pi=[128, 128], vf=[128, 128]),
-                normalize_images=(args.obs_mode in ("rgb_image", "rgb_cell_image")),
-            )
-        elif args.convlstm:
-            # Until a compliant recurrent policy wired to ConvLSTM features is implemented,
-            # train with sb3-contrib RecurrentPPO using its supported LSTM policies.
-            # This avoids incorrect training of recurrent models with vanilla PPO.
-            if RecurrentPPO is None:
-                raise ImportError("sb3-contrib is required for recurrent PPO. Please install sb3-contrib.")
-            policy = "CnnLstmPolicy"
-            policy_kwargs = dict(
-                net_arch=dict(pi=[128, 128], vf=[128, 128]),
-                normalize_images=(args.obs_mode in ("rgb_image", "rgb_cell_image"))
-            )
-        elif not tiny_grid:
-            # Fallback to CNN for image observations
-            if args.resnet:
-                # Use ResNet baseline features
-                try:
-                    from src.models.resnet import ResNetFeaturesExtractor  # type: ignore
-                except ImportError as _e:
-                    raise ImportError(f"ResNet baseline requested but not available: {_e}")
-                policy = ResNetPolicy
-                policy_kwargs = dict(
-                    # net_arch=dict(pi=[128, 128], vf=[128, 128]),
-                    normalize_images=(args.obs_mode in ("rgb_image", "rgb_cell_image")),
-                    # features_extractor_class=ResNetFeaturesExtractor,
-                    # features_extractor_kwargs=dict(features_dim=args.features_dim),
-
-                )
-            else:
-                policy = "CnnPolicy"
-                policy_kwargs = dict(
-                    net_arch=dict(pi=[128, 128], vf=[128, 128]), 
-                    normalize_images=(args.obs_mode in ("rgb_image", "rgb_cell_image"))  # Normalize RGB images
-                )
-                if SmallCNN is not None and args.small_cnn:
-                    policy_kwargs.update(dict(features_extractor_class=SmallCNN, features_extractor_kwargs=dict(features_dim=128)))
-                elif not args.convlstm:
-                    print("Warning: Using CNN instead of ConvLSTM for image observations. Use --convlstm for ConvLSTM.")
-        else:
-            # Use MLP for very small grids
-            policy = "MlpPolicy"
-            policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]), normalize_images=False)
-    elif args.obs_mode == "symbolic":
-        # Use MLP for symbolic observations
-        policy = "MlpPolicy"
-        policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]), normalize_images=False)
-    else:
-        raise ValueError(f"Unknown observation mode: {args.obs_mode}")
+    policy, policy_kwargs = select_policy(args, vec_env.observation_space)
+    print(
+        "Resolved policy contract: "
+        f"model_type={args.model_type}, policy={policy}, "
+        f"observation_space={vec_env.observation_space}, action_space={vec_env.action_space}"
+    )
 
     # Schedule factories for LR and clip_range
     def _make_schedule(kind: str, start: float, end: float) -> Callable[[float], float] | float:
@@ -964,9 +1030,7 @@ def main() -> None:
         except Exception as exc:
             raise RuntimeError(f"Failed to load model from {checkpoint_path}: {exc}")
     else:
-        if args.convlstm or args.drc:
-            # Use sb3-contrib RecurrentPPO for recurrent training
-            model = RecurrentPPO(  # type: ignore[operator]
+        model = PPO(
                 policy,
                 vec_env,
                 learning_rate=lr_value,
@@ -981,27 +1045,7 @@ def main() -> None:
                 ent_coef=args.ent_coef,
                 policy_kwargs=policy_kwargs,
                 normalize_advantage=args.normalize_advantage,
-                tensorboard_log=args.log_dir,
-                device=args.device,
-                verbose=1,
-            )
-        else:
-            model = PPO(
-                policy,
-                vec_env,
-                learning_rate=lr_value,
-                n_steps=args.n_steps,
-                batch_size=args.batch_size,
-                n_epochs=args.n_epochs,
-                gamma=args.gamma,
-                clip_range=clip_value,
-                gae_lambda=args.gae_lambda,
-                vf_coef=args.vf_coef,
-                max_grad_norm=args.max_grad_norm,
-                ent_coef=args.ent_coef,
-                policy_kwargs=policy_kwargs,
-                normalize_advantage=args.normalize_advantage,
-                tensorboard_log=args.log_dir,
+                tensorboard_log=args.log_dir if args.monitor_tensorboard else None,
                 device=args.device,
                 verbose=1,
             )
@@ -1019,6 +1063,14 @@ def main() -> None:
 
     if model is None:
         raise RuntimeError("Model initialisation failed")
+
+    # Configure SB3's logger before installing custom output formats. Newer
+    # SB3 versions otherwise create the logger only inside ``learn()``.
+    from stable_baselines3.common.logger import configure as _configure_sb3_logger
+    logger_formats = ["stdout"]
+    if args.monitor_tensorboard:
+        logger_formats.append("tensorboard")
+    model.set_logger(_configure_sb3_logger(args.log_dir, logger_formats))
 
     reset_num_timesteps = True
     learn_timesteps = max(0, int(args.timesteps))
@@ -1044,9 +1096,47 @@ def main() -> None:
         # Warmstart keeps optimiser fresh but uses pre-trained weights
         print(f"Warmstart initialisation complete; training for {learn_timesteps} timesteps from scratch schedule")
 
+    requested_environment_spec = EnvironmentSpec.from_namespace(args)
+    resolved_environment_spec = effective_environment_spec(args, curriculum_manager)
+    bank_split_manifest = None
+    if args.curriculum and args.use_bank_curriculum:
+        bank_manifest_path = Path(args.bank_dir) / "manifest.json"
+        manifest_sha256 = None
+        if bank_manifest_path.exists():
+            manifest_sha256 = hashlib.sha256(bank_manifest_path.read_bytes()).hexdigest()
+        bank_split_manifest = {
+            "directory": str(args.bank_dir),
+            "manifest_sha256": manifest_sha256,
+            "training_split": "train",
+            "evaluation_split": "eval",
+            "eval_fraction": args.bank_eval_fraction,
+            "split_seed": args.bank_split_seed,
+            "split_key": args.bank_split_key,
+        }
+    run_manifest = create_run_manifest(
+        project_root=PROJECT_ROOT,
+        requested_environment_spec=requested_environment_spec,
+        effective_environment_spec=resolved_environment_spec,
+        model_type=args.model_type,
+        policy=policy,
+        policy_kwargs=policy_kwargs,
+        observation_space=vec_env.observation_space,
+        action_space=vec_env.action_space,
+        initial_timesteps=int(getattr(model, "num_timesteps", 0)),
+        requested_additional_timesteps=learn_timesteps,
+        target_total_timesteps=int(getattr(model, "num_timesteps", 0)) + learn_timesteps,
+        seed=args.seed,
+        resolved_config=vars(args).copy(),
+        bank_split=bank_split_manifest,
+    )
+    run_manifest_path = Path(args.log_dir) / "run_manifest.json"
+    write_run_manifest(run_manifest_path, run_manifest)
+    print(f"Wrote resolved run manifest to {run_manifest_path}")
+
     # Callbacks: periodic checkpoint and eval success-rate logging + monitoring hub
     callbacks = []
     # Monitoring hub setup
+    native_metric_backends = []
     try:
         from src.monitoring import MonitoringHub, TensorBoardBackend, WandbBackend
         from src.monitoring.collectors import EpisodeStatsCollector, ActionUsageCollector, CurriculumProgressCollector
@@ -1058,7 +1148,9 @@ def main() -> None:
                 print("Warning: TensorBoard not available; disabling TB backend")
         if args.monitor_wandb:
             try:
-                monitoring_backends.append(WandbBackend(project=(args.wandb_project or "ricochet-robots"), entity=args.wandb_entity, run_name=args.wandb_run_name, tags=args.wandb_tags, config={"args": vars(args)}))
+                wandb_backend = WandbBackend(project=(args.wandb_project or "ricochet-robots"), entity=args.wandb_entity, run_name=args.wandb_run_name, tags=args.wandb_tags, config={"args": vars(args)})
+                monitoring_backends.append(wandb_backend)
+                native_metric_backends.append(wandb_backend)
             except ImportError:
                 print("Warning: wandb requested but not available; skipping")
         if not monitoring_backends:
@@ -1075,12 +1167,13 @@ def main() -> None:
     try:
         from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
         from stable_baselines3.common.env_util import make_vec_env as _make
+        from stable_baselines3.common.vec_env import sync_envs_normalization
 
-        if hub is not None and hasattr(model, "logger"):
+        if native_metric_backends and hasattr(model, "logger"):
             # Version-agnostic writer: accepts both (kvs, step) and (kvs, key_excluded, step)
             class _HubSB3Writer:
-                def __init__(self, hub_ref):
-                    self._hub = hub_ref
+                def __init__(self, backends):
+                    self._backends = backends
 
                 def write(self, *args, **kwargs) -> None:
                     # Extract kvs and step across SB3 versions
@@ -1111,10 +1204,11 @@ def main() -> None:
                             continue
                         if not math.isfinite(scalar):
                             continue
-                        try:
-                            self._hub.log_scalar(key, scalar, step_value)
-                        except Exception:
-                            pass
+                        for backend in self._backends:
+                            try:
+                                backend.record_scalar(key, scalar, step_value)
+                            except Exception:
+                                pass
 
                 def write_sequence(self, *args, **kwargs) -> None:
                     return None
@@ -1123,7 +1217,7 @@ def main() -> None:
                     return None
 
             try:
-                model.logger.output_formats.append(_HubSB3Writer(hub))
+                model.logger.output_formats.append(_HubSB3Writer(native_metric_backends))
             except Exception:
                 pass
 
@@ -1253,6 +1347,7 @@ def main() -> None:
                         infos = []
                     rewards = self.locals.get('rewards', [])  # type: ignore[assignment]
                     dones = self.locals.get('dones', [])  # type: ignore[assignment]
+                    actions = self.locals.get('actions', [])  # type: ignore[assignment]
                     if hasattr(rewards, 'tolist'):
                         rewards_seq = rewards.tolist()
                     else:
@@ -1261,6 +1356,24 @@ def main() -> None:
                         dones_seq = dones.tolist()
                     else:
                         dones_seq = list(dones) if isinstance(dones, (list, tuple)) else []
+                    if hasattr(actions, 'tolist'):
+                        actions_seq = actions.tolist()
+                    else:
+                        actions_seq = list(actions) if isinstance(actions, (list, tuple)) else []
+
+                    for action in actions_seq:
+                        try:
+                            action_value = int(action)
+                            hub.on_step({
+                                'global_step': self.num_timesteps,
+                                'last_action': action_value,
+                                'last_action_is_noop': bool(
+                                    args.include_noop
+                                    and action_value == int(vec_env.action_space.n) - 1
+                                ),
+                            })
+                        except (TypeError, ValueError, AttributeError):
+                            continue
 
                     # Emit a one-time note explaining success metrics to the monitoring streams.
                     if not self._note_emitted:
@@ -1405,6 +1518,8 @@ def main() -> None:
 
         # Wrap separate eval env
         if args.eval_freq > 0:
+            adaptive_eval_training_manager = None
+            adaptive_eval_manager = None
             # When curriculum is enabled, mirror the training env at the current level
             if args.curriculum and curriculum_manager is not None:
                 # For bank curriculum, use the same environment factory
@@ -1413,7 +1528,6 @@ def main() -> None:
                     # Old online curriculum system
                     current_level = curriculum_manager.get_current_level()
                     frozen_cfg = copy.deepcopy(curriculum_manager.config)
-                    frozen_cfg.max_level = current_level
                     # Build a dedicated eval curriculum manager starting at the frozen level
                     frozen_manager = create_curriculum_manager(
                         curriculum_config=frozen_cfg,
@@ -1425,12 +1539,45 @@ def main() -> None:
                         return create_curriculum_wrapper(
                             base_env_factory=make_env_factory(args),
                             curriculum_manager=frozen_manager,
+                            environment_spec=EnvironmentSpec.from_namespace(args),
+                            track_curriculum=False,
                             verbose=args.curriculum_verbose,
                         )
                     eval_env = _make(_eval_env_factory, n_envs=1, seed=args.seed)
+                    adaptive_eval_training_manager = curriculum_manager
+                    adaptive_eval_manager = frozen_manager
                 else:
-                    # Bank curriculum system - use same factory
-                    eval_env = _make(env_factory, n_envs=1, seed=args.seed)
+                    # Bank evaluation gets its own immutable manager and a
+                    # disjoint deterministic split. It must never write into
+                    # the training curriculum state.
+                    eval_manager = create_bank_curriculum_manager(
+                        bank=curriculum_manager.bank,
+                        curriculum_levels=copy.deepcopy(curriculum_manager.curriculum_levels),
+                        success_rate_threshold=curriculum_manager.success_rate_threshold,
+                        min_episodes_per_level=curriculum_manager.min_episodes_per_level,
+                        success_rate_window_size=curriculum_manager.success_rate_window_size,
+                        advancement_check_frequency=curriculum_manager.advancement_check_frequency,
+                        verbose=False,
+                    )
+                    eval_manager.current_level = curriculum_manager.current_level
+                    adaptive_eval_training_manager = curriculum_manager
+                    adaptive_eval_manager = eval_manager
+                    eval_spec = EnvironmentSpec.from_namespace(args)
+
+                    def _bank_eval_env_factory():
+                        return BankCurriculumWrapper(
+                            bank=curriculum_manager.bank,
+                            curriculum_manager=eval_manager,
+                            environment_spec=eval_spec,
+                            split="eval",
+                            eval_fraction=args.bank_eval_fraction,
+                            split_seed=args.bank_split_seed,
+                            split_key=args.bank_split_key,
+                            track_curriculum=False,
+                            verbose=False,
+                        )
+
+                    eval_env = _make(_bank_eval_env_factory, n_envs=1, seed=args.seed)
             else:
                 # Standard (non-curriculum) eval env
                 eval_env = _make(make_env_factory(args), n_envs=1, seed=args.seed)
@@ -1441,17 +1588,23 @@ def main() -> None:
                     eval_env,
                     training=False,
                     norm_obs=args.vecnorm_norm_obs,
-                    norm_reward=args.vecnorm_norm_reward,
+                    norm_reward=False,
                     clip_obs=args.vecnorm_clip_obs,
                     clip_reward=args.vecnorm_clip_reward,
                 )
-                # Sync running stats
-                if hasattr(vec_env, 'obs_rms'):
-                    eval_env.obs_rms = vec_env.obs_rms  # type: ignore[attr-defined]
-                if hasattr(vec_env, 'ret_rms'):
-                    eval_env.ret_rms = vec_env.ret_rms  # type: ignore[attr-defined]
-            eval_cb = EvalCallback(eval_env, best_model_save_path=(os.path.dirname(args.save_path) or "."),
-                                   log_path=args.log_dir, eval_freq=args.eval_freq,
+                sync_envs_normalization(vec_env, eval_env)
+
+            class _SynchronizedEvalCallback(EvalCallback):
+                def _on_step(self) -> bool:
+                    if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+                        if adaptive_eval_training_manager is not None and adaptive_eval_manager is not None:
+                            current_level = adaptive_eval_training_manager.current_level
+                            self.eval_env.env_method("sync_curriculum_level", current_level)
+                        sync_envs_normalization(self.training_env, self.eval_env)
+                    return super()._on_step()
+
+            eval_cb = _SynchronizedEvalCallback(eval_env, best_model_save_path=(os.path.dirname(args.save_path) or "."),
+                                   log_path=args.log_dir, eval_freq=callback_frequency(args.eval_freq, args.n_envs),
                                    n_eval_episodes=args.eval_episodes, deterministic=True, render=False)
             callbacks.append(eval_cb)
             if hub is not None:
@@ -1524,7 +1677,9 @@ def main() -> None:
                         v_walls = _np.array(layout_dict["v_walls"], dtype=bool)
                         goal = tuple(layout_dict["goal_position"])  # type: ignore
                         fl = FixedLayout(height=h, width=w, h_walls=h_walls, v_walls=v_walls, robot_positions=robots, goal_position=goal, target_robot=tr)
-                        return RicochetRobotsEnv(fixed_layout=fl, obs_mode=args.obs_mode, channels_first=True)
+                        return RicochetRobotsEnv(
+                            **EnvironmentSpec.from_namespace(args).to_env_kwargs(fixed_layout=fl)
+                        )
                     solver_cache = SolverCache.load(args.solver_cache)
                     fixed_eval = FixedSetEvaluator(fixedset=fixedset, episodes=args.eval_episodes)
                     gap_eval = OptimalityGapEvaluator(fixedset=fixedset, solver_cache=solver_cache, solver_limits={"max_depth": args.solver_max_depth, "max_nodes": args.solver_max_nodes}, skip_unsolved=True)
@@ -1532,6 +1687,7 @@ def main() -> None:
                     class _HubEvalForward(BaseCallback):
                         def __init__(self, verbose=0):
                             super().__init__(verbose)
+                            self._last_eval = 0
                             self._last_traj_dump = 0
                             self._renderer = None
                             try:
@@ -1540,9 +1696,10 @@ def main() -> None:
                             except Exception:
                                 self._renderer = None
                         def _on_step(self) -> bool:
-                            if self.num_timesteps % args.eval_freq == 0:
+                            if self.num_timesteps - self._last_eval >= args.eval_freq:
                                 fixed_eval.evaluate(hub, _make_env_from_layout, self.model, step=self.num_timesteps)
                                 gap_eval.evaluate(hub, _make_env_from_layout, self.model, step=self.num_timesteps)
+                                self._last_eval = self.num_timesteps
                             # Trajectory recorder on its own cadence using a standard training env factory
                             if args.traj_record_freq > 0 and (self.num_timesteps - self._last_traj_dump) >= args.traj_record_freq:
                                 # Capture RGB frames for video logging
@@ -1582,10 +1739,13 @@ def main() -> None:
                                                 return BankCurriculumWrapper(
                                                     bank=bank_obj,
                                                     curriculum_manager=mgr,
-                                                    obs_mode=(args.obs_mode if args.obs_mode in ("image", "rgb_image", "rgb_cell_image", "symbolic") else "rgb_image"),
-                                                    channels_first=True,
+                                                    environment_spec=EnvironmentSpec.from_namespace(args),
+                                                    split="eval",
+                                                    eval_fraction=args.bank_eval_fraction,
+                                                    split_seed=args.bank_split_seed,
+                                                    split_key=args.bank_split_key,
+                                                    track_curriculum=False,
                                                     render_mode=None,
-                                                    cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
                                                     verbose=False,
                                                 )
                                             rec_level = TrajectoryRecorder(episodes=1, capture_render=True, renderer=self._renderer)
@@ -1718,10 +1878,13 @@ def main() -> None:
                                                 return BankCurriculumWrapper(
                                                     bank=bank_obj,
                                                     curriculum_manager=mgr,
-                                                    obs_mode=(args.obs_mode if args.obs_mode in ("image", "rgb_image", "rgb_cell_image", "symbolic") else "rgb_image"),
-                                                    channels_first=True,
+                                                    environment_spec=EnvironmentSpec.from_namespace(args),
+                                                    split="eval",
+                                                    eval_fraction=args.bank_eval_fraction,
+                                                    split_seed=args.bank_split_seed,
+                                                    split_key=args.bank_split_key,
+                                                    track_curriculum=False,
                                                     render_mode=None,
-                                                    cell_obs_pixel_size=getattr(args, "cell_obs_pixel_size", 128),
                                                     verbose=False,
                                                 )
                                             rec_level = TrajectoryRecorder(episodes=1, capture_render=True, renderer=self._renderer)
@@ -1754,7 +1917,7 @@ def main() -> None:
                 except Exception as e:
                     print(f"Warning: Failed to configure trajectory recorder: {e}")
         if args.save_freq > 0:
-            ckpt_cb = CheckpointCallback(save_freq=args.save_freq, save_path=(os.path.dirname(args.save_path) or "."),
+            ckpt_cb = CheckpointCallback(save_freq=callback_frequency(args.save_freq, args.n_envs), save_path=(os.path.dirname(args.save_path) or "."),
                                          name_prefix=os.path.basename(args.save_path))
             callbacks.append(ckpt_cb)
     except ImportError:
@@ -1778,6 +1941,9 @@ def main() -> None:
         print("No training timesteps requested; skipping model.learn().")
     
     model.save(args.save_path)
+    run_manifest["timesteps"]["final_total"] = int(getattr(model, "num_timesteps", 0))
+    run_manifest["completed_at"] = datetime.now().astimezone().isoformat()
+    write_run_manifest(run_manifest_path, run_manifest)
     # Save VecNormalize statistics if used
     if vecnorm_used and _VecNormalize is not None:
         try:

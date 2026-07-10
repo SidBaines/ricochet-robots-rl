@@ -28,9 +28,11 @@ def test_drc_features_extractor_shapes_cpu():
     assert features.shape == (B, 128)
     assert isinstance(state, list)
     assert len(state) == 3
+    with torch.no_grad():
+        encoded = extractor.encoder(obs)
     for h, c in state:
-        assert h.shape == (B, 32, H, W)
-        assert c.shape == (B, 32, H, W)
+        assert h.shape == (B, 32, encoded.shape[-2], encoded.shape[-1])
+        assert c.shape == (B, 32, encoded.shape[-2], encoded.shape[-1])
 
 
 def test_drc_state_persistence_and_repeats_effect():
@@ -116,5 +118,4 @@ def test_drcstack_shapes_direct():
     for h, c in zip(h_list, c_list):
         assert h.shape == (B, C, H, W)
         assert c.shape == (B, C, H, W)
-
 

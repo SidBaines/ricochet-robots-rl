@@ -16,6 +16,7 @@ from .puzzle_bank import (
     create_fixed_layout_from_seed
 )
 from .ricochet_env import RicochetRobotsEnv, FixedLayout, GymEnvBase
+from .environment_spec import EnvironmentSpec
 
 
 @dataclass
@@ -81,6 +82,15 @@ class CriteriaFilteredEnv(GymEnvBase):
         allow_fallback: bool = False,
         max_steps: Optional[int] = None,
         cell_obs_pixel_size: Optional[int] = None,
+        step_penalty: float = -0.01,
+        goal_reward: float = 1.0,
+        noop_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        environment_spec: Optional[EnvironmentSpec] = None,
+        split: str = "all",
+        eval_fraction: float = 0.2,
+        split_seed: int = 0,
+        split_key: str = "layout_hash",
     ):
         """Initialize criteria-filtered environment.
         
@@ -94,16 +104,43 @@ class CriteriaFilteredEnv(GymEnvBase):
         """
         self.bank = bank
         self.criteria = criteria
-        self.obs_mode = obs_mode
-        self.channels_first = channels_first
-        self.include_noop = include_noop
+        if environment_spec is None:
+            environment_spec = EnvironmentSpec(
+                height=criteria.spec_key.height,
+                width=criteria.spec_key.width,
+                num_robots=criteria.spec_key.num_robots,
+                include_noop=include_noop,
+                step_penalty=step_penalty,
+                goal_reward=goal_reward,
+                noop_penalty=noop_penalty,
+                max_steps=10 if max_steps is None else max_steps,
+                seed=seed,
+                ensure_solvable=False,
+                obs_mode=obs_mode,
+                channels_first=channels_first,
+                cell_obs_pixel_size=128 if cell_obs_pixel_size is None else cell_obs_pixel_size,
+            )
+        self.environment_spec = environment_spec
+        self.obs_mode = environment_spec.obs_mode
+        self.channels_first = environment_spec.channels_first
+        self.include_noop = environment_spec.include_noop
         self.verbose = verbose
         self.allow_fallback = allow_fallback
-        self.max_steps = max_steps
-        self.cell_obs_pixel_size = cell_obs_pixel_size
+        self.max_steps = environment_spec.max_steps
+        self.cell_obs_pixel_size = environment_spec.cell_obs_pixel_size
+        self.split = split
+        self.render_mode = render_mode
         
         # Initialize sampler
-        self.sampler = BankSampler(bank, sampling_strategy="uniform")
+        self.sampler = BankSampler(
+            bank,
+            sampling_strategy="uniform",
+            seed=environment_spec.seed,
+            split=split,
+            eval_fraction=eval_fraction,
+            split_seed=split_seed,
+            split_key=split_key,
+        )
         
         # Current puzzle metadata
         self._current_metadata: Optional[PuzzleMetadata] = None
@@ -116,11 +153,20 @@ class CriteriaFilteredEnv(GymEnvBase):
         # Episode step counter (for optimality gap without online solving)
         self._episode_steps: int = 0
         
-        # Create initial environment
-        self._create_current_env()
+        # Construct only the spaces here. Sampling begins on the first reset so
+        # initialization does not consume and discard a puzzle.
+        self._current_env = RicochetRobotsEnv(
+            **self.environment_spec.to_env_kwargs(
+                height=self.criteria.spec_key.height,
+                width=self.criteria.spec_key.width,
+                num_robots=self.criteria.spec_key.num_robots,
+                edge_t_per_quadrant=self.criteria.spec_key.edge_t_per_quadrant,
+                central_l_per_quadrant=self.criteria.spec_key.central_l_per_quadrant,
+                render_mode=self.render_mode,
+            )
+        )
         
         # Set up render mode
-        self.render_mode = render_mode
         if self.render_mode is not None and self.render_mode not in ["ascii", "rgb"]:
             raise ValueError(f"Unsupported render_mode {self.render_mode}")
     
@@ -164,13 +210,10 @@ class CriteriaFilteredEnv(GymEnvBase):
             
             # Create environment with fixed layout
             self._current_env = RicochetRobotsEnv(
-                fixed_layout=fixed_layout,
-                obs_mode=self.obs_mode,
-                channels_first=self.channels_first,
-                include_noop=self.include_noop,
-                render_mode=self.render_mode,
-            cell_obs_pixel_size=self.cell_obs_pixel_size,
-                # max_steps=self.max_steps
+                **self.environment_spec.to_env_kwargs(
+                    fixed_layout=fixed_layout,
+                    render_mode=self.render_mode,
+                )
             )
             
         except Exception as e:
@@ -189,18 +232,15 @@ class CriteriaFilteredEnv(GymEnvBase):
         
         # Create a simple environment with the spec
         self._current_env = RicochetRobotsEnv(
-            height=self.criteria.spec_key.height,
-            width=self.criteria.spec_key.width,
-            num_robots=self.criteria.spec_key.num_robots,
-            edge_t_per_quadrant=self.criteria.spec_key.edge_t_per_quadrant,
-            central_l_per_quadrant=self.criteria.spec_key.central_l_per_quadrant,
-            ensure_solvable=True,  # Fallback to solvable generation
-            obs_mode=self.obs_mode,
-            channels_first=self.channels_first,
-            include_noop=self.include_noop,
-            render_mode=self.render_mode,
-            cell_obs_pixel_size=self.cell_obs_pixel_size,
-            # max_steps=self.max_steps
+            **self.environment_spec.to_env_kwargs(
+                height=self.criteria.spec_key.height,
+                width=self.criteria.spec_key.width,
+                num_robots=self.criteria.spec_key.num_robots,
+                edge_t_per_quadrant=self.criteria.spec_key.edge_t_per_quadrant,
+                central_l_per_quadrant=self.criteria.spec_key.central_l_per_quadrant,
+                ensure_solvable=True,
+                render_mode=self.render_mode,
+            )
         )
         
         self._current_metadata = None
@@ -209,17 +249,20 @@ class CriteriaFilteredEnv(GymEnvBase):
         """Reset environment and return initial observation.
         
         Args:
-            seed: Random seed (ignored for bank-based sampling)
+            seed: Restarts the deterministic bank-sampling stream when provided
             options: Additional options (ignored)
             
         Returns:
             (observation, info) tuple
         """
+        if seed is not None:
+            self.sampler.reseed(seed)
+
         # Create new environment for this episode
         self._create_current_env()
         
         # Reset environment
-        obs, info = self._current_env.reset()
+        obs, info = self._current_env.reset(seed=seed)
         # Reset step counter at start of episode
         self._episode_steps = 0
         

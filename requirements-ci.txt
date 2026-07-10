@@ -1,0 +1,15 @@
+# Pinned direct dependencies for the Python 3.11 CI reference environment.
+# This is not a hash-locked transitive dependency graph.
+gymnasium==1.3.0
+numpy==2.5.1
+pandas==3.0.3
+psutil==7.2.2
+pyarrow==25.0.0
+pytest==9.1.1
+PyYAML==6.0.3
+ruff==0.15.21
+sb3-contrib==2.9.0
+stable-baselines3==2.9.0
+tensorboard==2.21.0
+torch==2.13.0
+tqdm==4.68.4

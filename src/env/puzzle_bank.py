@@ -313,6 +313,9 @@ class PuzzleBank:
                     combined_df.to_csv(partition_path, index=False)
                 else:
                     df.to_csv(partition_path, index=False)
+
+            # Readers must see rows appended after the first cached query.
+            self._partition_df_cache.pop(partition_path, None)
             
             # Update manifest
             partition_key = spec_key.to_partition_key()
@@ -473,7 +476,16 @@ class PuzzleBank:
 class BankSampler:
     """Sampler for retrieving puzzles from the bank during training."""
     
-    def __init__(self, bank: PuzzleBank, sampling_strategy: str = "uniform"):
+    def __init__(
+        self,
+        bank: PuzzleBank,
+        sampling_strategy: str = "uniform",
+        seed: Optional[int] = None,
+        split: str = "all",
+        eval_fraction: float = 0.2,
+        split_seed: int = 0,
+        split_key: str = "layout_hash",
+    ):
         """Initialize bank sampler.
         
         Args:
@@ -482,13 +494,49 @@ class BankSampler:
         """
         self.bank = bank
         self.sampling_strategy = sampling_strategy
+        if split not in {"all", "train", "eval"}:
+            raise ValueError(f"Unknown bank split: {split}")
+        if not 0.0 < eval_fraction < 1.0:
+            raise ValueError("eval_fraction must be in (0, 1)")
+        if split_key not in {"layout_hash", "board_hash"}:
+            raise ValueError("split_key must be 'layout_hash' or 'board_hash'")
+        self.seed = seed
+        self.split = split
+        self.eval_fraction = float(eval_fraction)
+        self.split_seed = int(split_seed)
+        self.split_key = split_key
         # Cache of pre-filtered, shuffled views for fast per-episode sampling
         # key -> { 'df': DataFrame, 'order': np.ndarray[int], 'pos': int, 'rng': np.random.Generator }
-        self._criteria_cache: Dict[Tuple[str, int, int, int, int], Dict[str, Any]] = {}
-        self._cache_order: List[Tuple[str, int, int, int, int]] = []
+        self._criteria_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._cache_order: List[Tuple[Any, ...]] = []
         self._max_cache_entries: int = 128
         # Monitoring
         self._last_stratified_plan: Optional[Dict[str, Any]] = None
+
+    def reseed(self, seed: Optional[int]) -> None:
+        """Restart every cached sampling stream from ``seed``."""
+        self.seed = seed
+        self._criteria_cache.clear()
+        self._cache_order.clear()
+
+    def _split_mask(self, df: "pd.DataFrame") -> "pd.Series":
+        """Return stable hash-based split membership independent of row order."""
+        if self.split == "all":
+            return pd.Series([True] * len(df), index=df.index)
+
+        values = []
+        for _, row in df.iterrows():
+            value = row.get(self.split_key)
+            if value is None or str(value).strip() in {"", "nan", "None"}:
+                raise ValueError(
+                    f"Bank split requires a valid {self.split_key} for every row; "
+                    "refusing to weaken the declared isolation contract"
+                )
+            digest = hashlib.sha256(f"{self.split_seed}:{value}".encode("utf-8")).digest()
+            fraction = int.from_bytes(digest[:8], "big") / float(2**64)
+            values.append(fraction < self.eval_fraction)
+        is_eval = pd.Series(values, index=df.index)
+        return is_eval if self.split == "eval" else ~is_eval
 
     def _criteria_key(
         self,
@@ -497,12 +545,21 @@ class BankSampler:
         max_optimal_length: Optional[int],
         min_robots_moved: Optional[int],
         max_robots_moved: Optional[int],
-    ) -> Tuple[str, int, int, int, int]:
+        random_seed: Optional[int],
+    ) -> Tuple[Any, ...]:
         # Use partition string plus numeric bounds (None -> sentinel -1)
         part = spec_key.to_partition_key()
         def _n(v: Optional[int]) -> int:
             return -1 if v is None else int(v)
-        return (part, _n(min_optimal_length), _n(max_optimal_length), _n(min_robots_moved), _n(max_robots_moved))
+        effective_seed = self.seed if random_seed is None else random_seed
+        return (
+            part,
+            _n(min_optimal_length),
+            _n(max_optimal_length),
+            _n(min_robots_moved),
+            _n(max_robots_moved),
+            effective_seed,
+        )
 
     def _get_or_build_iterator(
         self,
@@ -513,7 +570,14 @@ class BankSampler:
         max_robots_moved: Optional[int],
         random_seed: Optional[int],
     ) -> Optional[Dict[str, Any]]:
-        key = self._criteria_key(spec_key, min_optimal_length, max_optimal_length, min_robots_moved, max_robots_moved)
+        key = self._criteria_key(
+            spec_key,
+            min_optimal_length,
+            max_optimal_length,
+            min_robots_moved,
+            max_robots_moved,
+            random_seed,
+        )
         it = self._criteria_cache.get(key)
         if it is None:
             # Build filtered DataFrame from cached partition
@@ -529,11 +593,12 @@ class BankSampler:
                 mask &= df['robots_moved'] >= min_robots_moved
             if max_robots_moved is not None:
                 mask &= df['robots_moved'] <= max_robots_moved
+            mask &= self._split_mask(df)
             filtered = df[mask]
             if len(filtered) == 0:
                 return None
             # Initialize RNG and shuffled order
-            rng = np.random.default_rng(random_seed)
+            rng = np.random.default_rng(self.seed if random_seed is None else random_seed)
             order = np.arange(len(filtered))
             rng.shuffle(order)
             it = {"df": filtered.reset_index(drop=True), "order": order, "pos": 0, "rng": rng}
@@ -641,7 +706,8 @@ class BankSampler:
         """
         if total_count <= 0 or len(bands) == 0:
             return []
-        rng = np.random.default_rng(random_seed)
+        effective_seed = self.seed if random_seed is None else random_seed
+        rng = np.random.default_rng(effective_seed)
         weights = np.array([float(b.get("weight", 1.0)) for b in bands], dtype=float)
         weights = np.maximum(weights, 0.0)
         if weights.sum() <= 0:
@@ -677,10 +743,12 @@ class BankSampler:
                 "weight": float(band.get("weight", 1.0)),
             })
             # Precompute the iterator seed so fallback sampling remains deterministic
-            if random_seed is None:
+            if effective_seed is None:
                 band_seeds.append(int(rng.integers(0, 2**31 - 1)))
             else:
-                band_seeds.append(int(random_seed))
+                # Derive separate deterministic streams so overlapping bands do
+                # not all traverse their filtered rows in the same order.
+                band_seeds.append(int(rng.integers(0, 2**31 - 1)))
 
         plan_details: List[Dict[str, Any]] = []
         out: List[PuzzleMetadata] = []

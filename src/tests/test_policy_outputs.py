@@ -35,7 +35,7 @@ def test_policy_output_shapes():
     obs, _ = env_img.reset()
     action, _ = model_img.predict(obs, deterministic=True)
     
-    assert isinstance(action, (int, np.integer))
+    assert np.asarray(action).shape == ()
     assert 0 <= action < env_img.action_space.n
     
     # Test symbolic obs with MlpPolicy
@@ -50,7 +50,7 @@ def test_policy_output_shapes():
     obs, _ = env_sym.reset()
     action, _ = model_sym.predict(obs, deterministic=True)
     
-    assert isinstance(action, (int, np.integer))
+    assert np.asarray(action).shape == ()
     assert 0 <= action < env_sym.action_space.n
 
 
@@ -84,7 +84,7 @@ def test_small_cnn_policy():
     obs, _ = env.reset()
     action, _ = model.predict(obs, deterministic=True)
     
-    assert isinstance(action, (int, np.integer))
+    assert np.asarray(action).shape == ()
     assert 0 <= action < env.action_space.n
 
 

@@ -10,6 +10,7 @@ class LoggerBackend(Protocol):
     def record_text(self, key: str, text: str, step: Optional[int] = None) -> None: ...
     def record_image(self, key: str, image: Any, step: Optional[int] = None) -> None: ...
     def flush(self) -> None: ...
+    def close(self) -> None: ...
 
 
 class Collector(Protocol):
@@ -90,6 +91,9 @@ class MonitoringHub:
         for c in self._collectors:
             c.close()
         for b in self._backends:
-            b.flush()
-
+            close = getattr(b, "close", None)
+            if callable(close):
+                close()
+            else:
+                b.flush()
 

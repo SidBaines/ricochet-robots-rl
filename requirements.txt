@@ -1,22 +1,3 @@
-numpy>=1.26
-gymnasium>=0.29
-pytest>=8.0
-jupyter>=1.0
-matplotlib>=3.7
-torch>=2.3
-stable-baselines3>=2.3.2
-sb3-contrib>=2.3.0
-tensorboard>=2.15.0
-moviepy==1.0.3
-# MPS support for M1/M2 Macs
-torchaudio>=2.3
-wandb>=0.17
-# Puzzle bank dependencies
-pandas>=2.0
-pyarrow>=10.0
-tqdm>=4.64
-Pillow>=9.0
-plotly>=5.22
-kaleido>=0.2.1
-imageio>=2.30.0
-PyYAML>=6.0
+# Convenience environment for development, training, monitoring, media, and notebooks.
+# CI pins direct dependencies with requirements-ci.txt; transitive resolution is not hash-locked yet.
+-e .[training,monitoring,media,notebooks,dev]

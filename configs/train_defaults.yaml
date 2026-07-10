@@ -1,19 +1,19 @@
 profile: none
 
 initialization:
-  mode: warmstart
+  mode: fresh
   resume:
     checkpoint_path: null
     vecnormalize_path: null
     target_total_timesteps: null
     additional_timesteps: false
   warmstart:
-    params_path: examples/resnet_example.zip
+    params_path: null
     vecnormalize_path: null
   vecnormalize_path: null
 
 env:
-  mode: v1
+  mode: random
   height: 8
   width: 8
   num_robots: 2
@@ -21,12 +21,13 @@ env:
   step_penalty: -0.01
   goal_reward: 1.0
   noop_penalty: -0.01
-  max_steps: 20
+  max_steps: 10
   seed: 0
   ensure_solvable: false
   solver_max_depth: 30
   solver_max_nodes: 20000
-  obs_mode: image
+  obs_mode: rgb_cell_image
+  cell_obs_pixel_size: 40
 
 algo:
   algo: ppo
@@ -50,13 +51,7 @@ algo:
   device: auto
 
 model:
-  type: resnet
-  params:
-    features_dim: 32
-    conv_channels: 32
-    lstm_channels: 64
-    lstm_layers: 2
-    lstm_repeats: 1
+  type: stock_cnn
 
 curriculum:
   enabled: true
@@ -69,6 +64,9 @@ curriculum:
   window_size: 100
   check_freq: 50
   verbose: true
+  eval_fraction: 0.2
+  split_seed: 0
+  split_key: layout_hash
 
 eval:
   eval_freq: 1000
@@ -82,8 +80,8 @@ monitoring:
   log_dir: artifacts/runs/ppo
   save_path: artifacts/checkpoints/ppo_model_tmp22
   save_freq: 5000
-  tensorboard: false
-  wandb: true
+  tensorboard: true
+  wandb: false
   wandb_entity: null
   wandb_project: null
   wandb_run_name: null

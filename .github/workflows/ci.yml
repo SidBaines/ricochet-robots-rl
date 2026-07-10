@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Install reference environment
+        run: python -m pip install -c requirements-ci.txt -e '.[training,dev]'
+      - name: Compile stabilized modules
+        run: python -m compileall -q src
+      - name: Run tests
+        run: python -m pytest
+      - name: Check fatal lint errors in stabilized modules
+        run: >-
+          ruff check --select=E9,F63,F7,F82
+          src/env/environment_spec.py
+          src/env/ricochet_env.py
+          src/env/puzzle_bank.py
+          src/env/criteria_env.py
+          src/env/curriculum.py
+          src/training
+          src/scripts/train_agent.py
+          src/tests
+

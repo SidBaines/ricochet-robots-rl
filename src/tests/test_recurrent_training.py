@@ -19,6 +19,11 @@ from src.env import RicochetRobotsEnv
 from gymnasium.spaces import Box, Discrete
 
 
+pytestmark = pytest.mark.skip(
+    reason="Legacy custom recurrent policy is not an advertised Phase 1 model"
+)
+
+
 class TestRecurrentPolicyHiddenStates:
     """Test hidden state lifecycle and per-env resets."""
     

@@ -16,6 +16,7 @@ from collections import deque
 from .ricochet_env import RicochetRobotsEnv, GymEnvBase
 from .puzzle_bank import PuzzleBank, SpecKey
 from .criteria_env import CriteriaFilteredEnv, PuzzleCriteria, BankCurriculumManager
+from .environment_spec import EnvironmentSpec
 
 
 class OptimalLengthFilteredEnv(RicochetRobotsEnv):
@@ -45,7 +46,7 @@ class OptimalLengthFilteredEnv(RicochetRobotsEnv):
         
         while attempts < max_attempts:
             attempts += 1
-            obs, info = super().reset(seed=seed, options=options)
+            obs, info = super().reset(seed=seed if attempts == 1 else None, options=options)
             
             # Check if the puzzle has acceptable optimal length
             if not self.ensure_solvable:
@@ -265,6 +266,8 @@ class CurriculumWrapper(GymEnvBase):
         self,
         base_env_factory: Callable[[], RicochetRobotsEnv],
         curriculum_manager: CurriculumManager,
+        environment_spec: Optional[EnvironmentSpec] = None,
+        track_curriculum: bool = True,
         verbose: bool = True
     ):
         """
@@ -277,7 +280,11 @@ class CurriculumWrapper(GymEnvBase):
         """
         self.base_env_factory = base_env_factory
         self.curriculum_manager = curriculum_manager
+        self.track_curriculum = track_curriculum
         self.verbose = verbose
+        if environment_spec is None:
+            raise ValueError("CurriculumWrapper requires an explicit EnvironmentSpec")
+        self.environment_spec = environment_spec
         
         # Create current environment
         self._current_env = None
@@ -296,26 +303,19 @@ class CurriculumWrapper(GymEnvBase):
         """Create a new environment instance with current level parameters."""
         level = self._get_current_level()
         
-        # Get observation mode and other settings from the base environment factory
-        # by creating a temporary environment to inspect its settings
-        temp_env = self.base_env_factory()
-        obs_mode = temp_env.obs_mode
-        channels_first = temp_env.channels_first
-        temp_env.close()
-        
         # Create environment with level-specific parameters and optimal length filtering
         self._current_env = OptimalLengthFilteredEnv(
             max_optimal_length=level.max_optimal_length,
-            height=level.height,
-            width=level.width,
-            num_robots=level.num_robots,
-            edge_t_per_quadrant=level.edge_t_per_quadrant,
-            central_l_per_quadrant=level.central_l_per_quadrant,
-            solver_max_depth=level.solver_max_depth,
-            solver_max_nodes=level.solver_max_nodes,
-            ensure_solvable=True,  # Always ensure solvable for curriculum
-            obs_mode=obs_mode,  # Use the same observation mode as base environment
-            channels_first=channels_first,  # Use the same channels_first setting
+            **self.environment_spec.to_env_kwargs(
+                height=level.height,
+                width=level.width,
+                num_robots=level.num_robots,
+                edge_t_per_quadrant=level.edge_t_per_quadrant,
+                central_l_per_quadrant=level.central_l_per_quadrant,
+                solver_max_depth=level.solver_max_depth,
+                solver_max_nodes=level.solver_max_nodes,
+                ensure_solvable=True,
+            ),
         )
     
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -329,10 +329,11 @@ class CurriculumWrapper(GymEnvBase):
         # Track episode completion and success
         if terminated or truncated:
             success = info.get('is_success', False) and not truncated
-            self.curriculum_manager.record_episode_result(success)
+            if self.track_curriculum:
+                self.curriculum_manager.record_episode_result(success)
             
             # Check if curriculum level has changed and recreate environment if needed
-            if self.curriculum_manager.current_level != self._last_known_level:
+            if self.track_curriculum and self.curriculum_manager.current_level != self._last_known_level:
                 self._create_current_env()
                 self._last_known_level = self.curriculum_manager.current_level
         
@@ -353,6 +354,17 @@ class CurriculumWrapper(GymEnvBase):
     def get_curriculum_stats(self) -> Dict[str, Any]:
         """Get comprehensive curriculum statistics."""
         return self.curriculum_manager.get_curriculum_stats()
+
+    def sync_curriculum_level(self, level: int) -> None:
+        """Move an independent read-only evaluator to a training level."""
+        if self.track_curriculum:
+            raise RuntimeError("sync_curriculum_level is only valid for read-only wrappers")
+        if not 0 <= int(level) < len(self.curriculum_manager.config.levels):
+            raise ValueError(f"Invalid curriculum level: {level}")
+        if self.curriculum_manager.current_level != int(level):
+            self.curriculum_manager.current_level = int(level)
+            self._last_known_level = int(level)
+            self._create_current_env()
     
     # Delegate other methods to current environment
     def render(self, *args, **kwargs):
@@ -495,6 +507,8 @@ def create_curriculum_manager(
 def create_curriculum_wrapper(
     base_env_factory: Callable[[], RicochetRobotsEnv],
     curriculum_manager: CurriculumManager,
+    environment_spec: Optional[EnvironmentSpec] = None,
+    track_curriculum: bool = True,
     verbose: bool = True
 ) -> CurriculumWrapper:
     """
@@ -511,6 +525,8 @@ def create_curriculum_wrapper(
     return CurriculumWrapper(
         base_env_factory=base_env_factory,
         curriculum_manager=curriculum_manager,
+        environment_spec=environment_spec,
+        track_curriculum=track_curriculum,
         verbose=verbose
     )
 
@@ -572,6 +588,7 @@ def create_bank_curriculum_wrapper(
     render_mode: Optional[str] = None,
     verbose: bool = True,
     cell_obs_pixel_size: Optional[int] = None,
+    environment_spec: Optional[EnvironmentSpec] = None,
 ) -> CriteriaFilteredEnv:
     """Create a bank-based curriculum wrapper.
     
@@ -586,6 +603,9 @@ def create_bank_curriculum_wrapper(
     Returns:
         Configured CriteriaFilteredEnv instance
     """
+    if environment_spec is None:
+        raise ValueError("create_bank_curriculum_wrapper requires an explicit EnvironmentSpec")
+
     # Get current criteria from curriculum manager
     criteria = curriculum_manager.get_current_criteria()
     
@@ -597,6 +617,7 @@ def create_bank_curriculum_wrapper(
         render_mode=render_mode,
         verbose=verbose,
         cell_obs_pixel_size=cell_obs_pixel_size,
+        environment_spec=environment_spec,
     )
 
 
@@ -619,6 +640,12 @@ class BankCurriculumWrapper(GymEnvBase):
         render_mode: Optional[str] = None,
         verbose: bool = True,
         cell_obs_pixel_size: Optional[int] = None,
+        environment_spec: Optional[EnvironmentSpec] = None,
+        split: str = "all",
+        eval_fraction: float = 0.2,
+        split_seed: int = 0,
+        split_key: str = "layout_hash",
+        track_curriculum: bool = True,
     ):
         """Initialize bank curriculum wrapper.
         
@@ -632,12 +659,25 @@ class BankCurriculumWrapper(GymEnvBase):
         """
         self.bank = bank
         self.curriculum_manager = curriculum_manager
-        self.obs_mode = obs_mode
-        self.channels_first = channels_first
-        self.include_noop = include_noop
+        if environment_spec is None:
+            environment_spec = EnvironmentSpec(
+                include_noop=include_noop,
+                obs_mode=obs_mode,
+                channels_first=channels_first,
+                cell_obs_pixel_size=128 if cell_obs_pixel_size is None else cell_obs_pixel_size,
+            )
+        self.environment_spec = environment_spec
+        self.obs_mode = environment_spec.obs_mode
+        self.channels_first = environment_spec.channels_first
+        self.include_noop = environment_spec.include_noop
         self.render_mode = render_mode
         self.verbose = verbose
-        self.cell_obs_pixel_size = cell_obs_pixel_size
+        self.cell_obs_pixel_size = environment_spec.cell_obs_pixel_size
+        self.split = split
+        self.eval_fraction = eval_fraction
+        self.split_seed = split_seed
+        self.split_key = split_key
+        self.track_curriculum = track_curriculum
         
         # Create current environment
         self._current_env = None
@@ -660,8 +700,12 @@ class BankCurriculumWrapper(GymEnvBase):
             include_noop=self.include_noop,
             render_mode=self.render_mode,
             verbose=self.verbose,
-            max_steps=criteria.max_optimal_length,
             cell_obs_pixel_size=self.cell_obs_pixel_size,
+            environment_spec=self.environment_spec,
+            split=self.split,
+            eval_fraction=self.eval_fraction,
+            split_seed=self.split_seed,
+            split_key=self.split_key,
         )
     
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -675,10 +719,11 @@ class BankCurriculumWrapper(GymEnvBase):
         # Track episode completion and success
         if terminated or truncated:
             success = info.get('is_success', False) and not truncated
-            self.curriculum_manager.record_episode_result(success)
+            if self.track_curriculum:
+                self.curriculum_manager.record_episode_result(success)
             
             # Check if curriculum level has changed and recreate environment if needed
-            if self.curriculum_manager.current_level != self._last_known_level:
+            if self.track_curriculum and self.curriculum_manager.current_level != self._last_known_level:
                 self._create_current_env()
                 self._last_known_level = self.curriculum_manager.current_level
         
@@ -699,6 +744,21 @@ class BankCurriculumWrapper(GymEnvBase):
     def get_curriculum_stats(self) -> Dict[str, Any]:
         """Get comprehensive curriculum statistics."""
         return self.curriculum_manager.get_stats()
+
+    def sync_curriculum_level(self, level: int) -> None:
+        """Move a read-only evaluation wrapper to a training level.
+
+        This updates only the wrapper's independent manager; no episode result
+        is recorded and no training state is shared.
+        """
+        if self.track_curriculum:
+            raise RuntimeError("sync_curriculum_level is only valid for read-only wrappers")
+        if not 0 <= int(level) < len(self.curriculum_manager.curriculum_levels):
+            raise ValueError(f"Invalid curriculum level: {level}")
+        if self.curriculum_manager.current_level != int(level):
+            self.curriculum_manager.current_level = int(level)
+            self._last_known_level = int(level)
+            self._create_current_env()
     
     # Delegate other methods to current environment
     def render(self, *args, **kwargs):

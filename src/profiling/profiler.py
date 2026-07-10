@@ -65,7 +65,10 @@ class Profiler:
         self.stats: Dict[str, ProfilerStats] = {}
         self.memory_snapshots: List[MemorySnapshot] = []
         self._lock = threading.Lock()
-        self._enabled = True
+        # Profiling is intentionally opt-in. Environment hot paths use this
+        # global profiler, so enabling it by default makes a normal training
+        # run collect process-memory snapshots on every operation.
+        self._enabled = False
         
         # Initialize GPU memory tracking
         if self.enable_gpu_profiling:
@@ -215,6 +218,11 @@ class Profiler:
     def disable(self):
         """Disable profiling."""
         self._enabled = False
+
+    @property
+    def enabled(self) -> bool:
+        """Whether profiling measurements are currently enabled."""
+        return self._enabled
     
     def print_summary(self, sort_by: str = 'total_time'):
         """Print a formatted summary of profiling statistics."""

@@ -16,6 +16,16 @@ from src.env.curriculum import (
     create_default_curriculum,
     OptimalLengthFilteredEnv
 )
+from src.env.environment_spec import EnvironmentSpec
+
+
+TEST_ENV_SPEC = EnvironmentSpec(
+    height=4,
+    width=4,
+    num_robots=1,
+    obs_mode="image",
+    channels_first=True,
+)
 
 
 class TestCurriculumLevel:
@@ -267,6 +277,7 @@ class TestCurriculumWrapper:
         wrapper = CurriculumWrapper(
             base_env_factory=mock_env_factory,
             curriculum_manager=manager,
+            environment_spec=TEST_ENV_SPEC,
             verbose=False
         )
         
@@ -277,7 +288,7 @@ class TestCurriculumWrapper:
     def test_curriculum_wrapper_reset(self):
         """Test curriculum wrapper reset functionality."""
         # Mock the OptimalLengthFilteredEnv class
-        with patch('env.curriculum.OptimalLengthFilteredEnv') as mock_env_class:
+        with patch('src.env.curriculum.OptimalLengthFilteredEnv') as mock_env_class:
             mock_env_instance = Mock()
             mock_env_instance.reset.return_value = (np.zeros((7, 4, 4)), {})
             mock_env_instance.step.return_value = (np.zeros((7, 4, 4)), 0, False, False, {})
@@ -296,6 +307,7 @@ class TestCurriculumWrapper:
             wrapper = CurriculumWrapper(
                 base_env_factory=mock_env_factory,
                 curriculum_manager=manager,
+                environment_spec=TEST_ENV_SPEC,
                 verbose=False
             )
             
@@ -307,7 +319,7 @@ class TestCurriculumWrapper:
     def test_curriculum_wrapper_step(self):
         """Test curriculum wrapper step functionality."""
         # Mock the OptimalLengthFilteredEnv class
-        with patch('env.curriculum.OptimalLengthFilteredEnv') as mock_env_class:
+        with patch('src.env.curriculum.OptimalLengthFilteredEnv') as mock_env_class:
             mock_env_instance = Mock()
             mock_env_instance.reset.return_value = (np.zeros((7, 4, 4)), {})
             mock_env_instance.step.return_value = (np.zeros((7, 4, 4)), 0, False, False, {})
@@ -326,6 +338,7 @@ class TestCurriculumWrapper:
             wrapper = CurriculumWrapper(
                 base_env_factory=mock_env_factory,
                 curriculum_manager=manager,
+                environment_spec=TEST_ENV_SPEC,
                 verbose=False
             )
             
@@ -341,7 +354,7 @@ class TestCurriculumWrapper:
     def test_curriculum_advancement(self):
         """Test curriculum advancement logic."""
         # Mock the RicochetRobotsEnv class
-        with patch('env.curriculum.RicochetRobotsEnv') as mock_env_class:
+        with patch('src.env.curriculum.OptimalLengthFilteredEnv') as mock_env_class:
             mock_env_instance = Mock()
             mock_env_instance.reset.return_value = (np.zeros((7, 4, 4)), {})
             mock_env_instance.step.return_value = (np.zeros((7, 4, 4)), 0, True, False, {'is_success': True})
@@ -369,6 +382,7 @@ class TestCurriculumWrapper:
             wrapper = CurriculumWrapper(
                 base_env_factory=mock_env_factory,
                 curriculum_manager=manager,
+                environment_spec=TEST_ENV_SPEC,
                 verbose=False
             )
             
@@ -416,6 +430,7 @@ class TestCurriculumWrapper:
         wrapper = CurriculumWrapper(
             base_env_factory=mock_env_factory,
             curriculum_manager=manager,
+            environment_spec=TEST_ENV_SPEC,
             verbose=False
         )
         
@@ -444,13 +459,13 @@ class TestDefaultCurriculum:
         assert config.min_episodes_per_level == 100
         
         # Check level progression
-        assert config.levels[0].height == 4
+        assert config.levels[0].height == 16
         assert config.levels[0].num_robots == 1
         assert config.levels[0].edge_t_per_quadrant == 0
         
-        assert config.levels[4].height == 10
+        assert config.levels[4].height == 16
         assert config.levels[4].num_robots == 3
-        assert config.levels[4].edge_t_per_quadrant == 3
+        assert config.levels[4].edge_t_per_quadrant == 2
     
     def test_create_curriculum_wrapper(self):
         """Test creating curriculum wrapper with default config."""
@@ -474,6 +489,7 @@ class TestDefaultCurriculum:
         wrapper = create_curriculum_wrapper(
             base_env_factory=mock_env_factory,
             curriculum_manager=manager,
+            environment_spec=TEST_ENV_SPEC,
             verbose=False
         )
         
@@ -508,7 +524,7 @@ class TestOptimalLengthFilteredEnv:
 class TestCurriculumIntegration:
     """Test curriculum integration with training."""
     
-    @patch('env.curriculum.RicochetRobotsEnv')
+    @patch('src.env.curriculum.OptimalLengthFilteredEnv')
     def test_curriculum_with_real_env(self, mock_env_class):
         """Test curriculum wrapper with mocked RicochetRobotsEnv."""
         # Mock the environment class
@@ -534,6 +550,7 @@ class TestCurriculumIntegration:
         wrapper = create_curriculum_wrapper(
             base_env_factory=env_factory,
             curriculum_manager=manager,
+            environment_spec=TEST_ENV_SPEC,
             verbose=False
         )
         
