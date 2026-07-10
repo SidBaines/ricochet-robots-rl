@@ -529,9 +529,12 @@ class BankSampler:
         if self.split == "all":
             return pd.Series([True] * len(df), index=df.index)
 
+        # Plain column iteration: iterrows() constructs a Series per row and
+        # costs seconds on large partitions, which used to dominate episode
+        # resets whenever a band iterator was rebuilt. The hash inputs are
+        # unchanged, so split membership and fingerprints are identical.
         values = []
-        for _, row in df.iterrows():
-            value = row.get(self.split_key)
+        for value in df[self.split_key].tolist():
             if value is None or str(value).strip() in {"", "nan", "None"}:
                 raise ValueError(
                     f"Bank split requires a valid {self.split_key} for every row; "
