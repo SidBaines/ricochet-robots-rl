@@ -53,3 +53,18 @@ def test_phase2_config_accepts_grid_cnn_on_planes() -> None:
     config = Phase2Config(policy="grid_cnn", obs_mode="image")
     spec = config.environment_spec(seed=0)
     assert spec.obs_mode == "image"
+
+
+def test_train_agent_select_policy_supports_grid_cnn() -> None:
+    from types import SimpleNamespace
+
+    from src.scripts.train_agent import select_policy
+
+    args = SimpleNamespace(model_type="grid_cnn", obs_mode="image")
+    policy, policy_kwargs = select_policy(args, _planes_space())
+    assert policy == "MlpPolicy"
+    assert policy_kwargs["features_extractor_class"] is GridPlanesCnn
+    assert policy_kwargs["normalize_images"] is False
+
+    with pytest.raises(ValueError, match="grid_cnn requires"):
+        select_policy(SimpleNamespace(model_type="grid_cnn", obs_mode="rgb_cell_image"), _planes_space())
