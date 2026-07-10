@@ -63,6 +63,7 @@ def create_run_manifest(
     model_type: str,
     policy: Any,
     policy_kwargs: Dict[str, Any],
+    actual_model: Dict[str, Any],
     observation_space: Any,
     action_space: Any,
     initial_timesteps: int,
@@ -76,7 +77,7 @@ def create_run_manifest(
     status = _git_value(project_root, "status", "--porcelain")
     tracked_diff = _git_value(project_root, "diff", "HEAD") or ""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "git": {
             "commit": _git_value(project_root, "rev-parse", "HEAD"),
@@ -97,8 +98,9 @@ def create_run_manifest(
         "resolved_config": resolved_config,
         "model": {
             "type": model_type,
-            "policy": policy if isinstance(policy, str) else getattr(policy, "__name__", str(policy)),
-            "policy_kwargs": policy_kwargs,
+            "requested_policy": policy if isinstance(policy, str) else getattr(policy, "__name__", str(policy)),
+            "requested_policy_kwargs": policy_kwargs,
+            **actual_model,
         },
         "spaces": {
             "observation": repr(observation_space),

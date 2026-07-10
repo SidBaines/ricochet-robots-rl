@@ -21,6 +21,7 @@ import copy
 import hashlib
 import uuid
 from dataclasses import replace
+import numpy as np
 import yaml
 from datetime import datetime
 
@@ -30,7 +31,6 @@ from src.env.curriculum import (
     create_curriculum_wrapper, create_curriculum_manager, create_default_curriculum, CurriculumConfig, CurriculumLevel,
     create_bank_curriculum_manager, create_bank_curriculum_levels, BankCurriculumWrapper
 )
-from src.env.criteria_env import CriteriaFilteredEnv
 from src.env.puzzle_bank import BankSampler, PuzzleBank
 from src.training.run_manifest import create_run_manifest, write_run_manifest
 try:
@@ -753,6 +753,133 @@ def effective_environment_spec(
     return spec
 
 
+def make_trajectory_env_factory(args: argparse.Namespace, curriculum_manager: Any = None) -> Callable[[], RicochetRobotsEnv]:
+    """Build fresh rollout environments from the evaluation distribution."""
+    environment_spec = EnvironmentSpec.from_namespace(args)
+    seed_stream = np.random.default_rng(environment_spec.seed)
+
+    def _next_spec() -> EnvironmentSpec:
+        return replace(environment_spec, seed=int(seed_stream.integers(0, 2**31 - 1)))
+
+    if curriculum_manager is not None and hasattr(curriculum_manager, "curriculum_levels"):
+        def _bank_factory():
+            evaluation_manager = create_bank_curriculum_manager(
+                bank=curriculum_manager.bank,
+                curriculum_levels=copy.deepcopy(curriculum_manager.curriculum_levels),
+                success_rate_threshold=curriculum_manager.success_rate_threshold,
+                min_episodes_per_level=curriculum_manager.min_episodes_per_level,
+                success_rate_window_size=curriculum_manager.success_rate_window_size,
+                advancement_check_frequency=curriculum_manager.advancement_check_frequency,
+                verbose=False,
+            )
+            evaluation_manager.current_level = curriculum_manager.current_level
+            return BankCurriculumWrapper(
+                bank=curriculum_manager.bank,
+                curriculum_manager=evaluation_manager,
+                environment_spec=_next_spec(),
+                split="eval",
+                eval_fraction=args.bank_eval_fraction,
+                split_seed=args.bank_split_seed,
+                split_key=args.bank_split_key,
+                track_curriculum=False,
+                render_mode=None,
+                verbose=False,
+            )
+
+        return _bank_factory
+
+    if curriculum_manager is not None and hasattr(curriculum_manager, "config"):
+        def _online_factory():
+            evaluation_manager = create_curriculum_manager(
+                curriculum_config=copy.deepcopy(curriculum_manager.config),
+                initial_level=curriculum_manager.current_level,
+                verbose=False,
+            )
+            return create_curriculum_wrapper(
+                base_env_factory=make_env_factory(args),
+                curriculum_manager=evaluation_manager,
+                environment_spec=_next_spec(),
+                track_curriculum=False,
+                verbose=False,
+            )
+
+        return _online_factory
+
+    base_factory = make_env_factory(args)
+
+    def _standard_factory():
+        environment = base_factory()
+        environment.seed(_next_spec().seed)
+        return environment
+
+    return _standard_factory
+
+
+def _qualified_class_name(value: Any) -> str:
+    cls = value if isinstance(value, type) else type(value)
+    return f"{cls.__module__}.{cls.__name__}"
+
+
+def _checkpoint_sha256(checkpoint_path: str | None) -> str | None:
+    if not checkpoint_path:
+        return None
+    path = Path(checkpoint_path)
+    if not path.exists() and path.suffix != ".zip":
+        zipped = path.with_suffix(".zip")
+        if zipped.exists():
+            path = zipped
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def validate_and_describe_model(
+    model: Any,
+    model_type: str,
+    *,
+    checkpoint_path: str | None = None,
+) -> Dict[str, Any]:
+    """Validate the instantiated/loaded policy and return manifest evidence."""
+    policy_object = getattr(model, "policy", None)
+    if policy_object is None:
+        raise ValueError("Model does not expose a policy object")
+    extractor = getattr(policy_object, "features_extractor", None)
+    if extractor is None:
+        raise ValueError("Model policy does not expose a features extractor")
+
+    extractor_name = type(extractor).__name__
+    expected_extractor = {
+        "stock_cnn": "NatureCNN",
+        "mlp": "FlattenExtractor",
+    }.get(model_type)
+    expected_policy = {
+        "stock_cnn": "ActorCriticCnnPolicy",
+        "mlp": "ActorCriticPolicy",
+    }.get(model_type)
+    if expected_extractor is None:
+        raise ValueError(f"Unsupported model type: {model_type}")
+    if type(model).__name__ != "PPO":
+        raise ValueError(f"Model contract mismatch: expected PPO, loaded {type(model).__name__}")
+    if type(policy_object).__name__ != expected_policy:
+        raise ValueError(
+            f"Model contract mismatch for {model_type}: expected {expected_policy}, "
+            f"loaded {type(policy_object).__name__}"
+        )
+    if extractor_name != expected_extractor:
+        raise ValueError(
+            f"Model contract mismatch for {model_type}: expected {expected_extractor}, "
+            f"loaded {extractor_name}"
+        )
+
+    return {
+        "algorithm_class": _qualified_class_name(model),
+        "policy_class": _qualified_class_name(policy_object),
+        "features_extractor_class": _qualified_class_name(extractor),
+        "actual_policy_kwargs": getattr(model, "policy_kwargs", {}),
+        "checkpoint_sha256": _checkpoint_sha256(checkpoint_path),
+    }
+
+
 def main() -> None:
     cli_parser = argparse.ArgumentParser(description="Train PPO on Ricochet Robots")
     cli_parser.add_argument("config_path", help="Path to YAML configuration file")
@@ -928,7 +1055,6 @@ def main() -> None:
     except ImportError:
         _VecNormalize = None  # type: ignore
     vecnorm_used = False
-    vecnorm_loaded_from: str | None = None
     if args.vecnorm and _VecNormalize is not None:
         candidate_paths: list[tuple[str, str]] = []
         seen_paths: set[str] = set()
@@ -964,7 +1090,6 @@ def main() -> None:
                 vec_env = _VecNormalize.load(candidate, venv=vec_env)
                 vec_env.training = True  # type: ignore[attr-defined]
                 vecnorm_used = True
-                vecnorm_loaded_from = candidate
                 print(f"Loaded VecNormalize statistics from {candidate} ({label})")
                 break
             except Exception as exc:  # pragma: no cover - defensive logging only
@@ -1064,6 +1189,22 @@ def main() -> None:
     if model is None:
         raise RuntimeError("Model initialisation failed")
 
+    source_checkpoint = None
+    if resume_mode:
+        source_checkpoint = args.resume_checkpoint_path
+    elif warmstart_mode:
+        source_checkpoint = args.warmstart_params_path
+    actual_model = validate_and_describe_model(
+        model,
+        args.model_type,
+        checkpoint_path=source_checkpoint,
+    )
+    print(
+        "Validated actual model contract: "
+        f"policy={actual_model['policy_class']}, "
+        f"features_extractor={actual_model['features_extractor_class']}"
+    )
+
     # Configure SB3's logger before installing custom output formats. Newer
     # SB3 versions otherwise create the logger only inside ``learn()``.
     from stable_baselines3.common.logger import configure as _configure_sb3_logger
@@ -1120,6 +1261,7 @@ def main() -> None:
         model_type=args.model_type,
         policy=policy,
         policy_kwargs=policy_kwargs,
+        actual_model=actual_model,
         observation_space=vec_env.observation_space,
         action_space=vec_env.action_space,
         initial_timesteps=int(getattr(model, "num_timesteps", 0)),
@@ -1444,6 +1586,7 @@ def main() -> None:
         # Always-on hub callback for periodic trajectory logging (independent of eval_fixedset)
         if hub is not None and args.traj_record_freq > 0:
             from src.monitoring.evaluators import TrajectoryRecorder
+            trajectory_env_factory = make_trajectory_env_factory(args, curriculum_manager)
             class _HubTrajectoryLogger(BaseCallback):
                 def __init__(self, verbose=0):
                     super().__init__(verbose)
@@ -1457,18 +1600,9 @@ def main() -> None:
                 def _on_step(self) -> bool:
                     # Throttle logging by traj_record_freq
                     if (self.num_timesteps - self._last_traj_dump) >= args.traj_record_freq:
-                        # Build a renderable env factory; prefer rgb frames for video logging
-                        def _make_renderable_env():
-                            e = make_env_factory(args)()
-                            try:
-                                if hasattr(e, 'render_mode'):
-                                    e.render_mode = 'rgb'
-                            except Exception:
-                                pass
-                            return e
                         try:
                             rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True, renderer=self._renderer)
-                            trajectories = rec.record(_make_renderable_env, self.model)
+                            trajectories = rec.record(trajectory_env_factory, self.model)
                             # Compact text summary per episode
                             summaries = []
                             for idx, traj in enumerate(trajectories):
@@ -1663,8 +1797,7 @@ def main() -> None:
             # Add fixed-set evaluation with solver-aware optimality gap via monitoring hub if configured
             if hub is not None and args.eval_fixedset is not None:
                 try:
-                    import os as _os
-                    from src.monitoring.evaluators import FixedSetEvaluator, OptimalityGapEvaluator, SolverCache, TrajectoryRecorder
+                    from src.monitoring.evaluators import FixedSetEvaluator, OptimalityGapEvaluator, SolverCache
                     # Load fixed set
                     with open(args.eval_fixedset, 'r', encoding='utf-8') as f:
                         fixedset = json.load(f)
@@ -1688,234 +1821,15 @@ def main() -> None:
                         def __init__(self, verbose=0):
                             super().__init__(verbose)
                             self._last_eval = 0
-                            self._last_traj_dump = 0
-                            self._renderer = None
-                            try:
-                                from src.env.visuals.mpl_renderer import MatplotlibBoardRenderer
-                                self._renderer = MatplotlibBoardRenderer(cell_size=28)
-                            except Exception:
-                                self._renderer = None
                         def _on_step(self) -> bool:
                             if self.num_timesteps - self._last_eval >= args.eval_freq:
                                 fixed_eval.evaluate(hub, _make_env_from_layout, self.model, step=self.num_timesteps)
                                 gap_eval.evaluate(hub, _make_env_from_layout, self.model, step=self.num_timesteps)
                                 self._last_eval = self.num_timesteps
-                            # Trajectory recorder on its own cadence using a standard training env factory
-                            if args.traj_record_freq > 0 and (self.num_timesteps - self._last_traj_dump) >= args.traj_record_freq:
-                                # Capture RGB frames for video logging
-                                def _make_renderable_env():
-                                    e = make_env_factory(args)()
-                                    # If env supports render_mode, set to rgb for video frames
-                                    try:
-                                        if hasattr(e, 'render_mode'):
-                                            e.render_mode = 'rgb'
-                                    except Exception:
-                                        pass
-                                    return e
-                                rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True, renderer=self._renderer)
-                                # If we have a bank curriculum, record one short trajectory per curriculum level
-                                if curriculum_manager is not None and hasattr(curriculum_manager, 'curriculum_levels') and hasattr(curriculum_manager, 'bank'):
-                                    try:
-                                        from src.env.curriculum import create_bank_curriculum_manager, BankCurriculumWrapper
-                                        import numpy as _np
-                                        levels = getattr(curriculum_manager, 'curriculum_levels')
-                                        bank_obj = getattr(curriculum_manager, 'bank')
-                                        srt = getattr(curriculum_manager, 'success_rate_threshold', 0.8)
-                                        min_eps = getattr(curriculum_manager, 'min_episodes_per_level', 100)
-                                        win_sz = getattr(curriculum_manager, 'success_rate_window_size', 200)
-                                        chk_freq = getattr(curriculum_manager, 'advancement_check_frequency', 50)
-                                        for lvl_idx, lvl_spec in enumerate(levels):
-                                            def _make_env_for_level(idx: int = lvl_idx):
-                                                mgr = create_bank_curriculum_manager(
-                                                    bank=bank_obj,
-                                                    curriculum_levels=levels,
-                                                    success_rate_threshold=srt,
-                                                    min_episodes_per_level=min_eps,
-                                                    success_rate_window_size=win_sz,
-                                                    advancement_check_frequency=chk_freq,
-                                                    verbose=False,
-                                                )
-                                                mgr.current_level = idx
-                                                return BankCurriculumWrapper(
-                                                    bank=bank_obj,
-                                                    curriculum_manager=mgr,
-                                                    environment_spec=EnvironmentSpec.from_namespace(args),
-                                                    split="eval",
-                                                    eval_fraction=args.bank_eval_fraction,
-                                                    split_seed=args.bank_split_seed,
-                                                    split_key=args.bank_split_key,
-                                                    track_curriculum=False,
-                                                    render_mode=None,
-                                                    verbose=False,
-                                                )
-                                            rec_level = TrajectoryRecorder(episodes=1, capture_render=True, renderer=self._renderer)
-                                            trajs = rec_level.record(_make_env_for_level, self.model)
-                                            if trajs and trajs[0].get('frames'):
-                                                frames = trajs[0]['frames'] or []
-                                                video_thwc = _np.asarray(frames, dtype=_np.uint8)
-                                                if video_thwc.ndim == 3:
-                                                    video_thwc = video_thwc[:, :, :, None]
-                                                if video_thwc.shape[0] == 1:
-                                                    video_thwc = _np.concatenate([video_thwc, video_thwc], axis=0)
-                                                hub.log_video(f"eval/trajectories/level{lvl_idx:02d}/video0", video_thwc, self.num_timesteps, fps=4)
-                                                # Save local per-level MP4 for inspection
-                                                try:
-                                                    from pathlib import Path as _Path
-                                                    import imageio.v2 as _imageio
-                                                    _out_dir = ARTIFACTS_ROOT / "rollout_gifs"
-                                                    _out_dir.mkdir(parents=True, exist_ok=True)
-                                                    _mp4_path = _Path(_out_dir) / f"eval_traj_step{int(self.num_timesteps)}_L{lvl_idx:02d}.mp4"
-                                                    _writer = _imageio.get_writer(_mp4_path, fps=4, codec="libx264", quality=7)
-                                                    try:
-                                                        for f in video_thwc:
-                                                            _writer.append_data(_np.asarray(f, dtype=_np.uint8))
-                                                    finally:
-                                                        _writer.close()
-                                                except Exception as _save_exc:
-                                                    print(f"Warning: Local per-level eval video save failed at step {self.num_timesteps}: {_save_exc}")
-                                        # After per-level logging, skip the generic single-level path
-                                        self._last_traj_dump = self.num_timesteps
-                                        return True
-                                    except Exception as _per_level_exc:
-                                        print(f"Warning: Per-level trajectory logging failed, falling back to default: {_per_level_exc}")
-                                # Fallback: Use a fresh non-curriculum single-env factory mirroring current args
-                                rec_env_factory = _make_renderable_env
-                                trajectories = rec.record(rec_env_factory, self.model)
-                                # Build compact text summary of actions per episode
-                                try:
-                                    summaries = []
-                                    for idx, traj in enumerate(trajectories):
-                                        acts = [str(step.get('action', -1)) for step in traj.get('steps', [])]
-                                        succ = "✓" if bool(traj.get('success', False)) else "✗"
-                                        summaries.append(f"ep {idx}: success={succ}, steps={len(acts)}, actions=[" + ",".join(acts[:60]) + (",..." if len(acts) > 60 else "]"))
-                                    if summaries:
-                                        hub.log_text("eval/trajectories/text", "\n".join(summaries), self.num_timesteps)
-                                except Exception as exc:
-                                    print(f"Warning: Trajectory text logging failed during eval at step {self.num_timesteps}: {exc}")
-                                # If frames are present, log a short video for the first episode and save a local copy
-                                first_frames: list[Any] = []
-                                try:
-                                    if trajectories and trajectories[0].get('frames'):
-                                        first_frames = trajectories[0]['frames'] or []
-                                        import numpy as _np
-                                        video_thwc = _np.asarray(first_frames, dtype=_np.uint8)  # (T,H,W,C) expected
-                                        # Ensure shape is (T,H,W,C)
-                                        if video_thwc.ndim == 3:  # (T,H,W) -> add channel
-                                            video_thwc = video_thwc[:, :, :, None]
-                                        # Ensure at least 2 frames for encoders that reject 1-frame videos
-                                        if video_thwc.shape[0] == 1:
-                                            video_thwc = _np.concatenate([video_thwc, video_thwc], axis=0)
-                                        hub.log_video("eval/trajectories/video0", video_thwc, self.num_timesteps, fps=4)
-
-                                        # Also save a local MP4 for quick inspection with a standard codec
-                                        try:
-                                            from pathlib import Path as _Path
-                                            _out_dir = ARTIFACTS_ROOT / "rollout_gifs"
-                                            _out_dir.mkdir(parents=True, exist_ok=True)
-                                            _mp4_path = _Path(_out_dir) / f"eval_traj_step{int(self.num_timesteps)}_ep0.mp4"
-                                            import imageio.v2 as _imageio
-                                            _writer = _imageio.get_writer(_mp4_path, fps=4, codec="libx264", quality=7)
-                                            try:
-                                                for f in video_thwc:
-                                                    _writer.append_data(_np.asarray(f, dtype=_np.uint8))
-                                            finally:
-                                                _writer.close()
-                                        except Exception as _save_exc:
-                                            print(f"Warning: Local eval video save failed at step {self.num_timesteps}: {_save_exc}")
-                                    else:
-                                        print(f"Warning: No frames captured for eval trajectory video at step {self.num_timesteps}")
-                                except Exception as exc:
-                                    print(f"Warning: Trajectory video logging failed during eval at step {self.num_timesteps}: {exc}")
-                                    try:
-                                        if first_frames:
-                                            hub.log_image("eval/trajectories/frame0", first_frames[0], self.num_timesteps)
-                                    except Exception as img_exc:
-                                        print(f"Warning: Trajectory image fallback failed during eval at step {self.num_timesteps}: {img_exc}")
-                                self._last_traj_dump = self.num_timesteps
                             return True
                     callbacks.append(_HubEvalForward(verbose=0))
                 except (OSError, json.JSONDecodeError) as e:
                     print(f"Warning: Failed to configure fixed-set evaluator: {e}")
-            # Always-on trajectory recorder (independent of fixedset) so it runs for default configs
-            if hub is not None and (args.eval_fixedset is None):
-                try:
-                    class _HubTrajectoryRecorder(BaseCallback):
-                        def __init__(self, verbose=0):
-                            super().__init__(verbose)
-                            self._last_traj_dump = 0
-                            self._renderer = None
-                            try:
-                                from src.env.visuals.mpl_renderer import MatplotlibBoardRenderer
-                                self._renderer = MatplotlibBoardRenderer(cell_size=28)
-                            except Exception:
-                                self._renderer = None
-                        def _on_step(self) -> bool:
-                            if args.traj_record_freq > 0 and (self.num_timesteps - self._last_traj_dump) >= args.traj_record_freq:
-                                # Prefer per-level trajectories if using bank curriculum; else fallback to single-env
-                                try:
-                                    from src.monitoring.evaluators import TrajectoryRecorder
-                                    if curriculum_manager is not None and hasattr(curriculum_manager, 'curriculum_levels') and hasattr(curriculum_manager, 'bank'):
-                                        from src.env.curriculum import create_bank_curriculum_manager, BankCurriculumWrapper
-                                        import numpy as _np
-                                        levels = getattr(curriculum_manager, 'curriculum_levels')
-                                        bank_obj = getattr(curriculum_manager, 'bank')
-                                        srt = getattr(curriculum_manager, 'success_rate_threshold', 0.8)
-                                        min_eps = getattr(curriculum_manager, 'min_episodes_per_level', 100)
-                                        win_sz = getattr(curriculum_manager, 'success_rate_window_size', 200)
-                                        chk_freq = getattr(curriculum_manager, 'advancement_check_frequency', 50)
-                                        for lvl_idx, _ in enumerate(levels):
-                                            def _make_env_for_level(idx: int = lvl_idx):
-                                                mgr = create_bank_curriculum_manager(
-                                                    bank=bank_obj,
-                                                    curriculum_levels=levels,
-                                                    success_rate_threshold=srt,
-                                                    min_episodes_per_level=min_eps,
-                                                    success_rate_window_size=win_sz,
-                                                    advancement_check_frequency=chk_freq,
-                                                    verbose=False,
-                                                )
-                                                mgr.current_level = idx
-                                                return BankCurriculumWrapper(
-                                                    bank=bank_obj,
-                                                    curriculum_manager=mgr,
-                                                    environment_spec=EnvironmentSpec.from_namespace(args),
-                                                    split="eval",
-                                                    eval_fraction=args.bank_eval_fraction,
-                                                    split_seed=args.bank_split_seed,
-                                                    split_key=args.bank_split_key,
-                                                    track_curriculum=False,
-                                                    render_mode=None,
-                                                    verbose=False,
-                                                )
-                                            rec_level = TrajectoryRecorder(episodes=1, capture_render=True, renderer=self._renderer)
-                                            trajs = rec_level.record(_make_env_for_level, self.model)
-                                            if trajs and trajs[0].get('frames'):
-                                                frames = trajs[0]['frames'] or []
-                                                video_thwc = _np.asarray(frames, dtype=_np.uint8)
-                                                if video_thwc.ndim == 3:
-                                                    video_thwc = video_thwc[:, :, :, None]
-                                                if video_thwc.shape[0] == 1:
-                                                    video_thwc = _np.concatenate([video_thwc, video_thwc], axis=0)
-                                                hub.log_video(f"eval/trajectories/level{lvl_idx:02d}/video0", video_thwc, self.num_timesteps, fps=4)
-                                    else:
-                                        # Fallback: single non-curriculum env
-                                        def _make_renderable_env():
-                                            e = make_env_factory(args)()
-                                            try:
-                                                if hasattr(e, 'render_mode'):
-                                                    e.render_mode = 'rgb'
-                                            except Exception:
-                                                pass
-                                            return e
-                                        rec = TrajectoryRecorder(episodes=args.traj_record_episodes, capture_render=True, renderer=self._renderer)
-                                        rec.record(_make_renderable_env, self.model)
-                                except Exception as _exc:
-                                    print(f"Warning: Trajectory recorder failed at step {self.num_timesteps}: {_exc}")
-                                self._last_traj_dump = self.num_timesteps
-                            return True
-                    callbacks.append(_HubTrajectoryRecorder(verbose=0))
-                except Exception as e:
-                    print(f"Warning: Failed to configure trajectory recorder: {e}")
         if args.save_freq > 0:
             ckpt_cb = CheckpointCallback(save_freq=callback_frequency(args.save_freq, args.n_envs), save_path=(os.path.dirname(args.save_path) or "."),
                                          name_prefix=os.path.basename(args.save_path))

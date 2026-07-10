@@ -143,6 +143,41 @@ def test_sampler_seed_replays_and_hash_splits_are_disjoint():
         assert train_seeds | eval_seeds == {10_000 + i for i in range(100)}
 
 
+def test_repeated_single_draw_stratification_advances_and_reseeds() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        bank = PuzzleBank(tmp)
+        spec = SpecKey(16, 16, 4, 2, 2)
+        bank.add_puzzles([
+            _make_metadata(spec, length * 1_000 + i, optimal_length=length, robots_moved=1)
+            for length in range(1, 5)
+            for i in range(8)
+        ])
+        bands = [
+            {
+                "min_optimal_length": length,
+                "max_optimal_length": length,
+                "min_robots_moved": 1,
+                "max_robots_moved": 1,
+                "weight": 1.0,
+            }
+            for length in range(1, 5)
+        ]
+        sampler = BankSampler(bank, seed=123)
+
+        first = [
+            sampler.sample_puzzles_stratified(spec, total_count=1, bands=bands)[0].optimal_length
+            for _ in range(24)
+        ]
+        sampler.reseed(123)
+        replay = [
+            sampler.sample_puzzles_stratified(spec, total_count=1, bands=bands)[0].optimal_length
+            for _ in range(24)
+        ]
+
+        assert len(set(first)) > 1
+        assert replay == first
+
+
 def test_append_invalidates_partition_read_cache():
     with tempfile.TemporaryDirectory() as tmp:
         bank = PuzzleBank(tmp)

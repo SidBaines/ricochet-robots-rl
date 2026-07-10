@@ -9,13 +9,13 @@ Now supports both online solving and bank-based curriculum learning.
 from __future__ import annotations
 
 import numpy as np
-from typing import Dict, List, Optional, Callable, Any, Union
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Callable, Any
+from dataclasses import dataclass, replace
 from collections import deque
 
 from .ricochet_env import RicochetRobotsEnv, GymEnvBase
-from .puzzle_bank import PuzzleBank, SpecKey
-from .criteria_env import CriteriaFilteredEnv, PuzzleCriteria, BankCurriculumManager
+from .puzzle_bank import PuzzleBank
+from .criteria_env import CriteriaFilteredEnv, BankCurriculumManager
 from .environment_spec import EnvironmentSpec
 
 
@@ -285,6 +285,7 @@ class CurriculumWrapper(GymEnvBase):
         if environment_spec is None:
             raise ValueError("CurriculumWrapper requires an explicit EnvironmentSpec")
         self.environment_spec = environment_spec
+        self._worker_seed = environment_spec.seed
         
         # Create current environment
         self._current_env = None
@@ -306,7 +307,7 @@ class CurriculumWrapper(GymEnvBase):
         # Create environment with level-specific parameters and optimal length filtering
         self._current_env = OptimalLengthFilteredEnv(
             max_optimal_length=level.max_optimal_length,
-            **self.environment_spec.to_env_kwargs(
+            **replace(self.environment_spec, seed=self._worker_seed).to_env_kwargs(
                 height=level.height,
                 width=level.width,
                 num_robots=level.num_robots,
@@ -320,6 +321,8 @@ class CurriculumWrapper(GymEnvBase):
     
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         """Reset the environment and return initial observation."""
+        if seed is not None:
+            self._worker_seed = int(seed)
         return self._current_env.reset(seed=seed, options=options)
     
     def step(self, action):
@@ -678,6 +681,7 @@ class BankCurriculumWrapper(GymEnvBase):
         self.split_seed = split_seed
         self.split_key = split_key
         self.track_curriculum = track_curriculum
+        self._worker_seed = environment_spec.seed
         
         # Create current environment
         self._current_env = None
@@ -701,7 +705,7 @@ class BankCurriculumWrapper(GymEnvBase):
             render_mode=self.render_mode,
             verbose=self.verbose,
             cell_obs_pixel_size=self.cell_obs_pixel_size,
-            environment_spec=self.environment_spec,
+            environment_spec=replace(self.environment_spec, seed=self._worker_seed),
             split=self.split,
             eval_fraction=self.eval_fraction,
             split_seed=self.split_seed,
@@ -710,6 +714,8 @@ class BankCurriculumWrapper(GymEnvBase):
     
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         """Reset the environment and return initial observation."""
+        if seed is not None:
+            self._worker_seed = int(seed)
         return self._current_env.reset(seed=seed, options=options)
     
     def step(self, action):

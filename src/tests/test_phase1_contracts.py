@@ -33,7 +33,9 @@ from src.scripts.train_agent import (
     flatten_structured_config,
     make_env_factory,
     make_bank_curriculum_env_factory,
+    make_trajectory_env_factory,
     select_policy,
+    validate_and_describe_model,
 )
 from src.training.run_manifest import create_run_manifest, write_run_manifest
 
@@ -170,6 +172,38 @@ def test_bank_environment_receives_complete_environment_spec(tmp_path: Path) -> 
     read_only.sync_curriculum_level(1)
     assert sync_manager.current_level == 1
     assert read_only._last_known_level == 1
+
+    shared_manager = BankCurriculumManager(bank, [level, second_level], verbose=False)
+    worker_a = BankCurriculumWrapper(bank, shared_manager, environment_spec=environment_spec, verbose=False)
+    worker_b = BankCurriculumWrapper(bank, shared_manager, environment_spec=environment_spec, verbose=False)
+    worker_a.reset(seed=101)
+    worker_b.reset(seed=202)
+    shared_manager.current_level = 1
+    worker_a._create_current_env()
+    worker_b._create_current_env()
+
+    assert worker_a._current_env.sampler.seed == 101
+    assert worker_b._current_env.sampler.seed == 202
+
+    trajectory_args = _args(
+        height=4,
+        width=4,
+        num_robots=1,
+        obs_mode="rgb_cell_image",
+        cell_obs_pixel_size=40,
+        bank_eval_fraction=0.999999,
+        bank_split_seed=0,
+        bank_split_key="layout_hash",
+    )
+    trajectory_factory = make_trajectory_env_factory(trajectory_args, manager)
+    trajectory_env = trajectory_factory()
+    next_trajectory_env = trajectory_factory()
+
+    assert trajectory_env.curriculum_manager is not manager
+    assert trajectory_env.track_curriculum is False
+    assert trajectory_env.split == "eval"
+    assert trajectory_env.action_space.n == 8
+    assert trajectory_env._worker_seed != next_trajectory_env._worker_seed
 
     curriculum_path = tmp_path / "curriculum.json"
     curriculum_path.write_text(
@@ -323,6 +357,13 @@ def test_run_manifest_is_json_and_records_resolved_contract(tmp_path: Path) -> N
         model_type="stock_cnn",
         policy="CnnPolicy",
         policy_kwargs={"normalize_images": True},
+        actual_model={
+            "algorithm_class": "stable_baselines3.ppo.PPO",
+            "policy_class": "stable_baselines3.common.policies.ActorCriticCnnPolicy",
+            "features_extractor_class": "stable_baselines3.common.torch_layers.NatureCNN",
+            "actual_policy_kwargs": {"normalize_images": True},
+            "checkpoint_sha256": None,
+        },
         observation_space=observation_space,
         action_space=action_space,
         initial_timesteps=0,
@@ -336,8 +377,11 @@ def test_run_manifest_is_json_and_records_resolved_contract(tmp_path: Path) -> N
     write_run_manifest(path, manifest)
     loaded = json.loads(path.read_text())
 
+    assert loaded["schema_version"] == 2
     assert loaded["environment"]["cell_obs_pixel_size"] == 40
     assert loaded["model"]["type"] == "stock_cnn"
+    assert loaded["model"]["requested_policy"] == "CnnPolicy"
+    assert loaded["model"]["features_extractor_class"].endswith("NatureCNN")
     assert loaded["timesteps"] == {
         "final_total": None,
         "initial": 0,
@@ -345,3 +389,27 @@ def test_run_manifest_is_json_and_records_resolved_contract(tmp_path: Path) -> N
         "target_total": 256,
     }
     assert loaded["git"]["commit"]
+
+
+def test_actual_model_contract_is_validated_and_checkpoint_is_fingerprinted(tmp_path: Path) -> None:
+    NatureCNN = type("NatureCNN", (), {})
+    UnsupportedExtractor = type("UnsupportedExtractor", (), {})
+    Policy = type("ActorCriticCnnPolicy", (), {})
+    Model = type("PPO", (), {})
+    checkpoint = tmp_path / "checkpoint.zip"
+    checkpoint.write_bytes(b"checkpoint contents")
+
+    policy = Policy()
+    policy.features_extractor = NatureCNN()
+    model = Model()
+    model.policy = policy
+    model.policy_kwargs = {"normalize_images": True}
+
+    summary = validate_and_describe_model(model, "stock_cnn", checkpoint_path=str(checkpoint))
+
+    assert summary["features_extractor_class"].endswith("NatureCNN")
+    assert len(summary["checkpoint_sha256"]) == 64
+
+    policy.features_extractor = UnsupportedExtractor()
+    with pytest.raises(ValueError, match="Model contract mismatch"):
+        validate_and_describe_model(model, "stock_cnn")

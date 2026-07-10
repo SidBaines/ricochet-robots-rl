@@ -105,6 +105,7 @@ def test_phase1_stock_cnn_run_writes_reloadable_model_and_manifest(tmp_path: Pat
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text())
     assert manifest["model"]["type"] == "stock_cnn"
+    assert manifest["model"]["features_extractor_class"].endswith("NatureCNN")
     assert manifest["environment"]["cell_obs_pixel_size"] == 40
     assert manifest["timesteps"]["requested_additional"] == 64
     assert manifest["timesteps"]["final_total"] == 64

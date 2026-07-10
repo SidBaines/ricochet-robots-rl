@@ -505,6 +505,10 @@ class BankSampler:
         self.eval_fraction = float(eval_fraction)
         self.split_seed = int(split_seed)
         self.split_key = split_key
+        # Allocation decisions for repeated stratified draws must advance as a
+        # stream. Recreating an RNG from ``seed`` on every episode collapses a
+        # multi-band curriculum to one repeatedly selected band.
+        self._stratified_rng = np.random.default_rng(seed)
         # Cache of pre-filtered, shuffled views for fast per-episode sampling
         # key -> { 'df': DataFrame, 'order': np.ndarray[int], 'pos': int, 'rng': np.random.Generator }
         self._criteria_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
@@ -516,6 +520,7 @@ class BankSampler:
     def reseed(self, seed: Optional[int]) -> None:
         """Restart every cached sampling stream from ``seed``."""
         self.seed = seed
+        self._stratified_rng = np.random.default_rng(seed)
         self._criteria_cache.clear()
         self._cache_order.clear()
 
@@ -706,8 +711,10 @@ class BankSampler:
         """
         if total_count <= 0 or len(bands) == 0:
             return []
-        effective_seed = self.seed if random_seed is None else random_seed
-        rng = np.random.default_rng(effective_seed)
+        # ``random_seed`` requests a standalone reproducible draw. Normal
+        # episode sampling advances the sampler-owned stream and is replayed
+        # only when ``reseed`` is called.
+        rng = self._stratified_rng if random_seed is None else np.random.default_rng(random_seed)
         weights = np.array([float(b.get("weight", 1.0)) for b in bands], dtype=float)
         weights = np.maximum(weights, 0.0)
         if weights.sum() <= 0:
@@ -733,8 +740,9 @@ class BankSampler:
                 base_alloc[int(idx)] += 1
 
         band_configs: List[Dict[str, Any]] = []
-        band_seeds: List[int] = []
-        for band in bands:
+        band_seeds: List[Optional[int]] = []
+        band_seed_root = self.seed if random_seed is None else random_seed
+        for band_index, band in enumerate(bands):
             band_configs.append({
                 "min_optimal_length": band.get("min_optimal_length"),
                 "max_optimal_length": band.get("max_optimal_length"),
@@ -742,13 +750,17 @@ class BankSampler:
                 "max_robots_moved": band.get("max_robots_moved"),
                 "weight": float(band.get("weight", 1.0)),
             })
-            # Precompute the iterator seed so fallback sampling remains deterministic
-            if effective_seed is None:
-                band_seeds.append(int(rng.integers(0, 2**31 - 1)))
+            # Keep each band's row iterator stable across episode calls while
+            # giving overlapping bands independent deterministic orders.
+            if band_seed_root is None:
+                band_seeds.append(None)
             else:
-                # Derive separate deterministic streams so overlapping bands do
-                # not all traverse their filtered rows in the same order.
-                band_seeds.append(int(rng.integers(0, 2**31 - 1)))
+                seed_material = json.dumps(
+                    [int(band_seed_root), band_index, band_configs[-1]],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                band_seeds.append(int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big"))
 
         plan_details: List[Dict[str, Any]] = []
         out: List[PuzzleMetadata] = []
