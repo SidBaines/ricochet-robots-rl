@@ -51,3 +51,5 @@ baseline_episodes_per_puzzle: 20
 overfit_puzzles_per_stratum: 4
 overfit_stochastic_episodes_per_puzzle: 20
 device: auto
+wandb_project: ricochet-robots-rl
+wandb_run_name: phase4-16x16-big

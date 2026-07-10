@@ -72,6 +72,8 @@ class Phase2Config:
     curriculum_window: int = 500
     curriculum_check_frequency: int = 100
     curriculum_max_episodes_per_stage: int | None = None
+    wandb_project: str | None = None
+    wandb_run_name: str | None = None
     training_seeds: tuple[int, ...] = (11, 29, 47)
     checkpoints: tuple[int, ...] = (0, 10_240, 25_600, 51_200)
     n_envs: int = 8
@@ -724,6 +726,65 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
     )
 
 
+def _maybe_init_wandb(config: Phase2Config, *, seed: int, output_dir: Path) -> Any:
+    """Start a W&B run for one training seed when configured; else None."""
+    if config.wandb_project is None:
+        return None
+    import wandb
+
+    run_name = config.wandb_run_name or output_dir.name
+    return wandb.init(
+        project=config.wandb_project,
+        name=f"{run_name}-seed{seed}",
+        config=asdict(config),
+        dir=str(output_dir),
+    )
+
+
+def _make_wandb_rollout_callback(wandb_run: Any, manager: Any, log_every_rollouts: int = 5) -> Any:
+    """Log rollout-level training stats and curriculum state to W&B."""
+    import numpy as _np
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class _WandbRolloutCallback(BaseCallback):
+        def __init__(self) -> None:
+            super().__init__()
+            self._rollouts = 0
+
+        def _on_step(self) -> bool:
+            return True
+
+        def _on_rollout_end(self) -> None:
+            self._rollouts += 1
+            if self._rollouts % log_every_rollouts != 0:
+                return
+            payload: Dict[str, Any] = {"train/timesteps": self.num_timesteps}
+            buffer = list(self.model.ep_info_buffer or [])
+            if buffer:
+                payload["rollout/ep_rew_mean"] = float(_np.mean([e["r"] for e in buffer]))
+                payload["rollout/ep_len_mean"] = float(_np.mean([e["l"] for e in buffer]))
+            if manager is not None:
+                payload["curriculum/level"] = manager.get_current_level()
+                payload["curriculum/window_success_rate"] = manager.get_success_rate()
+                payload["curriculum/episodes_at_level"] = manager.get_episodes_at_level()
+            wandb_run.log(payload, step=self.num_timesteps)
+
+    return _WandbRolloutCallback()
+
+
+def _wandb_eval_payload(prefix: str, summary: Mapping[str, Any]) -> Dict[str, Any]:
+    payload = {
+        f"{prefix}/success_rate": summary["success_rate"],
+        f"{prefix}/no_movement_rate": summary["no_movement_rate"],
+        f"{prefix}/mean_episode_length": summary["mean_episode_length"],
+    }
+    for length, by_length in summary.get("by_optimal_length", {}).items():
+        payload[f"{prefix}/success_len_{length}"] = by_length["success_rate"]
+    for robots, by_robots in summary.get("by_robots_moved", {}).items():
+        payload[f"{prefix}/success_robots_{robots}"] = by_robots["success_rate"]
+    return payload
+
+
 def _resolve_device(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -928,13 +989,19 @@ def train_seed(
     factory = _training_factory(bank, config, seed)
     vec_env = make_vec_env(factory, n_envs=config.n_envs, seed=seed)
     model = _build_model(vec_env, config, seed=seed, device=device)
+    wandb_run = _maybe_init_wandb(config, seed=seed, output_dir=output_dir)
+    learn_callback = (
+        _make_wandb_rollout_callback(wandb_run, factory.curriculum_manager)
+        if wandb_run is not None
+        else None
+    )
     curve: List[Dict[str, Any]] = []
     training_seconds = 0.0
     for checkpoint_index, checkpoint in enumerate(config.checkpoints):
         if checkpoint_index > 0:
             requested = checkpoint - config.checkpoints[checkpoint_index - 1]
             started = time.perf_counter()
-            model.learn(total_timesteps=requested, reset_num_timesteps=False)
+            model.learn(total_timesteps=requested, reset_num_timesteps=False, callback=learn_callback)
             if device == "mps":
                 torch.mps.synchronize()
             training_seconds += time.perf_counter() - started
@@ -998,6 +1065,16 @@ def train_seed(
             f"val-stoch-by-length={by_length}",
             flush=True,
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    **_wandb_eval_payload("eval_train_det", training_deterministic_eval["summary"]),
+                    **_wandb_eval_payload("eval_train_stoch", training_stochastic_eval["summary"]),
+                    **_wandb_eval_payload("eval_val_det", deterministic_eval["summary"]),
+                    **_wandb_eval_payload("eval_val_stoch", stochastic_eval["summary"]),
+                },
+                step=int(model.num_timesteps),
+            )
 
     deterministic_test = evaluate_controller(
         "model",
@@ -1046,6 +1123,17 @@ def train_seed(
         },
         "checkpoint": str(checkpoint_path.with_suffix(".zip")),
     }
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                **_wandb_eval_payload("test_det", deterministic_test["summary"]),
+                **_wandb_eval_payload("test_stoch", stochastic_test["summary"]),
+                "final/training_steps_per_second": result["training_steps_per_second"],
+                "final/curriculum_level": result["curriculum"]["final_level"],
+            },
+            step=int(model.num_timesteps),
+        )
+        wandb_run.finish()
     _atomic_json(output_dir / f"seed_{seed}" / "result.json", result)
     vec_env.close()
     return result
