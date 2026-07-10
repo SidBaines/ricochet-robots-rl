@@ -193,3 +193,9 @@ How to enable and where to look:
 - Overfit gate (28 puzzles): 89.3% stochastic — passed.
 - Seed 11, 409,600 steps: held-out test **68.5% deterministic / 70.7% stochastic** (gate passed, 70.7% vs 16.6%). By stratum: single-robot plans essentially solved (**99–100%** at every length); two-robot blocker puzzles **23–30%** (vs 0–8% baselines). Validation still rising at the final checkpoint (47.3% → 63.6% deterministic between 205k and 410k).
 - Next lever (phase 2c, running): two-robot bands were only ~13% of uniform training exposure; explicit band weights now lift them to ~41%, budget doubled to 819,200 steps, overfit gate skipped (already proven). Curriculum manager honours explicit `bands` on a level spec; `Phase2Config` gains `two_robot_band_weight` and `run_overfit_milestone`.
+
+### Phase 2c result: two-robot weakness largely fixed (2026-07-10)
+
+- `configs/phase2c_grid_cnn_2robot.yaml` (same phase2b fixture/split; two-robot exposure 13%→41%; 819,200 steps, seed 11): held-out test **87.0% deterministic / 84.8% stochastic** (gate 16.6%). By stratum: single-robot **100%/97%**, two-robot blocker puzzles **68%/67%** (phase2b: 23%/30%; heuristic baselines: 0–8%). Mean successful optimality gap 0.66 moves; deterministic no-movement rate 28.9% (was 91% for the broken stock baseline).
+- At equal budget (409,600 steps) the reweighted run reached 76.4% deterministic validation vs 63.6% unweighted — the distribution shift, not just the longer budget, drives the gain. Validation was still improving at 819k.
+- Next: scale the recipe to the real game footprint (16×16, 4 robots, 16 actions) as phase 3.
