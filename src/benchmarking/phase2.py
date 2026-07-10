@@ -205,8 +205,65 @@ def _level(config: Phase2Config) -> Dict[str, Any]:
     return level
 
 
-def build_fixture_bank(bank_dir: Path, config: Phase2Config) -> Dict[str, Any]:
-    """Build or validate the deterministic solver-labelled fixture bank."""
+def _fixture_attempt(args: tuple[int, "Phase2Config"]) -> "PuzzleMetadata | None":
+    """Generate and label one fixture candidate. Deterministic given the seed."""
+    seed, config = args
+    board = generate_board_from_spec_with_seed(
+        height=config.height,
+        width=config.width,
+        num_robots=config.num_robots,
+        edge_t_per_quadrant=config.edge_t_per_quadrant,
+        central_l_per_quadrant=config.central_l_per_quadrant,
+        seed=seed,
+    )
+    solve_started = time.perf_counter()
+    result = solve_bfs_with_metadata(
+        board,
+        max_depth=config.solver_max_depth,
+        max_nodes=config.solver_max_nodes,
+    )
+    solve_ms = int((time.perf_counter() - solve_started) * 1_000)
+    if result is None or not result.found or int(result.depth) == 0:
+        return None
+    actions = [int(robot_id) * 4 + int(direction) for robot_id, direction in result.actions]
+    robots_moved = count_robots_moved(actions)
+    if not config.min_optimal_length <= int(result.depth) <= config.max_optimal_length:
+        return None
+    if not config.min_robots_moved <= robots_moved <= config.max_robots_moved:
+        return None
+    solver_key = SolverKey(
+        algorithm="BFS",
+        max_depth=config.solver_max_depth,
+        max_nodes=config.solver_max_nodes,
+    )
+    return PuzzleMetadata(
+        seed=seed,
+        spec_key=config.spec_key,
+        solver_key=solver_key,
+        board_hash=compute_board_hash(board),
+        optimal_length=int(result.depth),
+        robots_moved=robots_moved,
+        nodes_expanded=int(result.nodes_expanded),
+        solve_time_ms=solve_ms,
+        solved_within_limits=True,
+        hit_depth_limit=int(result.depth) >= config.solver_max_depth,
+        hit_node_limit=int(result.nodes_expanded) >= config.solver_max_nodes,
+        actions_encoded=actions,
+        created_at=0.0,
+        run_id="phase2-deterministic-fixture",
+        board_seed=seed,
+        layout_hash=compute_layout_hash(board),
+        layout_blob=serialize_layout_to_blob(board),
+    )
+
+
+def build_fixture_bank(bank_dir: Path, config: Phase2Config, *, workers: int = 1) -> Dict[str, Any]:
+    """Build or validate the deterministic solver-labelled fixture bank.
+
+    ``workers`` parallelizes generation/labelling only; candidates are
+    assembled and deduplicated in seed order, so the stored fixture and its
+    fingerprint are identical for any worker count.
+    """
     fixture_path = bank_dir / "phase2_fixture.json"
     expected_definition = {
         "schema_version": 1,
@@ -235,63 +292,27 @@ def build_fixture_bank(bank_dir: Path, config: Phase2Config) -> Dict[str, Any]:
     if bank.get_puzzle_count() != 0:
         raise ValueError(f"Refusing to populate non-empty bank without {fixture_path.name}: {bank_dir}")
 
-    solver_key = SolverKey(
-        algorithm="BFS",
-        max_depth=config.solver_max_depth,
-        max_nodes=config.solver_max_nodes,
-    )
     puzzles: List[PuzzleMetadata] = []
     seen_boards: set[bytes] = set()
     started = time.perf_counter()
-    for seed in range(config.fixture_attempts):
-        board = generate_board_from_spec_with_seed(
-            height=config.height,
-            width=config.width,
-            num_robots=config.num_robots,
-            edge_t_per_quadrant=config.edge_t_per_quadrant,
-            central_l_per_quadrant=config.central_l_per_quadrant,
-            seed=seed,
-        )
-        solve_started = time.perf_counter()
-        result = solve_bfs_with_metadata(
-            board,
-            max_depth=config.solver_max_depth,
-            max_nodes=config.solver_max_nodes,
-        )
-        solve_ms = int((time.perf_counter() - solve_started) * 1_000)
-        if result is None or not result.found or int(result.depth) == 0:
-            continue
-        actions = [int(robot_id) * 4 + int(direction) for robot_id, direction in result.actions]
-        robots_moved = count_robots_moved(actions)
-        if not config.min_optimal_length <= int(result.depth) <= config.max_optimal_length:
-            continue
-        if not config.min_robots_moved <= robots_moved <= config.max_robots_moved:
-            continue
-        board_hash = compute_board_hash(board)
-        if board_hash in seen_boards:
-            continue
-        seen_boards.add(board_hash)
-        puzzles.append(
-            PuzzleMetadata(
-                seed=seed,
-                spec_key=config.spec_key,
-                solver_key=solver_key,
-                board_hash=board_hash,
-                optimal_length=int(result.depth),
-                robots_moved=robots_moved,
-                nodes_expanded=int(result.nodes_expanded),
-                solve_time_ms=solve_ms,
-                solved_within_limits=True,
-                hit_depth_limit=int(result.depth) >= config.solver_max_depth,
-                hit_node_limit=int(result.nodes_expanded) >= config.solver_max_nodes,
-                actions_encoded=actions,
-                created_at=0.0,
-                run_id="phase2-deterministic-fixture",
-                board_seed=seed,
-                layout_hash=compute_layout_hash(board),
-                layout_blob=serialize_layout_to_blob(board),
+    attempts = [(seed, config) for seed in range(config.fixture_attempts)]
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            candidates: Iterator[PuzzleMetadata | None] = pool.map(
+                _fixture_attempt, attempts, chunksize=64
             )
-        )
+            candidate_list = list(candidates)
+    else:
+        candidate_list = [_fixture_attempt(attempt) for attempt in attempts]
+    for candidate in candidate_list:  # seed order: dedup stays deterministic
+        if candidate is None:
+            continue
+        if candidate.board_hash in seen_boards:
+            continue
+        seen_boards.add(candidate.board_hash)
+        puzzles.append(candidate)
 
     if not puzzles:
         raise RuntimeError("The deterministic Phase 2 fixture produced no matching puzzles")
