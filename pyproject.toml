@@ -49,6 +49,7 @@ testpaths = ["src/tests"]
 addopts = "-ra --strict-markers"
 markers = [
   "integration: crosses multiple production components",
+  "mps: requires an Apple Metal Performance Shaders device",
   "slow: takes materially longer than a unit test",
   "training: performs an RL learning update",
 ]

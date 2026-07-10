@@ -100,6 +100,7 @@ def test_phase1_stock_cnn_run_writes_reloadable_model_and_manifest(tmp_path: Pat
     assert len(models) == 1
     model = PPO.load(models[0], device="cpu")
     assert type(model.policy.features_extractor).__name__ == "NatureCNN"
+    assert model.seed == 17
 
     manifests = list(log_dir.glob("*/run_manifest.json"))
     assert len(manifests) == 1

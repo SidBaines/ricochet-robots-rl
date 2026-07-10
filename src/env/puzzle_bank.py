@@ -686,6 +686,38 @@ class BankSampler:
         # Future: implement stratified strategy here
         return out
 
+    def list_puzzles(
+        self,
+        spec_key: SpecKey,
+        min_optimal_length: Optional[int] = None,
+        max_optimal_length: Optional[int] = None,
+        min_robots_moved: Optional[int] = None,
+        max_robots_moved: Optional[int] = None,
+    ) -> List[PuzzleMetadata]:
+        """Return every matching puzzle in stable fingerprint order.
+
+        Unlike the sampling methods, this never cycles or reshuffles rows. It
+        is intended for immutable benchmark-suite construction and audits.
+        """
+        df = self.bank.get_partition_dataframe(spec_key)
+        if len(df) == 0:
+            return []
+        mask = pd.Series([True] * len(df), index=df.index)
+        if min_optimal_length is not None:
+            mask &= df["optimal_length"] >= min_optimal_length
+        if max_optimal_length is not None:
+            mask &= df["optimal_length"] <= max_optimal_length
+        if min_robots_moved is not None:
+            mask &= df["robots_moved"] >= min_robots_moved
+        if max_robots_moved is not None:
+            mask &= df["robots_moved"] <= max_robots_moved
+        mask &= self._split_mask(df)
+        filtered = df[mask].copy()
+        sort_columns = [column for column in (self.split_key, "board_hash", "seed") if column in filtered.columns]
+        if sort_columns:
+            filtered = filtered.sort_values(sort_columns, kind="stable")
+        return [PuzzleMetadata.from_dict(row.to_dict()) for _, row in filtered.iterrows()]
+
     def sample_puzzles_stratified(
         self,
         spec_key: SpecKey,

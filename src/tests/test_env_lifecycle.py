@@ -28,6 +28,18 @@ def test_profiler_is_opt_in() -> None:
     assert profiler.enabled is False
 
 
+def test_profiler_synchronizes_accelerator_around_measurement(monkeypatch) -> None:
+    profiler = Profiler(enable_gpu_profiling=False)
+    profiler.enable()
+    calls = []
+    monkeypatch.setattr(profiler, "_synchronize_accelerator", lambda: calls.append("sync"))
+
+    with profiler.profile("accelerated", track_memory=False):
+        pass
+
+    assert calls == ["sync", "sync"]
+
+
 def test_unseeded_resets_advance_and_explicit_seed_replays_stream() -> None:
     env = RicochetRobotsEnv(height=8, width=8, num_robots=2, seed=123)
 

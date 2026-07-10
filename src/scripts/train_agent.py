@@ -1172,6 +1172,7 @@ def main() -> None:
                 normalize_advantage=args.normalize_advantage,
                 tensorboard_log=args.log_dir if args.monitor_tensorboard else None,
                 device=args.device,
+                seed=args.seed,
                 verbose=1,
             )
 

@@ -116,6 +116,19 @@ class Profiler:
             process_memory_mb=process_memory,
             available_memory_mb=available_memory
         )
+
+    def _synchronize_accelerator(self) -> None:
+        """Wait for queued accelerator work so timings include device execution."""
+        if not self.enable_gpu_profiling:
+            return
+        try:
+            if self._has_cuda:
+                torch.cuda.synchronize()
+            elif self._has_mps and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+                torch.mps.synchronize()
+        except Exception:
+            # Profiling must never make the measured operation fail.
+            pass
     
     @contextmanager
     def profile(self, name: str, track_memory: bool = True):
@@ -124,25 +137,18 @@ class Profiler:
             yield
             return
         
+        self._synchronize_accelerator()
+
         # Take initial memory snapshot
         if track_memory:
             initial_snapshot = self._take_memory_snapshot()
-            if self.enable_gpu_profiling:
-                try:
-                    if self._has_cuda:
-                        torch.cuda.synchronize()
-                    elif self._has_mps:
-                        # Ensure pending kernels are flushed on MPS
-                        if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
-                            torch.mps.synchronize()
-                except Exception:
-                    pass
         
         start_time = time.time()
         
         try:
             yield
         finally:
+            self._synchronize_accelerator()
             end_time = time.time()
             duration = end_time - start_time
             

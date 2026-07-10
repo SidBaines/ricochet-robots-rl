@@ -141,6 +141,10 @@ def test_sampler_seed_replays_and_hash_splits_are_disjoint():
         assert eval_seeds
         assert train_seeds.isdisjoint(eval_seeds)
         assert train_seeds | eval_seeds == {10_000 + i for i in range(100)}
+        assert [p.seed for p in train.list_puzzles(spec)] == sorted(
+            train_seeds,
+            key=lambda seed: ((seed + 1).to_bytes(32, "big"), seed.to_bytes(32, "big"), seed),
+        )
 
 
 def test_repeated_single_draw_stratification_advances_and_reseeds() -> None:

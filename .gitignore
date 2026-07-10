@@ -1,5 +1,6 @@
 *__pycache__*
 rlenv/
+.venv*/
 checkpoints/
 runs
 .DS_Store
