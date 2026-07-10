@@ -199,3 +199,10 @@ How to enable and where to look:
 - `configs/phase2c_grid_cnn_2robot.yaml` (same phase2b fixture/split; two-robot exposure 13%→41%; 819,200 steps, seed 11): held-out test **87.0% deterministic / 84.8% stochastic** (gate 16.6%). By stratum: single-robot **100%/97%**, two-robot blocker puzzles **68%/67%** (phase2b: 23%/30%; heuristic baselines: 0–8%). Mean successful optimality gap 0.66 moves; deterministic no-movement rate 28.9% (was 91% for the broken stock baseline).
 - At equal budget (409,600 steps) the reweighted run reached 76.4% deterministic validation vs 63.6% unweighted — the distribution shift, not just the longer budget, drives the gain. Validation was still improving at 819k.
 - Next: scale the recipe to the real game footprint (16×16, 4 robots, 16 actions) as phase 3.
+
+### Phase 3 (16×16, 4 robots): no-curriculum control fails; staged curriculum launched (2026-07-10)
+
+- New fixture (`configs/phase3_16x16_grid_cnn.yaml`, `artifacts/phase3_bank`): 16×16, 4 robots, 2 edge-T + 2 central-L walls per quadrant, lengths 1–6, robots-moved 1–2 — 6,588 puzzles over 11 strata, split 4,933/830/825. `build_fixture_bank` gained a deterministic parallel mode (verified byte-identical fingerprints; 6× faster) after a 15-minute sequential build was killed.
+- Baselines on this distribution: random 6.3%, target-robot-only 12.3%, oracle 100%.
+- Control run (same grid_cnn recipe, 6 conv layers, weighted bands, 1.64M steps, no curriculum): **flat** — validation ≤3.1% throughout, final held-out test 1.6% det / 5.1% stoch. With ~41% of episodes being two-robot length-5/6 puzzles the policy never stumbles on reward; a pure exploration failure, not capacity (identical recipe reached 87% on 8×8).
+- Response: staged length curriculum through the existing `BankCurriculumManager` (`curriculum_stage_max_lengths: [2, 4, 6]`, advance at 70% train success over a 500-episode window after ≥5,000 episodes per stage). `grid_cnn` also exposed as `model.type` in `train_agent.py`. Run `phase3b_16x16_staged` in progress.
