@@ -37,8 +37,8 @@ training_seeds: [11]
 checkpoints: [0, 1024000, 2048000, 4096000, 7168000, 10240000]
 n_envs: 16
 n_steps: 128
-batch_size: 512
-n_epochs: 4
+batch_size: 1024
+n_epochs: 2
 learning_rate: 0.0003
 gamma: 0.99
 gae_lambda: 0.95
