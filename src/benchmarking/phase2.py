@@ -74,6 +74,10 @@ class Phase2Config:
     curriculum_max_episodes_per_stage: int | None = None
     wandb_project: str | None = None
     wandb_run_name: str | None = None
+    bc_pretrain_epochs: int = 0
+    bc_batch_size: int = 1024
+    bc_learning_rate: float = 3e-4
+    bc_max_puzzles: int | None = None
     training_seeds: tuple[int, ...] = (11, 29, 47)
     checkpoints: tuple[int, ...] = (0, 10_240, 25_600, 51_200)
     n_envs: int = 8
@@ -116,6 +120,10 @@ class Phase2Config:
             raise ValueError("stock_cnn requires an RGB observation mode")
         if self.policy in {"grid_cnn", "grid_resnet"} and self.obs_mode != "image":
             raise ValueError(f"{self.policy} requires the structured-plane 'image' observation mode")
+        if self.bc_pretrain_epochs < 0:
+            raise ValueError("bc_pretrain_epochs must be non-negative")
+        if self.bc_pretrain_epochs > 0 and self.obs_mode != "image":
+            raise ValueError("BC pretraining requires the structured-plane 'image' observation mode")
         if self.curriculum_stage_max_lengths is not None:
             stages = self.curriculum_stage_max_lengths
             if tuple(sorted(set(stages))) != stages:
@@ -679,6 +687,8 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
             "normalize_images": True,
         }
     elif config.policy == "grid_resnet":  # residual variant on structured planes
+        import torch.nn as nn
+
         from src.models.grid_cnn import GridPlanesResNet
 
         policy_name = "MlpPolicy"
@@ -690,9 +700,19 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
                 "n_blocks": config.n_conv_layers,
             },
             "net_arch": dict(pi=[128, 128], vf=[128, 128]),
+            # SB3's default Tanh heads saturate on the unbounded ReLU features
+            # these extractors emit (62% of units past |2| at init on 16x16),
+            # crushing gradients for both BC and PPO.
+            "activation_fn": nn.ReLU,
+            # Keep the extractor's default PyTorch init: SB3's orthogonal
+            # sqrt(2) init compounds through residual branches and inflates
+            # feature scale, stalling supervised cloning.
+            "ortho_init": False,
             "normalize_images": False,
         }
     else:  # grid_cnn on structured planes (already float in [0, 1])
+        import torch.nn as nn
+
         from src.models.grid_cnn import GridPlanesCnn
 
         policy_name = "MlpPolicy"
@@ -704,6 +724,8 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
                 "n_conv_layers": config.n_conv_layers,
             },
             "net_arch": dict(pi=[128, 128], vf=[128, 128]),
+            "activation_fn": nn.ReLU,
+            "ortho_init": False,
             "normalize_images": False,
         }
     return PPO(
@@ -724,6 +746,110 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
         policy_kwargs=policy_kwargs,
         verbose=0,
     )
+
+
+def _bc_dataset(
+    puzzles: Sequence[PuzzleMetadata],
+    config: Phase2Config,
+    *,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Replay stored optimal plans into (observation, optimal_action) pairs.
+
+    Every fixture puzzle carries its BFS-optimal action sequence; the pairs
+    are the states along that plan. Observations are binary planes, stored as
+    uint8 to keep the dataset compact.
+    """
+    environment_spec = config.environment_spec(seed)
+    selected = list(puzzles)
+    if config.bc_max_puzzles is not None and len(selected) > config.bc_max_puzzles:
+        order = np.random.default_rng(seed).permutation(len(selected))[: config.bc_max_puzzles]
+        selected = [selected[index] for index in sorted(order)]
+    observations: List[np.ndarray] = []
+    actions: List[int] = []
+    for puzzle in selected:
+        layout = create_fixed_layout_from_seed(puzzle)
+        env = RicochetRobotsEnv(**environment_spec.to_env_kwargs(fixed_layout=layout))
+        obs, _ = env.reset()
+        terminated = False
+        for action in puzzle.actions_encoded:
+            observations.append(obs.astype(np.uint8))
+            actions.append(int(action))
+            obs, _, terminated, truncated, _ = env.step(int(action))
+            if terminated or truncated:
+                break
+        env.close()
+        if not terminated:
+            raise RuntimeError(f"Stored optimal plan failed to reach the goal for {_puzzle_id(puzzle)}")
+    return np.stack(observations), np.asarray(actions, dtype=np.int64)
+
+
+def _bc_pretrain(
+    model: Any,
+    puzzles: Sequence[PuzzleMetadata],
+    config: Phase2Config,
+    *,
+    seed: int,
+    device: str,
+    wandb_run: Any = None,
+) -> Dict[str, Any]:
+    """Behaviour-clone the policy on optimal plans before PPO fine-tuning."""
+    import torch
+
+    started = time.perf_counter()
+    observations, actions = _bc_dataset(puzzles, config, seed=seed)
+    build_seconds = time.perf_counter() - started
+    print(
+        f"[phase2 bc] dataset: {len(actions)} pairs from {len(puzzles)} puzzles "
+        f"({build_seconds:.0f}s)",
+        flush=True,
+    )
+    obs_tensor = torch.as_tensor(observations, dtype=torch.float32, device=device)
+    action_tensor = torch.as_tensor(actions, device=device)
+    # PPO's action head ships with orthogonal gain 0.01, which scales all
+    # upstream supervised gradients down ~100x and leaves cross-entropy stuck
+    # on the uniform plateau. Re-initialize it at unit gain for cloning.
+    torch.nn.init.orthogonal_(model.policy.action_net.weight, gain=1.0)
+    torch.nn.init.zeros_(model.policy.action_net.bias)
+    optimizer = torch.optim.Adam(model.policy.parameters(), lr=config.bc_learning_rate)
+    generator = torch.Generator().manual_seed(seed)
+    history: List[Dict[str, float]] = []
+    model.policy.train()
+    for epoch in range(config.bc_pretrain_epochs):
+        order = torch.randperm(len(action_tensor), generator=generator).to(device)
+        total_loss = 0.0
+        total_correct = 0
+        for start in range(0, len(order), config.bc_batch_size):
+            index = order[start : start + config.bc_batch_size]
+            distribution = model.policy.get_distribution(obs_tensor[index])
+            log_prob = distribution.log_prob(action_tensor[index])
+            loss = -log_prob.mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach()) * len(index)
+            predicted = distribution.distribution.probs.argmax(dim=-1)
+            total_correct += int((predicted == action_tensor[index]).sum())
+        epoch_stats = {
+            "loss": total_loss / len(action_tensor),
+            "accuracy": total_correct / len(action_tensor),
+        }
+        history.append(epoch_stats)
+        print(
+            f"[phase2 bc] epoch {epoch + 1}/{config.bc_pretrain_epochs} "
+            f"loss={epoch_stats['loss']:.3f} accuracy={epoch_stats['accuracy']:.1%}",
+            flush=True,
+        )
+        if wandb_run is not None:
+            wandb_run.log({"bc/loss": epoch_stats["loss"], "bc/accuracy": epoch_stats["accuracy"], "bc/epoch": epoch + 1})
+    model.policy.eval()
+    return {
+        "pairs": len(actions),
+        "puzzles": len(puzzles),
+        "dataset_seconds": build_seconds,
+        "epochs": history,
+        "total_seconds": time.perf_counter() - started,
+    }
 
 
 def _maybe_init_wandb(config: Phase2Config, *, seed: int, output_dir: Path) -> Any:
@@ -982,6 +1108,7 @@ def train_seed(
     seed: int,
     device: str,
     output_dir: Path,
+    bc_puzzles: Sequence[PuzzleMetadata] | None = None,
 ) -> Dict[str, Any]:
     import torch
     from stable_baselines3.common.env_util import make_vec_env
@@ -995,6 +1122,13 @@ def train_seed(
         if wandb_run is not None
         else None
     )
+    bc_stats: Dict[str, Any] | None = None
+    if config.bc_pretrain_epochs > 0:
+        if not bc_puzzles:
+            raise ValueError("BC pretraining requested but no training puzzles were provided")
+        # Runs before the checkpoint loop, so the step-0 evaluation measures
+        # the cloned policy on its own, before any PPO fine-tuning.
+        bc_stats = _bc_pretrain(model, bc_puzzles, config, seed=seed, device=device, wandb_run=wandb_run)
     curve: List[Dict[str, Any]] = []
     training_seconds = 0.0
     for checkpoint_index, checkpoint in enumerate(config.checkpoints):
@@ -1110,6 +1244,7 @@ def train_seed(
             "action_space": str(model.action_space),
         },
         "curve": curve,
+        "bc_pretrain": bc_stats,
         "curriculum": {
             "staged": config.curriculum_stage_max_lengths is not None,
             "final_level": factory.curriculum_manager.get_current_level(),
@@ -1337,8 +1472,9 @@ def run_phase2_benchmark(
         ),
         flush=True,
     )
+    training_membership = [lookup[puzzle_id] for puzzle_id in split_manifest["memberships"]["train"]]
     if config.run_overfit_milestone:
-        training_lookup = [lookup[puzzle_id] for puzzle_id in split_manifest["memberships"]["train"]]
+        training_lookup = training_membership
         overfit_groups: Dict[str, List[PuzzleMetadata]] = defaultdict(list)
         for puzzle in training_lookup:
             overfit_groups[_stratum(puzzle)].append(puzzle)
@@ -1370,6 +1506,7 @@ def run_phase2_benchmark(
             seed=seed,
             device=device,
             output_dir=output_dir,
+            bc_puzzles=training_membership,
         ))
     aggregate = {
         "deterministic": _seed_aggregate(seed_results, "deterministic"),
