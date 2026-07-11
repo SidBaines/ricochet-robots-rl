@@ -216,3 +216,31 @@ How to enable and where to look:
 - Result: **held-out gate failed** — final stochastic test 3.3% vs 8.5% required; deterministic 0.8% with 95% no-movement (argmax collapse). Mid-run validation showed real learning (length-1 held-out peaked at 67% during stages 0–1), but stages advanced only via the safety-valve (windows 25%/18%/10%), and by the end the policy had regressed to ~random on the test mix while grinding on stage-2 distributions it couldn't solve.
 - Diagnosis: at 16×16 with 16 actions and horizon 20, random success on length ≥3 is ~0–5%, so from-scratch PPO gets almost no reward signal past the easiest stage — the binding constraint is **exploration/credit assignment, not data, capacity, or wall-clock**. The safety-valve prevented stalling but demonstrated that advancing without mastery trades old skill for no new skill.
 - Next lever (in progress): **behaviour-cloning warmstart** — every fixture puzzle carries its BFS-optimal action sequence; pretrain the policy supervised on optimal actions, then PPO fine-tune under the same benchmark/gates.
+
+### Phase 4b: BC warmstart — implemented, PAUSED mid-run at user request (2026-07-10 ~23:05)
+
+**State: code committed (`0fb6e2f`), first run deliberately killed ~32 min in to rest the machine. Nothing is lost that matters — the harness only saves weights at the end of a run, so the resume is simply a rerun from scratch.**
+
+- Implementation (committed): `Phase2Config` gains `bc_pretrain_epochs` / `bc_batch_size` / `bc_learning_rate` / `bc_max_puzzles`; `train_seed` extracts every `(observation, optimal-first-action)` pair by replaying each training puzzle's stored BFS plan, pretrains the policy's action head with cross-entropy on MPS, then hands the warmstarted network to the normal staged-curriculum PPO loop. Requires `obs_mode: image`. Config: `configs/phase4b_bc_16x16.yaml` (25 BC epochs, batch 1024, lr 1e-3, then the exact phase-4 PPO setup: 10.24M steps, 4-stage curriculum, safety-valve 250k).
+- Evidence from the killed run (log `artifacts/phase2_experiments/phase4b_bc_16x16.log`): dataset extraction produced **210,947 pairs from 41,395 training puzzles in 19s**; BC accuracy climbed 15.0% → **65.0% by epoch 7 of 25** (random = 6.25%), loss 2.522 → 1.188, ~3 min/epoch. The supervised signal is strong — the policy can clearly learn the solver's first-move function, which is exactly the exploration prior PPO was missing.
+
+**To resume (one command, ~5.5–6h total on this machine):**
+
+```bash
+nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py \
+  --config configs/phase4b_bc_16x16.yaml \
+  --bank-dir artifacts/phase4_bank \
+  --output-dir artifacts/phase2_experiments/phase4b_bc_16x16 \
+  > artifacts/phase2_experiments/phase4b_bc_16x16.log 2>&1 &
+```
+
+(Delete or move the old `artifacts/phase2_experiments/phase4b_bc_16x16/` output dir first if it exists — the fixture bank `artifacts/phase4_bank` must be left untouched; its fingerprint validates on start. Expect: ~80 min BC, then ~4.5h PPO at ~630–715 steps/s, checkpoints at 1M/2M/4M/7M/10.24M, W&B run `phase4b-bc-16x16-seed11` in project `ricochet-robots-rl`.)
+
+**What a continuing agent should watch / decide:**
+
+- Success criterion: mean stochastic held-out test ≥ **8.5%** (target-robot-only baseline) — but the real ambition is far above it; phase 2c reached 10× baseline at 8×8.
+- Early sanity: the step-0 checkpoint after BC should already beat the 4.4% random baseline on validation (BC alone should transfer). If it doesn't, BC→policy wiring is suspect.
+- Watch `curriculum/window_success_rate` on W&B: with the BC prior, stages should now advance via the **65% mastery threshold**, not the safety-valve. Repeated safety-valve advancement = the phase-4 failure mode returning.
+- Known risk: PPO fine-tuning can catastrophically forget the BC prior (entropy bonus + policy-gradient noise). If validation collapses after strong step-0 numbers, consider: lower learning rate for PPO (1e-4), lower ent_coef, or adding a KL-to-BC-prior penalty.
+- If BC+PPO clears the gate: run the 3-seed protocol before claiming the milestone, then consider the DRC/recurrence comparison (docs/ResearchPlan.md) on top of this recipe.
+- Background context every new agent should read first: `CLAUDE.md` (hard-won lessons: real-factory benchmarking, no iterrows, fingerprints are contracts, detached long jobs), `docs/GridCnnGeneralizationReport.md` (full experiment arc), and the phase-4 diagnosis above (exploration, not scale, is the 16×16 constraint).

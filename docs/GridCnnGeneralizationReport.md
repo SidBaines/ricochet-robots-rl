@@ -87,6 +87,10 @@ Result: **held-out gate failed** — 3.3% stochastic vs 8.5% required; determini
 
 Updated diagnosis: past the easiest stage, random success on length ≥3 puzzles is ~0–5%, so from-scratch PPO receives almost no reward signal — the binding constraint at 16×16 is **exploration/credit assignment**, which more data, capacity, and wall-clock do not fix. The productive next lever is item 4: **behaviour-cloning warmstart from the bank's stored optimal plans**, then PPO fine-tuning under the same gates. A perf note for anyone rerunning: `BankSampler._split_mask` is now vectorized (was `iterrows()`, 83ms per reset on this bank — see `src/tests/test_bank_split_perf.py`).
 
+## Phase 4b — BC warmstart: implemented, paused mid-first-run
+
+Behaviour-cloning warmstart is implemented and committed (`bc_pretrain_epochs` etc. on `Phase2Config`; `configs/phase4b_bc_16x16.yaml`): before PPO, the policy is trained supervised on every `(state, optimal-first-action)` pair replayed from the training split's stored BFS plans — **210,947 pairs from 41,395 puzzles**, extracted in 19s. The first run was intentionally stopped at BC epoch 7/25 to free the machine; by then optimal-action accuracy had already climbed 15% → **65%** (random 6.25%), so the supervised signal is strong. The harness has no mid-run resume, so continuing means rerunning `phase4b_bc_16x16` from scratch (~5.5–6h). The full resume command, expected timeline, and decision criteria for the continuing agent are in `WorkInProgress.md` under "Phase 4b".
+
 ## Reproduction (16×16 fixture)
 
 ```bash
