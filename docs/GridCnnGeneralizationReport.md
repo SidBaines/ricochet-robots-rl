@@ -79,6 +79,14 @@ The staged mechanism itself works: stage 0 reached the 70% training-success thre
 4. **Behaviour-cloning warmstart** from the bank's stored optimal plans (every fixture puzzle carries its BFS-optimal action sequence).
 5. Multi-seed formal gating only after a single seed clears.
 
+## Phase 4 — the scaling run: items 1–3 alone are not enough
+
+Phase 4 executed the first three recommendations together (`configs/phase4_16x16_big.yaml`, bank `artifacts/phase4_bank`): a 55,143-puzzle fixture (lengths 1–8, robots-moved 1–3, BFS depth 8), a 6.1M-parameter residual `GridPlanesResNet`, a 4-stage length curriculum (1–2 → 1–4 → 1–6 → 1–8) with a 250k-episode stall safety-valve, and 10.24M steps at a measured 716 steps/s. Baselines on this distribution: random 4.4%, target-robot-only 8.5%.
+
+Result: **held-out gate failed** — 3.3% stochastic vs 8.5% required; deterministic 0.8% with 95% no-movement. Mid-run validation showed genuine learning on short puzzles (length-1 held-out peaked at 67% during stages 0–1), but every stage advanced via the safety-valve rather than the 65% mastery threshold (windows 25% / 18% / 10%), and the final policy had regressed to ~random on the test mix.
+
+Updated diagnosis: past the easiest stage, random success on length ≥3 puzzles is ~0–5%, so from-scratch PPO receives almost no reward signal — the binding constraint at 16×16 is **exploration/credit assignment**, which more data, capacity, and wall-clock do not fix. The productive next lever is item 4: **behaviour-cloning warmstart from the bank's stored optimal plans**, then PPO fine-tuning under the same gates. A perf note for anyone rerunning: `BankSampler._split_mask` is now vectorized (was `iterrows()`, 83ms per reset on this bank — see `src/tests/test_bank_split_perf.py`).
+
 ## Reproduction (16×16 fixture)
 
 ```bash
