@@ -15,8 +15,10 @@ The Phase 2 stock-CNN failure was an **observation-encoding × architecture mism
 | Phase 2 easy (8×8, no interior walls, lengths 1–2, 1 robot moved) | 29.5% / 46.7% | 31.7% stoch, 3.1% det | **75.0% ± 7.8% stoch, 69.8% ± 6.5% det** (3 seeds) |
 | Phase 2b hard (8×8, interior walls, lengths 1–4, ≤2 robots moved) | 14.1% / 16.6% | — | 70.7% stoch, 68.5% det (1 seed, 409k steps) |
 | Phase 2c (same fixture, two-robot bands up-weighted, 819k steps) | 14.1% / 16.6% | — | **84.8% stoch, 87.0% det**; single-robot strata 97–100%, two-robot 67–68% |
+| Phase 4 (16×16, 4 robots, lengths 1–8; scale-only) | 4.4% / 8.5% | — | 3.3% stoch — **failed** (from-scratch PPO, exploration wall) |
+| Phase 4b (same 16×16; BC warmstart) | 4.4% / 8.5% | — | **30.6% stoch / 24.8% det from BC alone** (step 0, pre-PPO); PPO fine-tune in progress |
 
-All numbers are held-out test suites disjoint from training by layout hash, on the unchanged deterministic fixtures and evaluation protocol.
+All numbers are held-out test suites disjoint from training by layout hash, on the unchanged deterministic fixtures and evaluation protocol. The 8×8 milestones are final; 16×16 is the live frontier (Phase 4/4b below).
 
 ## Diagnosis
 
@@ -109,7 +111,11 @@ Behaviour-cloning warmstart addresses the exploration bottleneck directly: teach
 
 **Config:** 25 BC epochs (batch 1024, lr 1e-3) → the exact Phase 4 PPO setup (6.1M-param `GridPlanesResNet`, 4-stage length curriculum 1–2→1–4→1–6→1–8 with the 250k-episode safety-valve, 10.24M steps, ~630–715 steps/s on MPS). Baselines on this distribution: random 4.4%, target-robot-only 8.5%.
 
-**Status: running.** BC learns strongly — a first (paused) run reached 65% optimal-action accuracy by epoch 7/25 (random 6.25%); the current run reproduces this (54% by epoch 3). The harness saves weights only at run end and has no mid-run resume, so a stop means rerunning from scratch (~5.5–6h total: ~80 min BC + ~4.5h PPO). Resume command and the continuing-agent decision criteria (early sanity: post-BC step-0 checkpoint should already beat the 4.4% random baseline; watch that stages advance via the 65% *mastery* threshold rather than the safety-valve; guard against PPO catastrophically forgetting the BC prior — lower PPO lr / lower `ent_coef` / KL-to-prior if validation collapses after a strong step-0) are in `WorkInProgress.md` under "Phase 4b". W&B run `phase4b-bc-16x16-seed11` in project `ricochet-robots-rl`.
+**Result — BC alone clears the gate before any PPO (2026-07-12).** The 25-epoch BC phase reached **89.3% optimal-action accuracy** on the training pairs. The **step-0 checkpoint (BC weights, zero PPO steps)** already scores **30.6% stochastic / 24.8% deterministic on the held-out test**, on the full length-1–8 mix — vs the 8.5% target-robot-only gate and the 3.3% that the identical-but-from-scratch Phase 4 run *ended* at. It is non-trivial at every stratum (held-out stochastic by optimal length: 1→100%, 2→58%, 3→69%, 4→33%, 5→17%, 6→17%, 7→11%, 8→6%).
+
+This is the decisive confirmation of the Phase 4 diagnosis: **16×16 was an exploration/credit-assignment problem, not capacity, data, or wall-clock.** Given the solver's move function as a prior, the "wall" at lengths ≥3 disappears immediately. From-scratch PPO could not discover reward on deep puzzles; supervised cloning hands it that competence directly.
+
+**PPO fine-tuning in progress.** The warmstarted network is now under the staged-curriculum PPO loop. The open question is whether PPO *builds on* the prior or *forgets* it (entropy bonus + policy-gradient noise can wash out a cloned policy early). The critical check is the first PPO checkpoint (1.02M steps): it must hold or beat the 30.6% step-0 number, not regress. If it collapses, the fix is a gentler fine-tune (lower PPO lr, lower `ent_coef`, or a KL-to-BC-prior penalty). Full run ~5.5–6h; W&B run `phase4b-bc-16x16-seed11`. Continuing-agent notes and resume command in `WorkInProgress.md` under "Phase 4b".
 
 ## Connection to the original DRC research goal
 
