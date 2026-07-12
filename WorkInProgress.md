@@ -217,7 +217,15 @@ How to enable and where to look:
 - Diagnosis: at 16×16 with 16 actions and horizon 20, random success on length ≥3 is ~0–5%, so from-scratch PPO gets almost no reward signal past the easiest stage — the binding constraint is **exploration/credit assignment, not data, capacity, or wall-clock**. The safety-valve prevented stalling but demonstrated that advancing without mastery trades old skill for no new skill.
 - Next lever (in progress): **behaviour-cloning warmstart** — every fixture puzzle carries its BFS-optimal action sequence; pretrain the policy supervised on optimal actions, then PPO fine-tune under the same benchmark/gates.
 
-### Phase 4b: BC warmstart — RUNNING (relaunched 2026-07-12 ~10:33; first run paused 2026-07-10 to rest the machine)
+### Phase 4b RESULT: gate cleared — BC warmstart + PPO solves longer/harder 16×16 puzzles (2026-07-12 ~16:10)
+
+- **Final held-out test: 28.8% stochastic / 24.2% deterministic — the 8.5% gate is passed at 3.4×** (from-scratch phase 4: 3.3%). By length (stoch): 100/53/47/29/20/24/12/7% for lengths 1–8 — unseen length-7 and length-8 puzzles solved for the first time in this project. By robots-moved: 53% single, 19% two-robot, 4% three-robot. Mean successful deterministic optimality gap 1.28 moves.
+- Trajectory: BC 89.3% action accuracy → BC-alone rollout 30.6%/24.8% val → PPO dipped to 24.0% at 2M (transient value-fitting), recovered to 31.4% at 4.1M, peaked 33.1%/27.3% at 7.2M, ended 30.6%/24.0%.
+- The curriculum advanced through **all stages via the 65% mastery threshold** — zero safety-valve firings (final stage window 63%). The phase-4 exploration pathology is gone.
+- Conclusion: the working 16×16 recipe is **structured planes + residual grid CNN + BC warmstart from stored solver plans + staged-curriculum PPO**. Scale alone failed; imitation gave the prior; RL extended it to the hardest strata.
+- Formal next steps: 3-seed protocol before claiming the milestone; fine-tune hyperparameters (the 2M dip and post-7.2M fade suggest lower lr/ent_coef could add several points; checkpoint selection at 7.2M would already report ~33%); then the DRC/recurrence comparison (docs/ResearchPlan.md).
+
+### Phase 4b: BC warmstart — earlier notes (relaunched 2026-07-12 ~10:33; first run paused 2026-07-10 to rest the machine)
 
 **State: code committed (`0fb6e2f`), run in progress. The harness saves weights only at the end of a run and has no mid-run resume, so a stop means rerunning from scratch (~5.5–6h). Full mechanism + hard-won lessons now written up in `docs/GridCnnGeneralizationReport.md` (Phase 4b + Architectures sections).**
 

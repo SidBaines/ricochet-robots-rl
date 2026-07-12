@@ -16,7 +16,7 @@ The Phase 2 stock-CNN failure was an **observation-encoding × architecture mism
 | Phase 2b hard (8×8, interior walls, lengths 1–4, ≤2 robots moved) | 14.1% / 16.6% | — | 70.7% stoch, 68.5% det (1 seed, 409k steps) |
 | Phase 2c (same fixture, two-robot bands up-weighted, 819k steps) | 14.1% / 16.6% | — | **84.8% stoch, 87.0% det**; single-robot strata 97–100%, two-robot 67–68% |
 | Phase 4 (16×16, 4 robots, lengths 1–8; scale-only) | 4.4% / 8.5% | — | 3.3% stoch — **failed** (from-scratch PPO, exploration wall) |
-| Phase 4b (same 16×16; BC warmstart) | 4.4% / 8.5% | — | **30.6% stoch / 24.8% det from BC alone** (step 0, pre-PPO); PPO fine-tune in progress |
+| Phase 4b (same 16×16; BC warmstart + PPO) | 4.4% / 8.5% | — | **28.8% stoch / 24.2% det final test — gate passed at 3.4×**; lengths 7–8 solved for the first time |
 
 All numbers are held-out test suites disjoint from training by layout hash, on the unchanged deterministic fixtures and evaluation protocol. The 8×8 milestones are final; 16×16 is the live frontier (Phase 4/4b below).
 
@@ -115,7 +115,11 @@ Behaviour-cloning warmstart addresses the exploration bottleneck directly: teach
 
 This is the decisive confirmation of the Phase 4 diagnosis: **16×16 was an exploration/credit-assignment problem, not capacity, data, or wall-clock.** Given the solver's move function as a prior, the "wall" at lengths ≥3 disappears immediately. From-scratch PPO could not discover reward on deep puzzles; supervised cloning hands it that competence directly.
 
-**PPO fine-tuning in progress.** The warmstarted network is now under the staged-curriculum PPO loop. The open question is whether PPO *builds on* the prior or *forgets* it (entropy bonus + policy-gradient noise can wash out a cloned policy early). The critical check is the first PPO checkpoint (1.02M steps): it must hold or beat the 30.6% step-0 number, not regress. If it collapses, the fix is a gentler fine-tune (lower PPO lr, lower `ent_coef`, or a KL-to-BC-prior penalty). Full run ~5.5–6h; W&B run `phase4b-bc-16x16-seed11`. Continuing-agent notes and resume command in `WorkInProgress.md` under "Phase 4b".
+**Result: the 16×16 gate is passed.** The full run (2026-07-12) completed: BC reached 89.3% action accuracy; BC-alone rolled out at 30.6% stochastic / 24.8% deterministic held-out validation; the PPO fine-tune dipped transiently (24.0% at 2M steps, value-function fitting), recovered past the prior by 4.1M (31.4%), peaked at 33.1%/27.3% at 7.2M, and finished at 30.6%/24.0%. Every curriculum stage advanced via the **65% mastery threshold** — zero safety-valve firings (contrast phase 4: all three advancements forced at 25%/18%/10% windows).
+
+Final held-out **test**: **28.8% stochastic / 24.2% deterministic** vs the 8.5% target-robot-only gate and 4.4% random — with non-trivial success at every optimal length (stochastic: 100/53/47/29/20/24/12/7% for lengths 1–8) and multi-robot plans (53% single, 19% two-robot, 4% three-robot). Mean successful deterministic optimality gap: 1.28 moves.
+
+Interpretation: **exploration was the 16×16 constraint, and imitation solves it.** Scale alone (phase 4) failed at 3.3%; the solver-plan prior alone reaches ~30%; reinforcement learning on top extends skill to the longest puzzles while the mastery-threshold curriculum progression confirms the pathology is gone. Remaining headroom: the 2M dip and post-7.2M fade suggest a gentler fine-tune (lower lr / `ent_coef`, or checkpoint selection — the 7.2M policy is the best artifact at ~33%) is worth several points; the formal 3-seed protocol should precede any milestone claim; and this recipe is now the right baseline for the DRC/recurrence comparison below.
 
 ## Connection to the original DRC research goal
 
