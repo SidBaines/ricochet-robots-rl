@@ -1,8 +1,10 @@
 # Grid-CNN Generalization Report
 
-Run date: 2026-07-10
-Branch: `sid-learnable-agent`
+Run dates: 2026-07-10 – 2026-07-12
+Branch: `sid-learnable-agent` (pushed to origin)
 Baseline being fixed: `docs/Phase2BenchmarkReport.md` (stock-CNN PPO failed the held-out gate at 31.7% stochastic vs the 46.7% target-robot-only baseline, with 3.1% deterministic success and 91% no-movement actions)
+
+**Reading order for a new contributor:** this report (the full experiment arc) → `CLAUDE.md` (hard-won operational lessons) → `WorkInProgress.md` "Phase 4b" (the live handoff and resume command). Every experiment runs through the deterministic harness in `src/benchmarking/phase2.py`; one YAML per experiment under `configs/`; outputs (gitignored) under `artifacts/phase2_experiments/<name>/` with a full `results.json` and machine-written `report.md`.
 
 ## Executive summary
 
@@ -28,6 +30,15 @@ The environment already provided a lossless encoding: `obs_mode="image"` structu
 - **`src/benchmarking/phase2.py`**: `Phase2Config` gains `obs_mode`, `policy` (`stock_cnn` | `grid_cnn`), `features_dim`, `conv_channels`, `n_conv_layers`, `two_robot_band_weight`, `run_overfit_milestone`; a shared `_build_model`; and fixture-derived (rather than Cartesian-product) split strata checks so harder fixtures validate.
 - **`src/env/criteria_env.py`**: curriculum levels may carry explicit stratified `bands` (with weights); the auto-built equal-length bands remain the default.
 - Contract tests in `src/tests/test_grid_cnn.py`.
+
+## Architectures (`src/models/grid_cnn.py`)
+
+Both extractors take channels-first structured planes and never pool or stride, so a robot one cell over changes the output — the property NatureCNN destroyed. Observation is `(C, H, W)` where `C = 4 wall planes + goal + target mask + num_robots` (8 channels at 8×8/2-robot, 10 channels at 16×16/4-robot).
+
+- **`GridPlanesCnn`** (8×8 work): `n_conv_layers` stride-1 same-padded 3×3 convs (default 4 × 64 ch) → flatten → linear to `features_dim`. ~1.26M policy params at the 8×8 default.
+- **`GridPlanesResNet`** (16×16 work): 3×3 stem → `n_blocks` residual blocks (two same-padded 3×3 convs + identity skip, default 6 × 128 ch) → 1×1 conv reducing to `reduce_channels` (32) → flatten → linear to `features_dim` (512). ~6.1M policy params at the 16×16 default. The 1×1 reduction keeps the flattened vector small (`32·16·16`) despite the wide conv trunk.
+
+Both are wired as SB3 `MlpPolicy` + custom `features_extractor` with `normalize_images=False` (planes are already 0/1 floats), and are selected by `policy:`/`model.type:` `grid_cnn`|`grid_resnet` in the harness and `train_agent.py`, with policy↔obs-mode validation and construction/predict/update contract tests.
 
 ## Experiment log
 
@@ -87,38 +98,65 @@ Result: **held-out gate failed** — 3.3% stochastic vs 8.5% required; determini
 
 Updated diagnosis: past the easiest stage, random success on length ≥3 puzzles is ~0–5%, so from-scratch PPO receives almost no reward signal — the binding constraint at 16×16 is **exploration/credit assignment**, which more data, capacity, and wall-clock do not fix. The productive next lever is item 4: **behaviour-cloning warmstart from the bank's stored optimal plans**, then PPO fine-tuning under the same gates. A perf note for anyone rerunning: `BankSampler._split_mask` is now vectorized (was `iterrows()`, 83ms per reset on this bank — see `src/tests/test_bank_split_perf.py`).
 
-## Phase 4b — BC warmstart: implemented, paused mid-first-run
+## Phase 4b — BC warmstart (`configs/phase4b_bc_16x16.yaml`)
 
-Behaviour-cloning warmstart is implemented and committed (`bc_pretrain_epochs` etc. on `Phase2Config`; `configs/phase4b_bc_16x16.yaml`): before PPO, the policy is trained supervised on every `(state, optimal-first-action)` pair replayed from the training split's stored BFS plans — **210,947 pairs from 41,395 puzzles**, extracted in 19s. The first run was intentionally stopped at BC epoch 7/25 to free the machine; by then optimal-action accuracy had already climbed 15% → **65%** (random 6.25%), so the supervised signal is strong. The harness has no mid-run resume, so continuing means rerunning `phase4b_bc_16x16` from scratch (~5.5–6h). The full resume command, expected timeline, and decision criteria for the continuing agent are in `WorkInProgress.md` under "Phase 4b".
+Behaviour-cloning warmstart addresses the exploration bottleneck directly: teach the policy the solver's move function *supervised* before PPO, so PPO starts from a policy that already reaches goals often enough to get reward signal on hard puzzles.
 
-## Reproduction (16×16 fixture)
+**Mechanism** (`_bc_dataset` / `_bc_pretrain` in `src/benchmarking/phase2.py`):
+- Each training-split puzzle carries its BFS-optimal action sequence. We replay that plan in the env and record a `(observation, action)` pair at **every state along the trajectory** — not just the first move — yielding **210,947 pairs from the 41,395 training puzzles** (extracted in ~18s, planes stored as uint8 to stay compact). A sanity check asserts every stored plan actually reaches the goal.
+- Train the policy's action distribution by NLL / cross-entropy (Adam, `bc_learning_rate`, `bc_batch_size`) for `bc_pretrain_epochs`, then hand the warmstarted network to the unchanged staged-curriculum PPO loop. Value head is left to PPO. BC metrics log to W&B as `bc/loss`, `bc/accuracy`.
+- **Hard-won lesson (in code comment):** SB3's PPO initializes the action head with orthogonal gain **0.01**, which scales all upstream supervised gradients down ~100× and pins cross-entropy on the uniform-policy plateau (accuracy stuck near 1/n_actions). BC only learns after re-initializing `action_net` at unit gain. Any future supervised-pretraining-into-SB3 work must do the same.
 
-```bash
-# Parallel deterministic fixture build (identical fingerprints to sequential):
-.venv-phase2/bin/python - <<'PY'
-from pathlib import Path
-import yaml
-from src.benchmarking.phase2 import Phase2Config, build_fixture_bank
-config = Phase2Config.from_mapping(yaml.safe_load(Path("configs/phase3_16x16_grid_cnn.yaml").read_text()))
-build_fixture_bank(Path("artifacts/phase3_bank"), config, workers=8)
-PY
-```
+**Config:** 25 BC epochs (batch 1024, lr 1e-3) → the exact Phase 4 PPO setup (6.1M-param `GridPlanesResNet`, 4-stage length curriculum 1–2→1–4→1–6→1–8 with the 250k-episode safety-valve, 10.24M steps, ~630–715 steps/s on MPS). Baselines on this distribution: random 4.4%, target-robot-only 8.5%.
+
+**Status: running.** BC learns strongly — a first (paused) run reached 65% optimal-action accuracy by epoch 7/25 (random 6.25%); the current run reproduces this (54% by epoch 3). The harness saves weights only at run end and has no mid-run resume, so a stop means rerunning from scratch (~5.5–6h total: ~80 min BC + ~4.5h PPO). Resume command and the continuing-agent decision criteria (early sanity: post-BC step-0 checkpoint should already beat the 4.4% random baseline; watch that stages advance via the 65% *mastery* threshold rather than the safety-valve; guard against PPO catastrophically forgetting the BC prior — lower PPO lr / lower `ent_coef` / KL-to-prior if validation collapses after a strong step-0) are in `WorkInProgress.md` under "Phase 4b". W&B run `phase4b-bc-16x16-seed11` in project `ricochet-robots-rl`.
+
+## Connection to the original DRC research goal
+
+The project's `docs/ResearchPlan.md` and `docs/rr_base_prompt.md` are built around the Deep Repeating ConvLSTM (DRC) from Guez et al. 2019, as analyzed for Sokoban in [arXiv:2407.15421](https://arxiv.org/html/2407.15421v3), with mechanistic interpretability of the learned *plan* as the eventual payoff. The work in this report is deliberately **feed-forward, not recurrent** — the January review's recovery plan said to establish a trustworthy non-recurrent baseline before repairing the (still-broken) DRC/RecurrentPPO paths in `src/models/`. Three connections:
+
+1. **Same core design principle, minus recurrence.** The reason DRC hidden states are interpretable in that paper is that computation stays spatial and grid-aligned throughout; the old baseline violated exactly this by aliasing the grid through a stride-4 conv. `GridPlanesCnn`/`GridPlanesResNet` restore the spatial-computation property — "the DRC encoder philosophy without the recurrent core."
+2. **8×8 calibrates where planning is *not* needed.** A fixed-depth net solves held-out 8×8 puzzles up to length 4 with two-robot blockers at ~87% — so for shallow instances amortized pattern-matching suffices, no iterative computation required. That is the control the DRC comparison needs and didn't previously exist.
+3. **16×16 marks where recurrence should earn its keep.** Fixed-depth compute stalls on lengths ≥5 (the exploration wall). That is precisely the regime where DRC's "more ticks = more planning compute / pondering helps hardest levels" result predicts a recurrent core would help — and the env already has the optional no-op "thinking step" action the plan earmarked for it. The benchmark harness now gives a clean A/B (same fixture, splits, gates: feed-forward vs DRC). Caveat: the paper's DRC used ~2B IMPALA steps; since even the feed-forward 16×16 run looks compute/exploration-starved, fix the data/exploration axis (BC warmstart) before attributing any residual gap to architecture, or the comparison is confounded. Ricochet Robots is arguably a *better* interpretability probe than Sokoban because the bank stores BFS-optimal plans for every puzzle — ground-truth "which robot, which direction" labels for probes, the direct analogue of the paper's box-direction probes.
+
+## Artifacts, fixtures and fingerprints
+
+Fixtures are deterministic; `build_fixture_bank(..., workers=N)` produces byte-identical fingerprints for any worker count (verified against the recorded phase2b manifest). Banks live under `artifacts/<bank>/` (gitignored); the fingerprint is in each bank's `phase2_fixture.json`.
+
+| Bank | Board / robots | Walls | Lengths / robots-moved | Puzzles | `fixture_sha256` (prefix) |
+|---|---|---|---|---:|---|
+| `phase2_bank` | 8×8 / 2 | none | 1–2 / 1 | 460 | `29c1aeb066ab` |
+| `phase2b_bank` | 8×8 / 2 | 1 ET + 1 CL /quad | 1–4 / 1–2 | 8,922 | `001a87948d54` |
+| `phase3_bank` | 16×16 / 4 | 2 ET + 2 CL /quad | 1–6 / 1–2 | 6,588 | `f4aea81c9e8c` |
+| `phase4_bank` | 16×16 / 4 | 2 ET + 2 CL /quad | 1–8 / 1–3 | 55,143 | `3579113b230a` |
+
+Split manifests are keyed by `layout_hash` and carry their own `fingerprint`; both fixture and split fingerprints are contracts — a refactor that changes them is a bug. `test_bank_split_perf.py` pins the split hash contract and the `_split_mask` scaling bound.
 
 ## Reproduction
 
 ```bash
+# Environment
 uv venv --python 3.11 .venv-phase2
 uv pip install --python .venv-phase2/bin/python -r requirements-ci.txt
 uv pip install --python .venv-phase2/bin/python -e .
-# Easy benchmark, three seeds:
+
+# 8×8 headline: three-seed held-out benchmark (~30 min MPS)
 .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py \
   --config configs/phase2_exp2_grid_cnn_3seed.yaml \
   --output-dir artifacts/phase2_experiments/exp2_grid_cnn_3seed
-# Harder fixture (fresh bank dir is created and labelled deterministically):
+
+# 8×8 hard, two-robot reweighted (best 8×8 result, 87% det held-out)
 .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py \
   --config configs/phase2c_grid_cnn_2robot.yaml \
   --bank-dir artifacts/phase2b_bank \
   --output-dir artifacts/phase2_experiments/phase2c_grid_cnn_2robot
+
+# 16×16 current frontier: BC warmstart + staged PPO (~5.5–6h MPS)
+nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py \
+  --config configs/phase4b_bc_16x16.yaml \
+  --bank-dir artifacts/phase4_bank \
+  --output-dir artifacts/phase2_experiments/phase4b_bc_16x16 \
+  > artifacts/phase2_experiments/phase4b_bc_16x16.log 2>&1 &
 ```
 
-Each run writes `results.json` (full per-episode records, provenance, fingerprints) and `report.md` under its output directory.
+Fixture banks are created and labelled deterministically on first use if absent (the 55k-row phase4 bank takes ~30 min; use the parallel builder in `WorkInProgress.md`). Each run writes `results.json` (full per-episode records, provenance, both fingerprints, `bc_pretrain` stats) and `report.md` under its output directory. Long runs must be launched detached (`nohup caffeinate -is … &`) — harness background tasks have been killed at ~15–20 min on this machine.
