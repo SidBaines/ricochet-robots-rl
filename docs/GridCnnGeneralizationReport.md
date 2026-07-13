@@ -119,6 +119,14 @@ This is the decisive confirmation of the Phase 4 diagnosis: **16×16 was an expl
 
 Final held-out **test**: **28.8% stochastic / 24.2% deterministic** vs the 8.5% target-robot-only gate and 4.4% random — with non-trivial success at every optimal length (stochastic: 100/53/47/29/20/24/12/7% for lengths 1–8) and multi-robot plans (53% single, 19% two-robot, 4% three-robot). Mean successful deterministic optimality gap: 1.28 moves.
 
+![Held-out stochastic success by optimal solution length across training](images/phase4b/by_optimal_length_stochastic.png)
+
+*Held-out stochastic success by optimal solution length across training (step 0 = post-BC, pre-PPO; dashed lines are the random and target-only baselines). Easy puzzles (L1–L3) sit far above the gate throughout; PPO's contribution is visible mostly in the deep strata (L5–L8) climbing off the floor after ~2M steps while mid-length dips slightly — a redistribution of skill toward the hard tail, not a uniform lift. Regenerate with `src/scripts/plot_training_by_difficulty.py`; the 2×2 panel (`training_curves_panels.png`, incl. by-robots-moved and the train-vs-held-out gap) and the final-test bars below sit alongside it under the run's `plots/`.*
+
+![Final held-out test success by difficulty](images/phase4b/final_test_by_length.png)
+
+*Final held-out test success by optimal length on the untouched test suite.*
+
 Interpretation: **exploration was the 16×16 constraint, and imitation solves it.** Scale alone (phase 4) failed at 3.3%; the solver-plan prior alone reaches ~30%; reinforcement learning on top extends skill to the longest puzzles while the mastery-threshold curriculum progression confirms the pathology is gone. Remaining headroom: the 2M dip and post-7.2M fade suggest a gentler fine-tune (lower lr / `ent_coef`, or checkpoint selection — the 7.2M policy is the best artifact at ~33%) is worth several points; the formal 3-seed protocol should precede any milestone claim; and this recipe is now the right baseline for the DRC/recurrence comparison below.
 
 ## Connection to the original DRC research goal
