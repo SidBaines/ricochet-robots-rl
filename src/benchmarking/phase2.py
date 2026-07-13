@@ -607,6 +607,24 @@ def _aggregate_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _joint_table(records: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Success over the 2-D (optimal_length, robots_moved) difficulty grid.
+
+    Difficulty is genuinely two-dimensional and its marginals cannot be
+    recombined into the joint, so this contingency table is persisted per
+    evaluation. Keys are ``"length,robots"``; absent cells are impossible
+    puzzles (e.g. robots_moved > optimal_length).
+    """
+    cells: Dict[str, List[bool]] = defaultdict(list)
+    for record in records:
+        key = f"{int(record['optimal_length'])},{int(record['robots_moved'])}"
+        cells[key].append(bool(record["success"]))
+    return {
+        key: {"rate": float(np.mean(values)), "n": len(values), "successes": int(sum(values))}
+        for key, values in sorted(cells.items())
+    }
+
+
 def summarize_records(records: Sequence[Mapping[str, Any]], elapsed_seconds: float) -> Dict[str, Any]:
     summary = _aggregate_records(records)
     summary["elapsed_seconds"] = elapsed_seconds
@@ -618,6 +636,8 @@ def summarize_records(records: Sequence[Mapping[str, Any]], elapsed_seconds: flo
         summary[f"by_{field}"] = {
             key: _aggregate_records(group) for key, group in sorted(grouped.items(), key=lambda item: int(item[0]))
         }
+    # Joint difficulty grid — enables across-training (length × robots) heatmaps.
+    summary["joint"] = _joint_table(records)
     return summary
 
 
