@@ -344,3 +344,11 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - Retry config `configs/phase5_canonical_bc_seed11_retry1.yaml` has a unique
   output/W&B identity, and both screen configs point to its future step-0 model.
   Gate: 110 passed, 9 skipped. Full evidence is in the execution log.
+
+### Canonical BC retry 1 launched (2026-07-17 15:35 EDT)
+
+- Commit `baecf88`; detached screen `phase5_bc_retry1` (launch-time Python PID
+  31861); log `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1.log`.
+- It retains mask validation and masked rollout/evaluation but uses the
+  empirically restored full-contrast BC loss. Epoch 1 should reproduce the
+  exact 15.0% audit reference before the remaining epochs are allowed to run.

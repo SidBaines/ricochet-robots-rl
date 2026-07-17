@@ -6,13 +6,14 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 15:33 EDT
+- Updated: 2026-07-17 15:35 EDT
 - Branch: `sid-learnable-agent`
-- Phase: canonical BC supervised-mask stall diagnosed and fixed; retry pending
-- Latest completed commit: `b82f899 exp: define matched BC to PPO screens`
+- Phase: canonical BC retry 1 active
+- Latest completed commit: `baecf88 fix: preserve full contrast in BC loss`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: none
+- Active experiment: `phase5_canonical_bc_seed11_retry1`, detached screen
+  session `phase5_bc_retry1` (screen PID 31858; launch-time Python PID 31861)
 - Last test gate: 110 passed, 9 intentionally skipped, 1 benign small-rollout
   batch-size warning in 13.14s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -21,9 +22,9 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: commit the independent BC-loss masking control and launch the
-  canonical retry in a fresh output directory
-- Exact next command: `screen -dmS phase5_bc_retry1 zsh -lc 'exec caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_canonical_bc_seed11_retry1.yaml --bank-dir artifacts/phase4_bank --output-dir artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1 >> artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1.log 2>&1'`
+- Current action: verify retry epoch 1 reproduces the 15% unmasked reference,
+  then monitor held-out BC loss until best-epoch selection and step-0 rollout
+- Exact monitor command: `tail -n 50 artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1.log`
 
 ## Locked decisions
 
@@ -256,3 +257,15 @@ state changes. Append chronological entries; never rewrite historical entries.
   masked. The optional masked BC-loss path remains tested.
 - Added unique retry config/output/W&B identity and repointed both screens to
   its exact future step-0 checkpoint. Full gate: 110 passed, 9 skipped.
+
+### 2026-07-17 15:35 EDT — canonical BC retry 1 launched
+
+- Launch commit `baecf88`; config
+  `configs/phase5_canonical_bc_seed11_retry1.yaml`; output/log stem
+  `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1`.
+- Detached screen session `phase5_bc_retry1`: launch-time screen PID 31858,
+  Python PID 31861, `caffeinate` helper PID 31863.
+- Immediate checks passed: immutable fixture/split validation, historical
+  4.4%/8.5% baselines, MPS selection, and seed-11 startup. Epoch-1 acceptance
+  reference is the exact audit/historical 15.0% training accuracy; a return to
+  ~9% would stop the run for further diagnosis.
