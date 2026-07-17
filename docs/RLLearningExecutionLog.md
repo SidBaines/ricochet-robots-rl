@@ -6,13 +6,14 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 15:08 EDT
+- Updated: 2026-07-17 15:07 EDT
 - Branch: `sid-learnable-agent`
-- Phase: canonical BC and matched screen configs ready; canonical run pending
-- Latest completed commit: `7716d73 docs: record reverse curriculum dry run`
+- Phase: canonical seed-11 BC run active
+- Latest completed commit: `b82f899 exp: define matched BC to PPO screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: none
+- Active experiment: `phase5_canonical_bc_seed11`, detached screen session
+  `phase5_bc` (screen PID 28369; launch-time Python PID 28372)
 - Last test gate: 108 passed, 9 intentionally skipped, 1 benign small-rollout
   batch-size warning in 20.97s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -21,9 +22,9 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: commit the canonical/matched config contract, then launch the
-  canonical seed-11 BC-only run detached
-- Exact next command: `nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_canonical_bc_seed11.yaml --bank-dir artifacts/phase4_bank --output-dir artifacts/phase2_experiments/phase5_canonical_bc_seed11 > artifacts/phase2_experiments/phase5_canonical_bc_seed11.log 2>&1 &`
+- Current action: monitor canonical BC validation loss/accuracy and verify the
+  selected epoch plus post-BC masked rollout before starting either PPO screen
+- Exact monitor commands: `screen -ls` and `tail -n 50 artifacts/phase2_experiments/phase5_canonical_bc_seed11.log`
 
 ## Locked decisions
 
@@ -192,7 +193,7 @@ state changes. Append chronological entries; never rewrite historical entries.
   session. Proceed to the performance-first canonical BC initialization and
   matched masked BC→PPO screens.
 
-### 2026-07-17 15:08 EDT — canonical BC and matched screens defined
+### 2026-07-17 15:05 EDT — canonical BC and matched screens defined
 
 - Added `phase5_canonical_bc_seed11.yaml`: 25 masked BC epochs over every Phase
   4 training trajectory, held-out expert-state validation each epoch,
@@ -211,3 +212,20 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Added a config contract test that fails on any undeclared screen difference
   and verifies that canonical BC is validation-only and saves step 0. Full gate:
   108 passed, 9 intentionally skipped.
+
+### 2026-07-17 15:07 EDT — canonical seed-11 BC run launched
+
+- Launch commit `b82f899`; config `configs/phase5_canonical_bc_seed11.yaml`;
+  output `artifacts/phase2_experiments/phase5_canonical_bc_seed11`; log
+  `artifacts/phase2_experiments/phase5_canonical_bc_seed11.log`.
+- Two normal `nohup ... &` launches (reported shell PIDs 28233 and 28322)
+  exited before Python startup because this command-execution wrapper cleans up
+  background children when its shell ends. Both left an empty log, created no
+  output directory, and performed no experiment work.
+- Relaunched under detached macOS `screen` session `phase5_bc`, which reparented
+  to PID 1 and was verified alive: screen PID 28369, launch-time Python PID
+  28372, `caffeinate` helper PID 28374. The log immediately recorded fixture
+  validation startup.
+- This run performs 25 BC epochs, restores the minimum held-out BC-loss epoch,
+  evaluates/saves step 0, and keeps the final test sealed. Do not start either
+  PPO screen until the checkpoint and BC result metadata have been audited.

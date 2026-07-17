@@ -319,3 +319,14 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   the endpoint and only 0.8% success.
 - Reverse machinery is validated and full RL-only training remains deferred.
   Work now returns to the performance-first canonical BC→PPO screens.
+
+### Canonical Phase 5 BC initialization launched (2026-07-17 15:07 EDT)
+
+- Commit `b82f899`; detached screen session `phase5_bc` (launch-time screen PID
+  28369, Python PID 28372). Config:
+  `configs/phase5_canonical_bc_seed11.yaml`; log:
+  `artifacts/phase2_experiments/phase5_canonical_bc_seed11.log`.
+- It trains 25 mask-aware epochs, selects by held-out expert-state BC loss,
+  saves the exact post-BC step-0 model, evaluates validation with five fixed
+  repetitions, and does not touch the final test. Both PPO screens will load
+  this same checkpoint; they must not start until its artifacts are audited.
