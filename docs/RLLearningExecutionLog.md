@@ -6,22 +6,22 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 14:05 EDT
+- Updated: 2026-07-17 14:45 EDT
 - Branch: `sid-learnable-agent`
-- Phase: observability/evaluation foundation complete; masking next
-- Latest completed commit: `2f1cb44 docs: synthesize RL remediation execution plan`
+- Phase: masking/BC stability complete; reverse-curriculum infrastructure next
+- Latest completed commit: `f9fae11 feat: make RL benchmark observable and selectable`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
-- Last test gate: 92 passed, 9 intentionally skipped, 1 warning in 6.74s
+- Last test gate: 99 passed, 9 intentionally skipped, 1 warning in 8.80s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: commit observability/evaluation, then implement movement
-  masks and MaskablePPO
+- Current action: commit masking/BC stability, then implement reverse start
+  states and calibrated frontier gating
 - Exact next command after handoff: `.venv-phase2/bin/python -m pytest src/tests/ -q`
 
 ## Locked decisions
@@ -90,3 +90,27 @@ state changes. Append chronological entries; never rewrite historical entries.
   Verified zero puzzle-ID and layout-hash overlap with train, validation, and
   the exposed development-test suite. No model was evaluated.
 - Test gate: 92 passed, 9 legacy recurrent tests skipped.
+
+### 2026-07-17 14:45 EDT — movement masking and BC→PPO stability complete
+
+- Added exact, non-mutating movement masks to the base environment and both
+  bank/curriculum wrapper paths. MaskablePPO now uses them during collection
+  and prediction; masked evaluation is the headline and optional unmasked
+  evaluation is explicitly labelled counterfactual.
+- BC validates every expert action against its mask and applies masks to the
+  supervised distribution. It now records held-out loss/agreement per epoch
+  and can restore the best held-out epoch.
+- Added exact initial-checkpoint loading so the two screens can share one
+  canonical seed-11 BC policy. Added fixed optimizer stability controls,
+  `target_kl`, and cumulative-timestep LR/entropy schedules that do not restart
+  at checkpoint boundaries.
+- Added the policy-health audit script and ran it on the historical endpoints:
+  - Phase 4: expert top-1 6.9%, target probability 6.1%, deterministic 0.0%,
+    stochastic 4.7%, logit between-state variance exactly 0.
+  - Phase 4b: expert top-1 52.9%, target probability 52.6%, deterministic
+    24.0%, stochastic 30.9%, logit variance 57.03.
+- Optimized mask computation to a direct adjacent-cell feasibility check.
+  Reset-inclusive real-factory probe improved from an initial 15.9% overhead
+  to 5.7% (11,605 unmasked versus 10,937 masked environment steps/s in the
+  isolated env probe), satisfying the <10% gate.
+- Test gate: 99 passed, 9 legacy recurrent tests skipped.

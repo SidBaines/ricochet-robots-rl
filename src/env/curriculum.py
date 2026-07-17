@@ -379,6 +379,10 @@ class CurriculumWrapper(GymEnvBase):
     def get_board(self):
         """Forward underlying board for visualization utilities."""
         return self._current_env.get_board()
+
+    def action_masks(self) -> np.ndarray:
+        """Forward the current puzzle's movement-action mask."""
+        return self._current_env.action_masks()
     
     @property
     def action_space(self):
@@ -778,6 +782,10 @@ class BankCurriculumWrapper(GymEnvBase):
     def get_board(self):
         """Forward underlying board for visualization utilities."""
         return self._current_env.get_board()
+
+    def action_masks(self) -> np.ndarray:
+        """Forward the current puzzle's movement-action mask."""
+        return self._current_env.action_masks()
     
     @property
     def action_space(self):

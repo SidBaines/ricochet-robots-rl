@@ -281,3 +281,16 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   suite by both puzzle ID and layout hash. No model has touched it.
 - Gate: 92 passed, 9 intentionally skipped. Detailed handoff remains in
   `docs/RLLearningExecutionLog.md`.
+
+### Training-time movement masking and BC stability (2026-07-17 14:45 EDT)
+
+- Implemented end-to-end MaskablePPO movement masking, wrapper forwarding,
+  mask-aware BC/evaluation, held-out BC best-epoch selection, exact shared BC
+  checkpoint loading, cumulative optimizer schedules, KL guard support, and a
+  reusable policy-health audit command.
+- Real-factory mask overhead is 5.7% after optimizing the feasibility check;
+  masked evaluation produces exactly zero blocked movements in tests.
+- Historical audit machine-recorded the Phase 4 constant-logit collapse (zero
+  between-state logit variance) and healthy state dependence in Phase 4b.
+- Gate: 99 passed, 9 intentionally skipped. Next: reverse-curriculum machinery
+  and its calibrated smoke tests; see `docs/RLLearningExecutionLog.md`.

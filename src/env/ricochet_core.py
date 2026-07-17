@@ -75,6 +75,25 @@ class Board:
         )
 
 
+def can_move_one_step(board: Board, robot_id: int, direction: int) -> bool:
+    """Return whether a slide can leave its starting cell."""
+    assert 0 <= direction < 4
+    row, col = board.robot_positions[robot_id]
+    delta_row, delta_col = DIRECTIONS[direction]
+    next_row, next_col = row + delta_row, col + delta_col
+    if not (0 <= next_row < board.height and 0 <= next_col < board.width):
+        return False
+    if direction == UP:
+        wall = board.has_wall_up(row, col)
+    elif direction == DOWN:
+        wall = board.has_wall_down(row, col)
+    elif direction == LEFT:
+        wall = board.has_wall_left(row, col)
+    else:
+        wall = board.has_wall_right(row, col)
+    return not wall and not board.is_occupied(next_row, next_col, ignore_robot=robot_id)
+
+
 def slide_until_blocked(board: Board, robot_id: int, direction: int) -> Tuple[int, int]:
     """
     Slide the specified robot in the given direction until hitting a wall edge or another robot.

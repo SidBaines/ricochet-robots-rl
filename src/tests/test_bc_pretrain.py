@@ -80,3 +80,32 @@ def test_bc_pretrain_reduces_loss_and_learns_actions() -> None:
 def test_bc_requires_plane_observations() -> None:
     with pytest.raises(ValueError, match="BC pretraining requires"):
         Phase2Config(bc_pretrain_epochs=1, obs_mode="rgb_cell_image", policy="stock_cnn")
+
+
+def test_masked_bc_tracks_validation_and_restores_best_epoch() -> None:
+    from stable_baselines3.common.env_util import make_vec_env
+
+    from src.env.ricochet_env import RicochetRobotsEnv
+
+    config = _small_config(
+        bc_pretrain_epochs=5,
+        bc_select_best_by_validation=True,
+        use_action_masking=True,
+    )
+    puzzles = _labelled_puzzles(config, count=10)
+    train, validation = puzzles[:6], puzzles[6:]
+    spec = config.environment_spec(0)
+    vec_env = make_vec_env(lambda: RicochetRobotsEnv(**spec.to_env_kwargs()), n_envs=1, seed=0)
+    model = _build_model(vec_env, config, seed=0, device="cpu")
+    stats = _bc_pretrain(
+        model,
+        train,
+        config,
+        seed=0,
+        device="cpu",
+        validation_puzzles=validation,
+    )
+    assert stats["selected_epoch"] in range(1, 6)
+    assert stats["validation_pairs"] == sum(p.optimal_length for p in validation)
+    assert all("validation_loss" in epoch for epoch in stats["epochs"])
+    vec_env.close()

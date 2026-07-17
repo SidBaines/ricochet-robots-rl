@@ -338,6 +338,12 @@ class CriteriaFilteredEnv(GymEnvBase):
             self._episode_steps = 0
         
         return obs, reward, terminated, truncated, info
+
+    def action_masks(self) -> np.ndarray:
+        """Forward the current puzzle's movement-action mask."""
+        if self._current_env is None:
+            raise RuntimeError("No current environment")
+        return self._current_env.action_masks()
     
     def render(self, *args, **kwargs):
         """Render environment."""

@@ -7,6 +7,7 @@ import pytest
 from src.benchmarking.phase2 import (
     Phase2Config,
     _build_model,
+    _make_cumulative_schedule_callback,
     _make_wandb_rollout_callback,
     _puzzle_clustered_bootstrap,
     build_confirmation_manifest,
@@ -109,6 +110,36 @@ def test_wandb_callback_forwards_train_and_health_metrics() -> None:
     vec_env.close()
 
 
+def test_cumulative_optimizer_schedule_reaches_declared_endpoints() -> None:
+    from stable_baselines3.common.env_util import make_vec_env
+
+    config = replace(
+        _tiny_config(),
+        obs_mode="image",
+        policy="grid_cnn",
+        features_dim=32,
+        conv_channels=8,
+        n_conv_layers=1,
+        checkpoints=(0, 16),
+        learning_rate=3e-4,
+        learning_rate_final=3e-5,
+        ent_coef=0.01,
+        ent_coef_final=0.001,
+        save_checkpoint_weights=False,
+        select_checkpoint_by_validation=False,
+    )
+    vec_env = make_vec_env(
+        lambda: RicochetRobotsEnv(**config.environment_spec(321).to_env_kwargs()),
+        n_envs=1,
+        seed=321,
+    )
+    model = _build_model(vec_env, config, seed=321, device="cpu")
+    model.learn(total_timesteps=16, callback=_make_cumulative_schedule_callback(config))
+    assert model.policy.optimizer.param_groups[0]["lr"] == pytest.approx(3e-5)
+    assert model.ent_coef == pytest.approx(0.001)
+    vec_env.close()
+
+
 @pytest.mark.integration
 @pytest.mark.training
 def test_tiny_phase2_benchmark_is_disjoint_replayable_and_complete(tmp_path) -> None:
@@ -173,3 +204,28 @@ def test_validation_only_run_keeps_final_test_sealed(tmp_path) -> None:
     assert seed_result["test_selected"] is None
     assert result["heldout_milestone"]["observed"] is None
     assert "Final test remained sealed" in (tmp_path / "output" / "report.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.integration
+@pytest.mark.training
+def test_initial_checkpoint_is_loaded_exactly_at_step_zero(tmp_path) -> None:
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.env_util import make_vec_env
+
+    base = _tiny_config()
+    vec_env = make_vec_env(
+        lambda: RicochetRobotsEnv(**base.environment_spec(77).to_env_kwargs()),
+        n_envs=1,
+        seed=77,
+    )
+    initial = _build_model(vec_env, base, seed=77, device="cpu")
+    initial_path = tmp_path / "initial_model"
+    initial.save(initial_path)
+    vec_env.close()
+
+    config = replace(base, initial_checkpoint_path=str(initial_path.with_suffix(".zip")))
+    result = run_phase2_benchmark(config, bank_dir=tmp_path / "bank", output_dir=tmp_path / "output")
+    loaded = PPO.load(result["seeds"][0]["checkpoints"][0]["model"], device="cpu")
+    reference = PPO.load(initial_path.with_suffix(".zip"), device="cpu")
+    for observed, expected in zip(loaded.policy.parameters(), reference.policy.parameters()):
+        assert np.array_equal(observed.detach().numpy(), expected.detach().numpy())

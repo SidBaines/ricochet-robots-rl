@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, List, Literal, Set
 
 import numpy as np
 
-from .ricochet_core import Board, apply_action, reached_goal
+from .ricochet_core import Board, apply_action, can_move_one_step, reached_goal
 FIXED_PIXEL_SIZE = 128 # This needs to be board size * the default cell size, otherwise we get errors caused by a mismatch between the obs/render (with the fixed cache size) TODO fix this: observe the error by changing this or the defult cell size, and then running the bank_curriculum_preview.py
 
 # Provide a runtime gymnasium binding if available, otherwise a minimal fallback
@@ -482,6 +482,26 @@ class RicochetRobotsEnv(GymEnvBase):
         if robot_id >= self.num_robots:
             raise ValueError(f"Invalid robot_id {robot_id} for action {action}")
         return robot_id, direction
+
+    def action_masks(self) -> np.ndarray:
+        """Return the non-mutating movement-action mask expected by MaskablePPO.
+
+        ``True`` means that the action moves its robot by at least one cell.
+        An explicitly configured no-op remains available because it represents
+        a deliberate action rather than a blocked movement; Phase 2 configs do
+        not include that action.
+        """
+        if self._board is None:
+            raise RuntimeError("Call reset() before requesting action masks")
+        mask = np.zeros(self.action_space.n, dtype=np.bool_)
+        for action in range(self.num_robots * 4):
+            robot_id, direction = self._decode_action(action)
+            mask[action] = can_move_one_step(self._board, robot_id, direction)
+        if self.include_noop and self._noop_action is not None:
+            mask[self._noop_action] = True
+        if not mask.any():
+            raise RuntimeError("Valid nonterminal board has no available action")
+        return mask
 
     def _make_obs(self, board: Board) -> np.ndarray:
         if self.obs_mode == "image":

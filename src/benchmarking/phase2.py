@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import platform
+import copy
 import subprocess
 import sys
 import time
@@ -82,6 +83,10 @@ class Phase2Config:
     bc_batch_size: int = 1024
     bc_learning_rate: float = 3e-4
     bc_max_puzzles: int | None = None
+    bc_select_best_by_validation: bool = False
+    initial_checkpoint_path: str | None = None
+    use_action_masking: bool = False
+    evaluate_both_mask_modes: bool = False
     training_seeds: tuple[int, ...] = (11, 29, 47)
     checkpoints: tuple[int, ...] = (0, 10_240, 25_600, 51_200)
     n_envs: int = 8
@@ -89,9 +94,12 @@ class Phase2Config:
     batch_size: int = 256
     n_epochs: int = 4
     learning_rate: float = 3e-4
+    learning_rate_final: float | None = None
     gamma: float = 0.99
     gae_lambda: float = 0.95
     ent_coef: float = 0.01
+    ent_coef_final: float | None = None
+    target_kl: float | None = None
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     validation_episodes_per_puzzle: int = 1
@@ -135,6 +143,8 @@ class Phase2Config:
             raise ValueError("bc_pretrain_epochs must be non-negative")
         if self.bc_pretrain_epochs > 0 and self.obs_mode != "image":
             raise ValueError("BC pretraining requires the structured-plane 'image' observation mode")
+        if self.initial_checkpoint_path is not None and self.bc_pretrain_epochs > 0:
+            raise ValueError("initial_checkpoint_path and BC pretraining are mutually exclusive")
         if self.policy_activation not in {None, "relu", "tanh"}:
             raise ValueError("policy_activation must be one of: relu, tanh")
         if self.bc_action_head_gain <= 0:
@@ -147,6 +157,14 @@ class Phase2Config:
             raise ValueError("health_probe_puzzles must be positive")
         if self.health_log_every_rollouts <= 0:
             raise ValueError("health_log_every_rollouts must be positive")
+        if self.learning_rate_final is not None and self.learning_rate_final <= 0:
+            raise ValueError("learning_rate_final must be positive")
+        if self.ent_coef_final is not None and self.ent_coef_final < 0:
+            raise ValueError("ent_coef_final must be non-negative")
+        if self.target_kl is not None and self.target_kl <= 0:
+            raise ValueError("target_kl must be positive")
+        if self.evaluate_both_mask_modes and not self.use_action_masking:
+            raise ValueError("evaluate_both_mask_modes requires use_action_masking")
         if self.curriculum_stage_max_lengths is not None:
             stages = self.curriculum_stage_max_lengths
             if tuple(sorted(set(stages))) != stages:
@@ -602,6 +620,7 @@ def _episode(
     rng: np.random.Generator,
     model: Any = None,
     deterministic: bool = True,
+    action_masking: bool = False,
 ) -> Dict[str, Any]:
     layout = create_fixed_layout_from_seed(puzzle)
     env = RicochetRobotsEnv(**environment_spec.to_env_kwargs(fixed_layout=layout))
@@ -615,7 +634,10 @@ def _episode(
     step_index = 0
     while not (terminated or truncated):
         if controller == "model":
-            action_value, _ = model.predict(obs, deterministic=deterministic)
+            predict_kwargs: Dict[str, Any] = {"deterministic": deterministic}
+            if action_masking:
+                predict_kwargs["action_masks"] = env.action_masks()
+            action_value, _ = model.predict(obs, **predict_kwargs)
             action = int(np.asarray(action_value).reshape(-1)[0])
         elif controller == "random":
             action = int(rng.integers(0, env.action_space.n))
@@ -793,6 +815,7 @@ def evaluate_controller(
     model: Any = None,
     deterministic: bool = True,
     bootstrap_samples: int = 0,
+    action_masking: bool = False,
 ) -> Dict[str, Any]:
     rng = np.random.default_rng(seed)
     records: List[Dict[str, Any]] = []
@@ -810,6 +833,7 @@ def evaluate_controller(
                         rng=rng,
                         model=model,
                         deterministic=deterministic,
+                        action_masking=action_masking,
                     )
                 )
     elapsed = time.perf_counter() - started
@@ -899,9 +923,11 @@ def _policy_construction(config: Phase2Config) -> tuple[str, Dict[str, Any], Dic
 def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) -> Any:
     """Construct the PPO model selected by ``config.policy`` on ``vec_env``."""
     from stable_baselines3 import PPO
+    from sb3_contrib import MaskablePPO
 
     policy_name, policy_kwargs, effective = _policy_construction(config)
-    model = PPO(
+    algorithm_class = MaskablePPO if config.use_action_masking else PPO
+    model = algorithm_class(
         policy_name,
         vec_env,
         device=device,
@@ -915,20 +941,24 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
         ent_coef=config.ent_coef,
         vf_coef=config.vf_coef,
         max_grad_norm=config.max_grad_norm,
+        target_kl=config.target_kl,
         normalize_advantage=True,
         policy_kwargs=policy_kwargs,
         verbose=0,
     )
+    effective["algorithm_class"] = f"{algorithm_class.__module__}.{algorithm_class.__qualname__}"
+    effective["use_action_masking"] = config.use_action_masking
     model._phase2_effective_policy = effective
     return model
 
 
-def _bc_dataset(
+def _bc_dataset_impl(
     puzzles: Sequence[PuzzleMetadata],
     config: Phase2Config,
     *,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
+    include_masks: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Replay stored optimal plans into (observation, optimal_action) pairs.
 
     Every fixture puzzle carries its BFS-optimal action sequence; the pairs
@@ -942,6 +972,7 @@ def _bc_dataset(
         selected = [selected[index] for index in sorted(order)]
     observations: List[np.ndarray] = []
     actions: List[int] = []
+    masks: List[np.ndarray] = []
     for puzzle in selected:
         layout = create_fixed_layout_from_seed(puzzle)
         env = RicochetRobotsEnv(**environment_spec.to_env_kwargs(fixed_layout=layout))
@@ -950,13 +981,32 @@ def _bc_dataset(
         for action in puzzle.actions_encoded:
             observations.append(obs.astype(np.uint8))
             actions.append(int(action))
+            if include_masks:
+                mask = env.action_masks()
+                if not bool(mask[int(action)]):
+                    raise RuntimeError(f"Stored expert action is masked for {_puzzle_id(puzzle)}")
+                masks.append(mask)
             obs, _, terminated, truncated, _ = env.step(int(action))
             if terminated or truncated:
                 break
         env.close()
         if not terminated:
             raise RuntimeError(f"Stored optimal plan failed to reach the goal for {_puzzle_id(puzzle)}")
-    return np.stack(observations), np.asarray(actions, dtype=np.int64)
+    return (
+        np.stack(observations),
+        np.asarray(actions, dtype=np.int64),
+        np.stack(masks) if include_masks else None,
+    )
+
+
+def _bc_dataset(
+    puzzles: Sequence[PuzzleMetadata],
+    config: Phase2Config,
+    *,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    observations, actions, _ = _bc_dataset_impl(puzzles, config, seed=seed, include_masks=False)
+    return observations, actions
 
 
 def _observation_probe(
@@ -979,6 +1029,27 @@ def _observation_probe(
     return np.stack(observations)
 
 
+def _observation_and_mask_probe(
+    puzzles: Sequence[PuzzleMetadata],
+    config: Phase2Config,
+    *,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    selected = sorted(puzzles, key=_puzzle_id)[: config.health_probe_puzzles]
+    observations: List[np.ndarray] = []
+    masks: List[np.ndarray] = []
+    for puzzle in selected:
+        layout = create_fixed_layout_from_seed(puzzle)
+        env = RicochetRobotsEnv(**config.environment_spec(seed).to_env_kwargs(fixed_layout=layout))
+        obs, _ = env.reset()
+        observations.append(np.asarray(obs))
+        masks.append(env.action_masks())
+        env.close()
+    if not observations:
+        raise ValueError("Policy-health probe requires at least one training puzzle")
+    return np.stack(observations), np.stack(masks)
+
+
 def _bc_pretrain(
     model: Any,
     puzzles: Sequence[PuzzleMetadata],
@@ -987,12 +1058,26 @@ def _bc_pretrain(
     seed: int,
     device: str,
     wandb_run: Any = None,
+    validation_puzzles: Sequence[PuzzleMetadata] | None = None,
 ) -> Dict[str, Any]:
     """Behaviour-clone the policy on optimal plans before PPO fine-tuning."""
     import torch
 
     started = time.perf_counter()
-    observations, actions = _bc_dataset(puzzles, config, seed=seed)
+    observations, actions, action_masks = _bc_dataset_impl(
+        puzzles,
+        config,
+        seed=seed,
+        include_masks=config.use_action_masking,
+    )
+    validation_data = None
+    if validation_puzzles:
+        validation_data = _bc_dataset_impl(
+            validation_puzzles,
+            config,
+            seed=seed + 1,
+            include_masks=config.use_action_masking,
+        )
     build_seconds = time.perf_counter() - started
     print(
         f"[phase2 bc] dataset: {len(actions)} pairs from {len(puzzles)} puzzles "
@@ -1001,6 +1086,7 @@ def _bc_pretrain(
     )
     obs_tensor = torch.as_tensor(observations, dtype=torch.float32, device=device)
     action_tensor = torch.as_tensor(actions, device=device)
+    mask_tensor = torch.as_tensor(action_masks, device=device) if action_masks is not None else None
     # PPO's action head ships with orthogonal gain 0.01, which scales all
     # upstream supervised gradients down ~100x and leaves cross-entropy stuck
     # on the uniform plateau. Structured BC runs explicitly opt into a larger
@@ -1011,6 +1097,38 @@ def _bc_pretrain(
     optimizer = torch.optim.Adam(model.policy.parameters(), lr=config.bc_learning_rate)
     generator = torch.Generator().manual_seed(seed)
     history: List[Dict[str, float]] = []
+    best_epoch: int | None = None
+    best_validation_loss = math.inf
+    best_validation_accuracy = -math.inf
+    best_policy_state: Dict[str, Any] | None = None
+
+    def distribution_for(batch_obs: Any, batch_masks: Any = None) -> Any:
+        distribution = model.policy.get_distribution(batch_obs)
+        if batch_masks is not None:
+            distribution.apply_masking(batch_masks)
+        return distribution
+
+    def validation_metrics() -> tuple[float, float] | None:
+        if validation_data is None:
+            return None
+        val_observations, val_actions, val_masks = validation_data
+        total_loss = 0.0
+        total_correct = 0
+        with torch.no_grad():
+            for start in range(0, len(val_actions), config.bc_batch_size):
+                stop = start + config.bc_batch_size
+                batch_obs = torch.as_tensor(val_observations[start:stop], dtype=torch.float32, device=device)
+                batch_actions = torch.as_tensor(val_actions[start:stop], device=device)
+                batch_masks = (
+                    torch.as_tensor(val_masks[start:stop], device=device) if val_masks is not None else None
+                )
+                distribution = distribution_for(batch_obs, batch_masks)
+                loss = -distribution.log_prob(batch_actions).mean()
+                total_loss += float(loss) * len(batch_actions)
+                predicted = distribution.distribution.probs.argmax(dim=-1)
+                total_correct += int((predicted == batch_actions).sum())
+        return total_loss / len(val_actions), total_correct / len(val_actions)
+
     model.policy.train()
     for epoch in range(config.bc_pretrain_epochs):
         order = torch.randperm(len(action_tensor), generator=generator).to(device)
@@ -1018,7 +1136,10 @@ def _bc_pretrain(
         total_correct = 0
         for start in range(0, len(order), config.bc_batch_size):
             index = order[start : start + config.bc_batch_size]
-            distribution = model.policy.get_distribution(obs_tensor[index])
+            distribution = distribution_for(
+                obs_tensor[index],
+                mask_tensor[index] if mask_tensor is not None else None,
+            )
             log_prob = distribution.log_prob(action_tensor[index])
             loss = -log_prob.mean()
             optimizer.zero_grad()
@@ -1027,24 +1148,58 @@ def _bc_pretrain(
             total_loss += float(loss.detach()) * len(index)
             predicted = distribution.distribution.probs.argmax(dim=-1)
             total_correct += int((predicted == action_tensor[index]).sum())
-        epoch_stats = {
+        val_metrics = validation_metrics()
+        epoch_stats: Dict[str, float] = {
             "loss": total_loss / len(action_tensor),
             "accuracy": total_correct / len(action_tensor),
+            "train_loss": total_loss / len(action_tensor),
+            "train_accuracy": total_correct / len(action_tensor),
         }
+        if val_metrics is not None:
+            epoch_stats["validation_loss"] = val_metrics[0]
+            epoch_stats["validation_accuracy"] = val_metrics[1]
+            candidate = (val_metrics[0], -val_metrics[1])
+            incumbent = (best_validation_loss, -best_validation_accuracy)
+            if candidate < incumbent:
+                best_epoch = epoch + 1
+                best_validation_loss, best_validation_accuracy = val_metrics
+                best_policy_state = copy.deepcopy(model.policy.state_dict())
         history.append(epoch_stats)
         print(
             f"[phase2 bc] epoch {epoch + 1}/{config.bc_pretrain_epochs} "
-            f"loss={epoch_stats['loss']:.3f} accuracy={epoch_stats['accuracy']:.1%}",
+            f"loss={epoch_stats['loss']:.3f} accuracy={epoch_stats['accuracy']:.1%}"
+            + (
+                f" val_loss={epoch_stats['validation_loss']:.3f} "
+                f"val_accuracy={epoch_stats['validation_accuracy']:.1%}"
+                if "validation_loss" in epoch_stats else ""
+            ),
             flush=True,
         )
         if wandb_run is not None:
-            wandb_run.log({"bc/loss": epoch_stats["loss"], "bc/accuracy": epoch_stats["accuracy"], "bc/epoch": epoch + 1})
+            payload = {
+                "bc/loss": epoch_stats["loss"],
+                "bc/accuracy": epoch_stats["accuracy"],
+                "bc/epoch": epoch + 1,
+            }
+            if "validation_loss" in epoch_stats:
+                payload["bc/validation_loss"] = epoch_stats["validation_loss"]
+                payload["bc/validation_accuracy"] = epoch_stats["validation_accuracy"]
+            wandb_run.log(payload)
+    if config.bc_select_best_by_validation:
+        if best_policy_state is None:
+            raise ValueError("BC validation selection requires validation puzzles")
+        model.policy.load_state_dict(best_policy_state)
     model.policy.eval()
     return {
         "pairs": len(actions),
         "puzzles": len(puzzles),
+        "validation_pairs": len(validation_data[1]) if validation_data is not None else 0,
+        "validation_puzzles": len(validation_puzzles) if validation_puzzles is not None else 0,
         "dataset_seconds": build_seconds,
         "epochs": history,
+        "selected_epoch": best_epoch if config.bc_select_best_by_validation else config.bc_pretrain_epochs,
+        "best_validation_loss": best_validation_loss if best_epoch is not None else None,
+        "best_validation_accuracy": best_validation_accuracy if best_epoch is not None else None,
         "action_head_reinitialized": config.bc_reinitialize_action_head,
         "action_head_gain": config.bc_action_head_gain,
         "total_seconds": time.perf_counter() - started,
@@ -1075,7 +1230,11 @@ def _maybe_init_wandb(config: Phase2Config, *, seed: int, output_dir: Path) -> A
     return run
 
 
-def _policy_health_payload(model: Any, observations: np.ndarray) -> Dict[str, float]:
+def _policy_health_payload(
+    model: Any,
+    observations: np.ndarray,
+    movement_masks: np.ndarray | None = None,
+) -> Dict[str, float]:
     """Summarize representation and head health on a fixed training probe."""
     import torch
 
@@ -1114,6 +1273,11 @@ def _policy_health_payload(model: Any, observations: np.ndarray) -> Dict[str, fl
         payload.update(tensor_stats("value", values))
         payload["health/policy_normalized_entropy"] = float(normalized_entropy.mean().cpu())
         payload["health/mean_max_action_probability"] = float(probabilities.max(dim=-1).values.mean().cpu())
+        if movement_masks is not None:
+            allowed = torch.as_tensor(movement_masks, dtype=torch.bool, device=probabilities.device)
+            payload["health/no_movement_probability_mass"] = float(
+                probabilities.masked_fill(allowed, 0.0).sum(dim=-1).mean().cpu()
+            )
     policy.train()
     return payload
 
@@ -1123,6 +1287,7 @@ def _make_wandb_rollout_callback(
     manager: Any,
     *,
     health_observations: np.ndarray,
+    health_movement_masks: np.ndarray | None = None,
     log_every_rollouts: int = 5,
 ) -> Any:
     """Log rollout-level training stats and curriculum state to W&B."""
@@ -1157,10 +1322,40 @@ def _make_wandb_rollout_callback(
                 payload["curriculum/level"] = manager.get_current_level()
                 payload["curriculum/window_success_rate"] = manager.get_success_rate()
                 payload["curriculum/episodes_at_level"] = manager.get_episodes_at_level()
-            payload.update(_policy_health_payload(self.model, health_observations))
+            payload.update(_policy_health_payload(self.model, health_observations, health_movement_masks))
             wandb_run.log(payload)
 
     return _WandbRolloutCallback()
+
+
+def _make_cumulative_schedule_callback(config: Phase2Config) -> Any:
+    """Anneal LR/entropy against cumulative experiment timesteps.
+
+    The harness calls ``learn`` once per checkpoint. SB3's native progress
+    schedule therefore resets its denominator at every call; this callback
+    deliberately keys schedules to ``max(config.checkpoints)`` instead.
+    """
+    if config.learning_rate_final is None and config.ent_coef_final is None:
+        return None
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    total_timesteps = max(config.checkpoints)
+
+    class _CumulativeScheduleCallback(BaseCallback):
+        def _on_step(self) -> bool:
+            return True
+
+        def _on_rollout_end(self) -> None:
+            fraction = min(1.0, self.num_timesteps / max(1, total_timesteps))
+            if config.learning_rate_final is not None:
+                value = config.learning_rate + (config.learning_rate_final - config.learning_rate) * fraction
+                self.model.lr_schedule = lambda _: value
+                for group in self.model.policy.optimizer.param_groups:
+                    group["lr"] = value
+            if config.ent_coef_final is not None:
+                self.model.ent_coef = config.ent_coef + (config.ent_coef_final - config.ent_coef) * fraction
+
+    return _CumulativeScheduleCallback()
 
 
 def _wandb_eval_payload(prefix: str, summary: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1317,6 +1512,7 @@ def train_overfit_milestone(
             seed=seed + checkpoint + 501,
             model=model,
             deterministic=True,
+            action_masking=config.use_action_masking,
         )
         stochastic_eval = evaluate_controller(
             "model",
@@ -1326,6 +1522,7 @@ def train_overfit_milestone(
             seed=seed + checkpoint + 502,
             model=model,
             deterministic=False,
+            action_masking=config.use_action_masking,
         )
         curve.append(
             {
@@ -1397,6 +1594,7 @@ def train_seed(
     device: str,
     output_dir: Path,
     bc_puzzles: Sequence[PuzzleMetadata] | None = None,
+    bc_validation_puzzles: Sequence[PuzzleMetadata] | None = None,
 ) -> Dict[str, Any]:
     import torch
     from stable_baselines3.common.env_util import make_vec_env
@@ -1405,25 +1603,66 @@ def train_seed(
     vec_env = make_vec_env(factory, n_envs=config.n_envs, seed=seed)
     model = _build_model(vec_env, config, seed=seed, device=device)
     effective_policy = dict(model._phase2_effective_policy)
-    health_observations = _observation_probe(training_suite, config, seed=seed + 70_000)
+    if config.initial_checkpoint_path is not None:
+        initial_path = Path(config.initial_checkpoint_path)
+        if not initial_path.exists():
+            raise FileNotFoundError(f"Initial checkpoint not found: {initial_path}")
+        model = type(model).load(
+            initial_path,
+            env=vec_env,
+            device=device,
+            seed=seed,
+            n_steps=config.n_steps,
+            batch_size=config.batch_size,
+            n_epochs=config.n_epochs,
+            learning_rate=config.learning_rate,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
+            ent_coef=config.ent_coef,
+            vf_coef=config.vf_coef,
+            max_grad_norm=config.max_grad_norm,
+            target_kl=config.target_kl,
+        )
+        model._phase2_effective_policy = effective_policy
+    health_observations, health_movement_masks = _observation_and_mask_probe(
+        training_suite,
+        config,
+        seed=seed + 70_000,
+    )
     wandb_run = _maybe_init_wandb(config, seed=seed, output_dir=output_dir)
-    learn_callback = (
-        _make_wandb_rollout_callback(
+    callbacks: List[Any] = []
+    if wandb_run is not None:
+        callbacks.append(_make_wandb_rollout_callback(
             wandb_run,
             factory.curriculum_manager,
             health_observations=health_observations,
+            health_movement_masks=health_movement_masks,
             log_every_rollouts=config.health_log_every_rollouts,
-        )
-        if wandb_run is not None
-        else None
-    )
+        ))
+    schedule_callback = _make_cumulative_schedule_callback(config)
+    if schedule_callback is not None:
+        callbacks.append(schedule_callback)
+    if len(callbacks) > 1:
+        from stable_baselines3.common.callbacks import CallbackList
+
+        learn_callback: Any = CallbackList(callbacks)
+    else:
+        learn_callback = callbacks[0] if callbacks else None
     bc_stats: Dict[str, Any] | None = None
     if config.bc_pretrain_epochs > 0:
         if not bc_puzzles:
             raise ValueError("BC pretraining requested but no training puzzles were provided")
         # Runs before the checkpoint loop, so the step-0 evaluation measures
         # the cloned policy on its own, before any PPO fine-tuning.
-        bc_stats = _bc_pretrain(model, bc_puzzles, config, seed=seed, device=device, wandb_run=wandb_run)
+        bc_stats = _bc_pretrain(
+            model,
+            bc_puzzles,
+            config,
+            seed=seed,
+            device=device,
+            wandb_run=wandb_run,
+            validation_puzzles=bc_validation_puzzles,
+        )
     curve: List[Dict[str, Any]] = []
     checkpoint_records: List[Dict[str, Any]] = []
     training_seconds = 0.0
@@ -1445,6 +1684,7 @@ def train_seed(
             model=model,
             deterministic=True,
             bootstrap_samples=config.validation_bootstrap_samples,
+            action_masking=config.use_action_masking,
         )
         training_stochastic_eval = evaluate_controller(
             "model",
@@ -1455,6 +1695,7 @@ def train_seed(
             model=model,
             deterministic=False,
             bootstrap_samples=config.validation_bootstrap_samples,
+            action_masking=config.use_action_masking,
         )
         deterministic_eval = evaluate_controller(
             "model",
@@ -1465,6 +1706,7 @@ def train_seed(
             model=model,
             deterministic=True,
             bootstrap_samples=config.validation_bootstrap_samples,
+            action_masking=config.use_action_masking,
         )
         stochastic_eval = evaluate_controller(
             "model",
@@ -1475,7 +1717,34 @@ def train_seed(
             model=model,
             deterministic=False,
             bootstrap_samples=config.validation_bootstrap_samples,
+            action_masking=config.use_action_masking,
         )
+        counterfactual_unmasked = None
+        if config.evaluate_both_mask_modes:
+            counterfactual_unmasked = {
+                "deterministic": evaluate_controller(
+                    "model",
+                    validation_suite,
+                    config.environment_spec(seed + 100_000),
+                    episodes_per_puzzle=config.validation_episodes_per_puzzle,
+                    seed=seed + evaluation_seed_step + 1,
+                    model=model,
+                    deterministic=True,
+                    bootstrap_samples=config.validation_bootstrap_samples,
+                    action_masking=False,
+                )["summary"],
+                "stochastic": evaluate_controller(
+                    "model",
+                    validation_suite,
+                    config.environment_spec(seed + 200_000),
+                    episodes_per_puzzle=config.validation_episodes_per_puzzle,
+                    seed=seed + evaluation_seed_step + 2,
+                    model=model,
+                    deterministic=False,
+                    bootstrap_samples=config.validation_bootstrap_samples,
+                    action_masking=False,
+                )["summary"],
+            }
         point = {
             "requested_checkpoint": checkpoint,
             "actual_timesteps": int(model.num_timesteps),
@@ -1485,7 +1754,8 @@ def train_seed(
             },
             "deterministic": deterministic_eval["summary"],
             "stochastic": stochastic_eval["summary"],
-            "health": _policy_health_payload(model, health_observations),
+            "health": _policy_health_payload(model, health_observations, health_movement_masks),
+            "counterfactual_unmasked": counterfactual_unmasked,
         }
         curve.append(point)
         checkpoint_record: Dict[str, Any] = {
@@ -1549,7 +1819,7 @@ def train_seed(
         selected_model = type(model).load(selected_record["model"], device=device)
 
     def test_model(candidate: Any, *, seed_offset: int) -> Dict[str, Any]:
-        return {
+        evaluation = {
             "deterministic": evaluate_controller(
                 "model",
                 test_suite,
@@ -1559,6 +1829,7 @@ def train_seed(
                 model=candidate,
                 deterministic=True,
                 bootstrap_samples=config.validation_bootstrap_samples,
+                action_masking=config.use_action_masking,
             ),
             "stochastic": evaluate_controller(
                 "model",
@@ -1569,8 +1840,35 @@ def train_seed(
                 model=candidate,
                 deterministic=False,
                 bootstrap_samples=config.validation_bootstrap_samples,
+                action_masking=config.use_action_masking,
             ),
         }
+        if config.evaluate_both_mask_modes:
+            evaluation["counterfactual_unmasked"] = {
+                "deterministic": evaluate_controller(
+                    "model",
+                    test_suite,
+                    config.environment_spec(seed + 300_000 + seed_offset),
+                    episodes_per_puzzle=1,
+                    seed=seed + 3 + seed_offset,
+                    model=candidate,
+                    deterministic=True,
+                    bootstrap_samples=config.validation_bootstrap_samples,
+                    action_masking=False,
+                ),
+                "stochastic": evaluate_controller(
+                    "model",
+                    test_suite,
+                    config.environment_spec(seed + 400_000 + seed_offset),
+                    episodes_per_puzzle=config.final_stochastic_episodes_per_puzzle,
+                    seed=seed + 4 + seed_offset,
+                    model=candidate,
+                    deterministic=False,
+                    bootstrap_samples=config.validation_bootstrap_samples,
+                    action_masking=False,
+                ),
+            }
+        return evaluation
 
     test_final: Dict[str, Any] | None = None
     test_selected: Dict[str, Any] | None = None
@@ -1596,6 +1894,7 @@ def train_seed(
         "selected_checkpoint_timesteps": selected_timesteps,
         "selected_checkpoint": selected_record["model"],
         "bc_pretrain": bc_stats,
+        "initial_checkpoint_path": config.initial_checkpoint_path,
         "curriculum": {
             "staged": config.curriculum_stage_max_lengths is not None,
             "final_level": factory.curriculum_manager.get_current_level(),
@@ -1859,6 +2158,7 @@ def run_phase2_benchmark(
         flush=True,
     )
     training_membership = [lookup[puzzle_id] for puzzle_id in split_manifest["memberships"]["train"]]
+    validation_membership = [lookup[puzzle_id] for puzzle_id in split_manifest["memberships"]["validation"]]
     if config.run_overfit_milestone:
         training_lookup = training_membership
         overfit_groups: Dict[str, List[PuzzleMetadata]] = defaultdict(list)
@@ -1893,6 +2193,7 @@ def run_phase2_benchmark(
             device=device,
             output_dir=output_dir,
             bc_puzzles=training_membership,
+            bc_validation_puzzles=validation_membership,
         ))
     aggregate = {
         "deterministic": _seed_aggregate(seed_results, "deterministic"),
