@@ -6,22 +6,23 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 14:45 EDT
+- Updated: 2026-07-17 15:15 EDT
 - Branch: `sid-learnable-agent`
-- Phase: masking/BC stability complete; reverse-curriculum infrastructure next
-- Latest completed commit: `f9fae11 feat: make RL benchmark observable and selectable`
+- Phase: reverse-curriculum implementation complete; smoke pending
+- Latest completed commit: `6373fa2 feat: add masked PPO and stable BC transfer controls`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
-- Last test gate: 99 passed, 9 intentionally skipped, 1 warning in 8.80s
+- Last test gate: 103 passed, 9 intentionally skipped, 1 warning in 13.73s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: commit masking/BC stability, then implement reverse start
-  states and calibrated frontier gating
+- Current action: commit reverse infrastructure, then run the 8×8 smoke in the
+  foreground
+- Exact next command: `.venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_reverse_smoke_8x8.yaml --bank-dir artifacts/phase2b_bank --output-dir artifacts/phase2_experiments/phase5_reverse_smoke_8x8`
 - Exact next command after handoff: `.venv-phase2/bin/python -m pytest src/tests/ -q`
 
 ## Locked decisions
@@ -114,3 +115,20 @@ state changes. Append chronological entries; never rewrite historical entries.
   to 5.7% (11,605 unmasked versus 10,937 masked environment steps/s in the
   isolated env probe), satisfying the <10% gate.
 - Test gate: 99 passed, 9 legacy recurrent tests skipped.
+
+### 2026-07-17 15:15 EDT — reverse infrastructure implemented; smoke queued
+
+- Added exact stored-plan prefix replay without bank mutation; every tested
+  suffix reaches the goal in exactly its declared remaining distance.
+- Added deterministic weighted band identity, terminal `curriculum_band`
+  plumbing, per-band windows, frontier-only mastery, and explicit
+  mastery/forced transition records. Legacy unkeyed band sampling retains its
+  previous path.
+- Added a calibration command and persisted artifacts:
+  - 8×8 fingerprint `991c7e1b4404…`; thresholds d1=73.53%, d2/d3=70%.
+  - 16×16 fingerprint `d6b32bd0ee70…`; threshold d1=79.5%, d2–d8=70%.
+- Added smoke, dry-run, and deferred full-run configs. The deferred full config
+  is documented but must not be launched in this session.
+- Re-derived the immutable Phase 4 contracts after the changes: fixture
+  `3579113b230a…`, split `c0e97329b109…`, unchanged.
+- Test gate: 103 passed, 9 legacy recurrent tests skipped.

@@ -732,7 +732,10 @@ class BankCurriculumWrapper(GymEnvBase):
         if terminated or truncated:
             success = info.get('is_success', False) and not truncated
             if self.track_curriculum:
-                self.curriculum_manager.record_episode_result(success)
+                self.curriculum_manager.record_episode_result(
+                    success,
+                    band_key=info.get("curriculum_band"),
+                )
             
             # Check if curriculum level has changed and recreate environment if needed
             if self.track_curriculum and self.curriculum_manager.current_level != self._last_known_level:

@@ -72,6 +72,11 @@ class Phase2Config:
     two_robot_band_weight: float | None = None
     run_overfit_milestone: bool = True
     curriculum_stage_max_lengths: tuple[int, ...] | None = None
+    curriculum_start_distances: tuple[int, ...] | None = None
+    reverse_final_full_starts: bool = False
+    curriculum_frontier_weight: float = 3.0
+    curriculum_frontier_window: int = 200
+    curriculum_frontier_thresholds: Mapping[int, float] | None = None
     curriculum_success_threshold: float = 0.7
     curriculum_min_episodes: int = 5_000
     curriculum_window: int = 500
@@ -173,13 +178,41 @@ class Phase2Config:
                 raise ValueError("The final curriculum stage must cover max_optimal_length")
             if stages[0] < self.min_optimal_length:
                 raise ValueError("Curriculum stages cannot start below min_optimal_length")
+        if self.curriculum_stage_max_lengths is not None and self.curriculum_start_distances is not None:
+            raise ValueError("Length and reverse-distance curricula are mutually exclusive")
+        if self.curriculum_start_distances is not None:
+            distances = self.curriculum_start_distances
+            if tuple(sorted(set(distances))) != distances:
+                raise ValueError("curriculum_start_distances must be strictly increasing")
+            if not distances or distances[0] < 1 or distances[-1] > self.max_optimal_length:
+                raise ValueError("curriculum_start_distances must be within the fixture length range")
+            thresholds = self.curriculum_frontier_thresholds or {}
+            missing = set(distances) - set(thresholds)
+            if missing:
+                raise ValueError(f"Missing calibrated frontier thresholds for distances: {sorted(missing)}")
+            if any(not 0.0 < float(value) <= 1.0 for value in thresholds.values()):
+                raise ValueError("Frontier thresholds must be in (0, 1]")
+        if self.curriculum_frontier_weight <= 0:
+            raise ValueError("curriculum_frontier_weight must be positive")
+        if self.curriculum_frontier_window <= 0:
+            raise ValueError("curriculum_frontier_window must be positive")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "Phase2Config":
         normalized = dict(values)
-        for key in ("training_seeds", "checkpoints", "curriculum_stage_max_lengths"):
+        for key in (
+            "training_seeds",
+            "checkpoints",
+            "curriculum_stage_max_lengths",
+            "curriculum_start_distances",
+        ):
             if key in normalized and normalized[key] is not None:
                 normalized[key] = tuple(int(value) for value in normalized[key])
+        if normalized.get("curriculum_frontier_thresholds") is not None:
+            normalized["curriculum_frontier_thresholds"] = {
+                int(key): float(value)
+                for key, value in normalized["curriculum_frontier_thresholds"].items()
+            }
         unknown = set(normalized) - set(cls.__dataclass_fields__)
         if unknown:
             raise ValueError(f"Unknown Phase 2 configuration keys: {', '.join(sorted(unknown))}")
@@ -278,6 +311,8 @@ def _level(
 
 
 def _curriculum_levels(config: Phase2Config) -> List[Dict[str, Any]]:
+    if config.curriculum_start_distances is not None:
+        return _reverse_curriculum_levels(config)
     if config.curriculum_stage_max_lengths is None:
         return [_level(config)]
     return [
@@ -289,6 +324,66 @@ def _curriculum_levels(config: Phase2Config) -> List[Dict[str, Any]]:
         )
         for index, stage_length in enumerate(config.curriculum_stage_max_lengths)
     ]
+
+
+def _reverse_curriculum_levels(config: Phase2Config) -> List[Dict[str, Any]]:
+    distances = config.curriculum_start_distances
+    if distances is None:
+        raise ValueError("Reverse curriculum requires curriculum_start_distances")
+    thresholds = config.curriculum_frontier_thresholds or {}
+    levels: List[Dict[str, Any]] = []
+    for index, frontier_distance in enumerate(distances):
+        active_distances = distances[: index + 1]
+        levels.append({
+            "level": index,
+            "name": f"reverse-stage-{index}-frontier-d{frontier_distance}",
+            "spec_key": config.spec_key,
+            "min_optimal_length": min(active_distances),
+            "max_optimal_length": config.max_optimal_length,
+            "min_robots_moved": config.min_robots_moved,
+            "max_robots_moved": config.max_robots_moved,
+            "bands": [
+                {
+                    "min_optimal_length": distance,
+                    "max_optimal_length": config.max_optimal_length,
+                    "min_robots_moved": config.min_robots_moved,
+                    "max_robots_moved": config.max_robots_moved,
+                    "start_distance": distance,
+                    "band_key": f"d{distance}",
+                    "weight": config.curriculum_frontier_weight if distance == frontier_distance else 1.0,
+                }
+                for distance in active_distances
+            ],
+            "frontier_band": f"d{frontier_distance}",
+            "frontier_threshold": float(thresholds[frontier_distance]),
+            "frontier_window": config.curriculum_frontier_window,
+        })
+    if config.reverse_final_full_starts:
+        final = _level(
+            config,
+            index=len(levels),
+            name="reverse-final-original-starts",
+        )
+        final_bands = final.get("bands")
+        if final_bands is None:
+            final_bands = [
+                {
+                    "min_optimal_length": length,
+                    "max_optimal_length": length,
+                    "min_robots_moved": config.min_robots_moved,
+                    "max_robots_moved": config.max_robots_moved,
+                    "weight": 1.0,
+                }
+                for length in range(config.min_optimal_length, config.max_optimal_length + 1)
+            ]
+        for band in final_bands:
+            band["band_key"] = (
+                f"L{band['min_optimal_length']}"
+                f"R{band['min_robots_moved']}-{band['max_robots_moved']}"
+            )
+        final["bands"] = final_bands
+        levels.append(final)
+    return levels
 
 
 def _fixture_attempt(args: tuple[int, "Phase2Config"]) -> "PuzzleMetadata | None":
@@ -1322,6 +1417,15 @@ def _make_wandb_rollout_callback(
                 payload["curriculum/level"] = manager.get_current_level()
                 payload["curriculum/window_success_rate"] = manager.get_success_rate()
                 payload["curriculum/episodes_at_level"] = manager.get_episodes_at_level()
+                frontier_rate = manager.get_frontier_success_rate()
+                if frontier_rate is not None:
+                    payload["curriculum/frontier_success_rate"] = frontier_rate
+                for band_key, success_rate in manager.get_band_success_rates().items():
+                    payload[f"curriculum/band/{band_key}"] = success_rate
+                if manager.transitions:
+                    payload["curriculum/forced_transitions"] = sum(
+                        transition["reason"] == "forced" for transition in manager.transitions
+                    )
             payload.update(_policy_health_payload(self.model, health_observations, health_movement_masks))
             wandb_run.log(payload)
 
@@ -1384,7 +1488,7 @@ def _resolve_device(requested: str) -> str:
 
 
 def _training_factory(bank: PuzzleBank, config: Phase2Config, seed: int):
-    staged = config.curriculum_stage_max_lengths is not None
+    staged = config.curriculum_stage_max_lengths is not None or config.curriculum_start_distances is not None
     if staged:
         manager = create_bank_curriculum_manager(
             bank=bank,
@@ -1568,6 +1672,9 @@ def _curriculum_checkpoint_state(manager: Any) -> Dict[str, Any]:
         "episodes_at_level": int(manager.get_episodes_at_level()),
         "success_rate_window": [bool(value) for value in manager.success_rate_window],
         "window_success_rate": float(manager.get_success_rate()),
+        "frontier_success_rate": manager.get_frontier_success_rate(),
+        "band_success_rates": manager.get_band_success_rates(),
+        "transitions": list(manager.transitions),
     }
 
 
@@ -1896,11 +2003,17 @@ def train_seed(
         "bc_pretrain": bc_stats,
         "initial_checkpoint_path": config.initial_checkpoint_path,
         "curriculum": {
-            "staged": config.curriculum_stage_max_lengths is not None,
+            "staged": (
+                config.curriculum_stage_max_lengths is not None
+                or config.curriculum_start_distances is not None
+            ),
             "final_level": factory.curriculum_manager.get_current_level(),
             "total_levels": len(factory.curriculum_manager.curriculum_levels),
             "episodes_at_final_level": factory.curriculum_manager.get_episodes_at_level(),
             "window_success_rate": factory.curriculum_manager.get_success_rate(),
+            "frontier_success_rate": factory.curriculum_manager.get_frontier_success_rate(),
+            "band_success_rates": factory.curriculum_manager.get_band_success_rates(),
+            "transitions": list(factory.curriculum_manager.transitions),
         },
         "test_status": "run" if config.run_final_test else "sealed_not_run",
         "test": test_selected,

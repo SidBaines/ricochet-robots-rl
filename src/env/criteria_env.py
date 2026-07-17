@@ -8,14 +8,16 @@ puzzles matching specific criteria without requiring online solving.
 from __future__ import annotations
 
 import numpy as np
+from collections import deque
 from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .puzzle_bank import (
     PuzzleBank, BankSampler, PuzzleMetadata, SpecKey, 
     create_fixed_layout_from_seed
 )
 from .ricochet_env import RicochetRobotsEnv, FixedLayout, GymEnvBase
+from .ricochet_core import Board, apply_action, reached_goal
 from .environment_spec import EnvironmentSpec
 
 
@@ -60,6 +62,35 @@ class PuzzleCriteria:
                 return False
         
         return True
+
+
+def layout_at_start_distance(
+    metadata: PuzzleMetadata,
+    layout: FixedLayout,
+    start_distance: int,
+) -> FixedLayout:
+    """Return the stored-plan state with ``start_distance`` suffix actions left."""
+    distance = int(start_distance)
+    length = int(metadata.optimal_length)
+    if not 1 <= distance <= length:
+        raise ValueError(f"start_distance must be in [1, {length}], got {distance}")
+    board = Board(
+        height=layout.height,
+        width=layout.width,
+        h_walls=layout.h_walls.copy(),
+        v_walls=layout.v_walls.copy(),
+        robot_positions=dict(layout.robot_positions),
+        goal_position=layout.goal_position,
+        target_robot=layout.target_robot,
+    )
+    prefix = metadata.actions_encoded[: length - distance]
+    for index, action in enumerate(prefix):
+        if reached_goal(board):
+            raise RuntimeError(f"Stored plan reaches goal before prefix action {index}")
+        board = apply_action(board, int(action) // 4, int(action) % 4)
+        if reached_goal(board):
+            raise RuntimeError("Stored optimal plan reaches the goal before its final action")
+    return replace(layout, robot_positions=dict(board.robot_positions))
 
 
 class CriteriaFilteredEnv(GymEnvBase):
@@ -152,6 +183,9 @@ class CriteriaFilteredEnv(GymEnvBase):
         self._failed_samples = 0
         # Episode step counter (for optimality gap without online solving)
         self._episode_steps: int = 0
+        self._current_band_key: Optional[str] = None
+        self._current_start_distance: Optional[int] = None
+        self._band_rng = np.random.default_rng(environment_spec.seed)
         
         # Construct only the spaces here. Sampling begins on the first reset so
         # initialization does not consume and discard a puzzle.
@@ -174,10 +208,27 @@ class CriteriaFilteredEnv(GymEnvBase):
         """Create current environment from bank sample."""
         # Sample puzzle from bank (optionally stratified)
         if self.criteria.bands:
+            tracked_bands = any(
+                "band_key" in band or "start_distance" in band for band in self.criteria.bands
+            )
+            if tracked_bands:
+                weights = np.asarray([float(band.get("weight", 1.0)) for band in self.criteria.bands], dtype=float)
+                if not np.isfinite(weights).all() or (weights < 0).any() or weights.sum() <= 0:
+                    raise ValueError("Curriculum band weights must be finite, non-negative, and not all zero")
+                band_index = int(self._band_rng.choice(len(self.criteria.bands), p=weights / weights.sum()))
+                selected_band = self.criteria.bands[band_index]
+                sampling_bands = [selected_band]
+                self._current_band_key = str(selected_band.get("band_key", f"band_{band_index}"))
+                raw_distance = selected_band.get("start_distance")
+                self._current_start_distance = int(raw_distance) if raw_distance is not None else None
+            else:
+                sampling_bands = self.criteria.bands
+                self._current_band_key = None
+                self._current_start_distance = None
             samples = self.sampler.sample_puzzles_stratified(
                 spec_key=self.criteria.spec_key,
                 total_count=1,
-                bands=self.criteria.bands,
+                bands=sampling_bands,
                 random_seed=None,
                 warn_on_empty_band=self.verbose,
             )
@@ -190,6 +241,8 @@ class CriteriaFilteredEnv(GymEnvBase):
                 min_robots_moved=self.criteria.min_robots_moved,
                 max_robots_moved=self.criteria.max_robots_moved
             )
+            self._current_band_key = None
+            self._current_start_distance = None
         
         if metadata is None:
             if self.verbose:
@@ -207,6 +260,8 @@ class CriteriaFilteredEnv(GymEnvBase):
         try:
             # Create FixedLayout from metadata
             fixed_layout = create_fixed_layout_from_seed(metadata)
+            if self._current_start_distance is not None:
+                fixed_layout = layout_at_start_distance(metadata, fixed_layout, self._current_start_distance)
             
             # Create environment with fixed layout
             self._current_env = RicochetRobotsEnv(
@@ -257,6 +312,7 @@ class CriteriaFilteredEnv(GymEnvBase):
         """
         if seed is not None:
             self.sampler.reseed(seed)
+            self._band_rng = np.random.default_rng(seed)
 
         # Create new environment for this episode
         self._create_current_env()
@@ -302,6 +358,10 @@ class CriteriaFilteredEnv(GymEnvBase):
                 "robots_moved": self._current_metadata.robots_moved,
                 "puzzle_seed": self._current_metadata.seed
             })
+        if self._current_band_key is not None:
+            info["curriculum_band"] = self._current_band_key
+        if self._current_start_distance is not None:
+            info["start_distance"] = self._current_start_distance
         
         return obs, info
     
@@ -334,6 +394,10 @@ class CriteriaFilteredEnv(GymEnvBase):
                 else:
                     # For failures, still attach gap as None to indicate unavailable
                     info.setdefault("optimality_gap", None)
+            if self._current_band_key is not None:
+                info["curriculum_band"] = self._current_band_key
+            if self._current_start_distance is not None:
+                info["start_distance"] = self._current_start_distance
             # Reset step counter for safety (env will usually be reset by caller)
             self._episode_steps = 0
         
@@ -448,6 +512,8 @@ class BankCurriculumManager:
         # Current state
         self.current_level = 0
         self.success_rate_window = []
+        self.band_windows: Dict[str, deque] = {}
+        self.transitions: List[Dict[str, Any]] = []
         self.episode_count = 0
         self.level_start_episode = 0
         
@@ -495,7 +561,7 @@ class BankCurriculumManager:
             bands=bands
         )
     
-    def record_episode_result(self, success: bool) -> None:
+    def record_episode_result(self, success: bool, band_key: Optional[str] = None) -> None:
         """Record episode result.
         
         Args:
@@ -503,6 +569,14 @@ class BankCurriculumManager:
         """
         self.episode_count += 1
         self.success_rate_window.append(success)
+        if band_key is not None:
+            level_spec = self.curriculum_levels[self.current_level]
+            window_size = int(level_spec.get("frontier_window", self.success_rate_window_size))
+            window = self.band_windows.get(str(band_key))
+            if window is None or window.maxlen != window_size:
+                window = deque(maxlen=window_size)
+                self.band_windows[str(band_key)] = window
+            window.append(bool(success))
         
         # Trim window if too large
         if len(self.success_rate_window) > self.success_rate_window_size:
@@ -525,7 +599,7 @@ class BankCurriculumManager:
                     f"after {self.episode_count - self.level_start_episode} episodes "
                     f"(window success {self.get_success_rate():.1%})"
                 )
-            self._advance_level()
+            self._advance_level(reason="forced")
     
     def _should_check_advancement(self) -> bool:
         """Check if it's time to evaluate advancement."""
@@ -542,26 +616,48 @@ class BankCurriculumManager:
     
     def _check_advancement(self) -> None:
         """Check if agent performance warrants advancing to next level."""
+        level_spec = self.curriculum_levels[self.current_level]
+        frontier_band = level_spec.get("frontier_band")
+        if frontier_band is not None:
+            frontier_window_size = int(level_spec.get("frontier_window", self.success_rate_window_size))
+            frontier_window = self.band_windows.get(str(frontier_band))
+            if frontier_window is None or len(frontier_window) < frontier_window_size:
+                return
+            threshold = float(level_spec.get("frontier_threshold", self.success_rate_threshold))
+            if float(np.mean(frontier_window)) >= threshold:
+                self._advance_level(reason="mastery")
+            return
         if len(self.success_rate_window) < self.success_rate_window_size:
-            return  # Not enough data yet
-        
-        success_rate = np.mean(self.success_rate_window)
-        
-        if success_rate >= self.success_rate_threshold:
-            self._advance_level()
+            return
+        if float(np.mean(self.success_rate_window)) >= self.success_rate_threshold:
+            self._advance_level(reason="mastery")
     
-    def _advance_level(self) -> None:
+    def _advance_level(self, *, reason: str = "mastery") -> None:
         """Advance to the next curriculum level."""
         old_level = self.current_level
+        transition = {
+            "from_level": old_level,
+            "to_level": old_level + 1,
+            "reason": reason,
+            "episode_count": self.episode_count,
+            "episodes_at_level": self.get_episodes_at_level(),
+            "window_success_rate": self.get_success_rate(),
+            "frontier_success_rate": self.get_frontier_success_rate(),
+        }
+        self.transitions.append(transition)
         self.current_level += 1
         self.level_start_episode = self.episode_count
         
         # Clear success rate window for new level
         self.success_rate_window.clear()
+        self.band_windows.clear()
         
         if self.verbose:
             level_spec = self.curriculum_levels[self.current_level]
-            print(f"Curriculum advanced from level {old_level} to {self.current_level}: {level_spec['name']}")
+            print(
+                f"Curriculum advanced from level {old_level} to {self.current_level} "
+                f"({reason}): {level_spec['name']}"
+            )
     
     def get_current_level(self) -> int:
         """Get current curriculum level."""
@@ -576,6 +672,20 @@ class BankCurriculumManager:
     def get_episodes_at_level(self) -> int:
         """Get number of episodes at current level."""
         return self.episode_count - self.level_start_episode
+
+    def get_frontier_success_rate(self) -> Optional[float]:
+        frontier = self.curriculum_levels[self.current_level].get("frontier_band")
+        if frontier is None or str(frontier) not in self.band_windows:
+            return None
+        window = self.band_windows[str(frontier)]
+        return float(np.mean(window)) if window else None
+
+    def get_band_success_rates(self) -> Dict[str, float]:
+        return {
+            key: float(np.mean(window))
+            for key, window in sorted(self.band_windows.items())
+            if window
+        }
     
     def get_stats(self) -> Dict[str, Any]:
         """Get comprehensive statistics."""
@@ -587,5 +697,8 @@ class BankCurriculumManager:
             "episodes_at_level": self.get_episodes_at_level(),
             "total_episodes": self.episode_count,
             "window_size": len(self.success_rate_window),
+            "frontier_success_rate": self.get_frontier_success_rate(),
+            "band_success_rates": self.get_band_success_rates(),
+            "transitions": list(self.transitions),
             "criteria": self.get_current_criteria()
         }
