@@ -6,23 +6,23 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 18:02 EDT
+- Updated: 2026-07-17 18:28 EDT
 - Branch: `sid-learnable-agent`
-- Phase: exact resumable promotion implemented; prospective allocation/stopping rules next
-- Latest completed commit: `0ff548d feat: add exact resumable PPO checkpoints`
+- Phase: acceleration steps 2–7 complete; controlled batch/precision/model tests next
+- Latest completed commit: `ba36356 feat: predeclare Phase 5 allocation rules`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
-- Last test gate: 118 passed, 9 intentionally skipped, 3 benign checkpoint or
-  small-rollout warnings in 16.76s
+- Last test gate: 126 passed, 9 intentionally skipped, 3 benign checkpoint or
+  small-rollout warnings in 15.65s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: implement predeclared successive-halving and plateau-stopping
-  rules, retaining the selected `16×128` rollout geometry
+- Current action: benchmark larger BC batches, mixed precision, and smaller
+  models as separate controlled factors; do not silently change the recipe
 - Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
   SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
@@ -432,3 +432,33 @@ state changes. Append chronological entries; never rewrite historical entries.
   not resumable promotion sources. Future Phase 5 checkpoint directories will
   contain both `model.zip` and `training_state.pkl`; the canonical BC model
   remains a valid weights-only initializer.
+
+### 2026-07-17 18:28 EDT — prospective allocation and plateau rules implemented
+
+- Commit `ba36356` caps both matched A/B screen configs at the first 512k-step
+  successive-halving rung. They can only be continued through
+  `src/scripts/adjudicate_phase5_rung.py`, which consumes completed results and
+  the versioned rules in `configs/phase5_allocation_rules.yaml` and emits a
+  machine-readable decision plus validated exact-resume configs.
+- A candidate must have zero masked no-movement and invalid actions and may not
+  regress deterministic or either two-/three-robot stochastic validation by
+  more than two points from its rung run's first checkpoint. Stochastic
+  validation is primary, deterministic validation breaks ties, and a clear
+  halving decision additionally requires at least a one-point margin,
+  disjoint puzzle-clustered 95% intervals, and a lead at both recent common
+  checkpoints. Ambiguity retains all healthy candidates; it never forces an
+  under-supported elimination merely to meet the nominal halving ratio.
+- Rung 1 promotes from 512k to checkpoints at 1.024M and 2.048M. Rung 2 promotes
+  from 2.048M toward 10.24M. Generated configs require both `model.zip` and
+  `training_state.pkl`, clearing the weights-only initializer so optimizer,
+  schedules, RNG, curriculum, and sampler streams are preserved.
+- Full promotion prospectively enables stochastic-validation plateau stopping:
+  minimum budget 4.096M, patience three checkpoint evaluations, and minimum
+  material improvement one percentage point. The rule uses fixed validation
+  seeds, runs only after the checkpoint is safely persisted, is recorded in
+  each result, and retains ordinary best-checkpoint selection.
+- Unit coverage exercises clear promotion, overlapping uncertainty,
+  inconsistent curves, health rejection, exact-resume config generation, and
+  plateau recovery/reset semantics. Full gate: 126 passed, 9 intentionally
+  skipped. No A/B learning results have yet been inspected and the final test
+  remains sealed.
