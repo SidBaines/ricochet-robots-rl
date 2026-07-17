@@ -254,3 +254,17 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - Known risk: PPO fine-tuning can catastrophically forget the BC prior (entropy bonus + policy-gradient noise). If validation collapses after strong step-0 numbers, consider: lower learning rate for PPO (1e-4), lower ent_coef, or adding a KL-to-BC-prior penalty.
 - If BC+PPO clears the gate: run the 3-seed protocol before claiming the milestone, then consider the DRC/recurrence comparison (docs/ResearchPlan.md) on top of this recipe.
 - Background context every new agent should read first: `CLAUDE.md` (hard-won lessons: real-factory benchmarking, no iterrows, fingerprints are contracts, detached long jobs), `docs/GridCnnGeneralizationReport.md` (full experiment arc), and the phase-4 diagnosis above (exploration, not scale, is the 16×16 constraint).
+
+### Performance-first RL remediation started (2026-07-17 13:29 EDT)
+
+- Synthesized `docs/RLLearningInvestigationPlan.md` and
+  `docs/Phase5ReverseCurriculumPlan.md` into
+  `docs/RLLearningSynthesizedPlan.md`.
+- Detailed live state, experiment commands, results, decisions, and all
+  deferred work are tracked in `docs/RLLearningExecutionLog.md`; use that file
+  for handoff.
+- Locked priority: improve the BC→PPO feed-forward model first with explicit
+  provenance, sealed evaluation, training-time movement masking, BC validation,
+  and PPO stability screens. Reverse curriculum will be implemented and tested
+  now but its full RL-only run is deferred.
+- Baseline before edits: 88 passed, 9 intentionally skipped.
