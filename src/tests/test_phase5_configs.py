@@ -46,3 +46,25 @@ def test_phase5_screens_are_matched_except_for_declared_optimizer_bundle() -> No
     assert historical["fixed_validation_seeds"]
     assert historical["use_action_masking"]
     assert not historical["run_final_test"]
+
+
+def test_phase5_geometry_benchmarks_are_matched_except_for_rollout_shape() -> None:
+    names = (
+        "phase5_geometry_16x128.yaml",
+        "phase5_geometry_32x64.yaml",
+        "phase5_geometry_64x32.yaml",
+    )
+    configs = [asdict(_load_config(name)) for name in names]
+    reference = configs[0]
+    for candidate in configs[1:]:
+        differences = {key for key in reference if reference[key] != candidate[key]}
+        assert differences == {"n_envs", "n_steps"}
+    assert [(config["n_envs"], config["n_steps"]) for config in configs] == [
+        (16, 128),
+        (32, 64),
+        (64, 32),
+    ]
+    assert all(config["n_envs"] * config["n_steps"] == 2048 for config in configs)
+    assert all(config["checkpoints"] == (0, 102400) for config in configs)
+    assert all(config["evaluation_batch_size"] == 64 for config in configs)
+    assert all(not config["run_final_test"] for config in configs)
