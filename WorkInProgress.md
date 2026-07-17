@@ -268,3 +268,16 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   and PPO stability screens. Reverse curriculum will be implemented and tested
   now but its full RL-only run is deferred.
 - Baseline before edits: 88 passed, 9 intentionally skipped.
+
+### RL remediation observability/evaluation foundation (2026-07-17 14:05 EDT)
+
+- Added explicit policy provenance, evaluable per-checkpoint weights and
+  metadata, validation-only runs, validation-selected reporting, puzzle-level
+  bootstrap uncertainty, corrected W&B axes, SB3 optimizer metrics, and fixed
+  training-probe activation/logit/value health.
+- Sealed a fresh 375-layout confirmation suite at
+  `artifacts/phase2_experiments/phase4_confirmation_manifest.json`, fingerprint
+  `816d8583c7cd…`; it is disjoint from train, validation, and the exposed test
+  suite by both puzzle ID and layout hash. No model has touched it.
+- Gate: 92 passed, 9 intentionally skipped. Detailed handoff remains in
+  `docs/RLLearningExecutionLog.md`.

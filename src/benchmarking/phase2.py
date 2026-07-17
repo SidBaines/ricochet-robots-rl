@@ -64,6 +64,10 @@ class Phase2Config:
     features_dim: int = 256
     conv_channels: int = 64
     n_conv_layers: int = 4
+    policy_activation: str | None = None
+    ortho_init: bool | None = None
+    bc_reinitialize_action_head: bool = True
+    bc_action_head_gain: float = 1.0
     two_robot_band_weight: float | None = None
     run_overfit_milestone: bool = True
     curriculum_stage_max_lengths: tuple[int, ...] | None = None
@@ -91,10 +95,17 @@ class Phase2Config:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     validation_episodes_per_puzzle: int = 1
+    validation_bootstrap_samples: int = 0
+    fixed_validation_seeds: bool = False
     final_stochastic_episodes_per_puzzle: int = 5
     baseline_episodes_per_puzzle: int = 20
     overfit_puzzles_per_stratum: int = 4
     overfit_stochastic_episodes_per_puzzle: int = 20
+    save_checkpoint_weights: bool = False
+    select_checkpoint_by_validation: bool = False
+    run_final_test: bool = True
+    health_probe_puzzles: int = 64
+    health_log_every_rollouts: int = 5
     device: str = "auto"
 
     def __post_init__(self) -> None:
@@ -124,6 +135,18 @@ class Phase2Config:
             raise ValueError("bc_pretrain_epochs must be non-negative")
         if self.bc_pretrain_epochs > 0 and self.obs_mode != "image":
             raise ValueError("BC pretraining requires the structured-plane 'image' observation mode")
+        if self.policy_activation not in {None, "relu", "tanh"}:
+            raise ValueError("policy_activation must be one of: relu, tanh")
+        if self.bc_action_head_gain <= 0:
+            raise ValueError("bc_action_head_gain must be positive")
+        if self.validation_bootstrap_samples < 0:
+            raise ValueError("validation_bootstrap_samples must be non-negative")
+        if self.select_checkpoint_by_validation and not self.save_checkpoint_weights:
+            raise ValueError("select_checkpoint_by_validation requires save_checkpoint_weights")
+        if self.health_probe_puzzles <= 0:
+            raise ValueError("health_probe_puzzles must be positive")
+        if self.health_log_every_rollouts <= 0:
+            raise ValueError("health_log_every_rollouts must be positive")
         if self.curriculum_stage_max_lengths is not None:
             stages = self.curriculum_stage_max_lengths
             if tuple(sorted(set(stages))) != stages:
@@ -495,6 +518,67 @@ def build_split_manifest(bank: PuzzleBank, output_path: Path, config: Phase2Conf
     return manifest
 
 
+def build_confirmation_manifest(
+    bank: PuzzleBank,
+    parent_manifest: Mapping[str, Any],
+    output_path: Path,
+    config: Phase2Config,
+    *,
+    selection_seed: int = 20_260_717,
+    max_per_stratum: int = 20,
+) -> Dict[str, Any]:
+    """Seal unused test layouts for one final model evaluation."""
+    if max_per_stratum <= 0:
+        raise ValueError("max_per_stratum must be positive")
+    lookup = _lookup_puzzles(bank, config)
+    exposed_ids = set(str(value) for value in parent_manifest["test_suite"])
+    exposed_layouts = {_layout_id(lookup[puzzle_id]) for puzzle_id in exposed_ids}
+    candidate_ids = [
+        str(puzzle_id)
+        for puzzle_id in parent_manifest["memberships"]["test"]
+        if str(puzzle_id) not in exposed_ids and _layout_id(lookup[str(puzzle_id)]) not in exposed_layouts
+    ]
+    groups: Dict[str, List[PuzzleMetadata]] = defaultdict(list)
+    for puzzle_id in candidate_ids:
+        groups[_stratum(lookup[puzzle_id])].append(lookup[puzzle_id])
+    rng = np.random.default_rng(selection_seed)
+    selected: List[PuzzleMetadata] = []
+    selected_layouts: set[str] = set()
+    for stratum in sorted(groups):
+        group = sorted(groups[stratum], key=_puzzle_id)
+        order = rng.permutation(len(group))
+        chosen = 0
+        for index in order:
+            puzzle = group[int(index)]
+            layout_id = _layout_id(puzzle)
+            if layout_id in selected_layouts:
+                continue
+            selected.append(puzzle)
+            selected_layouts.add(layout_id)
+            chosen += 1
+            if chosen >= max_per_stratum:
+                break
+    manifest: Dict[str, Any] = {
+        "schema_version": 1,
+        "parent_split_fingerprint": parent_manifest["fingerprint"],
+        "selection_seed": selection_seed,
+        "max_per_stratum": max_per_stratum,
+        "excluded_puzzle_ids": sorted(exposed_ids),
+        "excluded_layout_ids": sorted(exposed_layouts),
+        "selected_puzzle_ids": [_puzzle_id(puzzle) for puzzle in selected],
+        "selected_layout_ids": [_layout_id(puzzle) for puzzle in selected],
+        "histogram": dict(sorted(Counter(_stratum(puzzle) for puzzle in selected).items())),
+    }
+    manifest["fingerprint"] = _sha256_json(manifest)
+    if output_path.exists():
+        existing = json.loads(output_path.read_text(encoding="utf-8"))
+        if existing != manifest:
+            raise ValueError(f"Existing confirmation manifest differs: {output_path}")
+        return existing
+    _atomic_json(output_path, manifest)
+    return manifest
+
+
 def _lookup_puzzles(bank: PuzzleBank, config: Phase2Config) -> Dict[str, PuzzleMetadata]:
     sampler = BankSampler(bank, split="all")
     return {_puzzle_id(puzzle): puzzle for puzzle in sampler.list_puzzles(config.spec_key)}
@@ -625,7 +709,35 @@ def _joint_table(records: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, An
     }
 
 
-def summarize_records(records: Sequence[Mapping[str, Any]], elapsed_seconds: float) -> Dict[str, Any]:
+def _puzzle_clustered_bootstrap(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    samples: int,
+    seed: int,
+) -> List[float] | None:
+    """Bootstrap puzzles, preserving repeated episodes within each puzzle."""
+    if samples <= 0 or not records:
+        return None
+    by_puzzle: Dict[str, List[float]] = defaultdict(list)
+    for record in records:
+        by_puzzle[str(record["puzzle_id"])].append(float(bool(record["success"])))
+    puzzle_rates = np.asarray([np.mean(values) for values in by_puzzle.values()], dtype=np.float64)
+    if not len(puzzle_rates):
+        return None
+    rng = np.random.default_rng(seed)
+    draws = rng.integers(0, len(puzzle_rates), size=(samples, len(puzzle_rates)))
+    rates = puzzle_rates[draws].mean(axis=1)
+    low, high = np.quantile(rates, [0.025, 0.975])
+    return [float(low), float(high)]
+
+
+def summarize_records(
+    records: Sequence[Mapping[str, Any]],
+    elapsed_seconds: float,
+    *,
+    bootstrap_samples: int = 0,
+    bootstrap_seed: int = 0,
+) -> Dict[str, Any]:
     summary = _aggregate_records(records)
     summary["elapsed_seconds"] = elapsed_seconds
     summary["environment_steps_per_second"] = summary["total_steps"] / elapsed_seconds if elapsed_seconds else 0.0
@@ -638,6 +750,13 @@ def summarize_records(records: Sequence[Mapping[str, Any]], elapsed_seconds: flo
         }
     # Joint difficulty grid — enables across-training (length × robots) heatmaps.
     summary["joint"] = _joint_table(records)
+    clustered = _puzzle_clustered_bootstrap(
+        records,
+        samples=bootstrap_samples,
+        seed=bootstrap_seed,
+    )
+    if clustered is not None:
+        summary["success_rate_puzzle_bootstrap_95"] = clustered
     return summary
 
 
@@ -673,6 +792,7 @@ def evaluate_controller(
     seed: int,
     model: Any = None,
     deterministic: bool = True,
+    bootstrap_samples: int = 0,
 ) -> Dict[str, Any]:
     rng = np.random.default_rng(seed)
     records: List[Dict[str, Any]] = []
@@ -693,25 +813,40 @@ def evaluate_controller(
                     )
                 )
     elapsed = time.perf_counter() - started
-    return {"summary": summarize_records(records, elapsed), "records": records}
+    return {
+        "summary": summarize_records(
+            records,
+            elapsed,
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=seed,
+        ),
+        "records": records,
+    }
 
 
-def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) -> Any:
-    """Construct the PPO model selected by ``config.policy`` on ``vec_env``."""
-    from stable_baselines3 import PPO
+def _policy_construction(config: Phase2Config) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Return SB3 policy arguments and a JSON-safe effective-settings record."""
+    import torch.nn as nn
 
+    activation_by_name = {"relu": nn.ReLU, "tanh": nn.Tanh}
     if config.policy == "stock_cnn":
         policy_name = "CnnPolicy"
         policy_kwargs: Dict[str, Any] = {
             "net_arch": dict(pi=[128, 128], vf=[128, 128]),
             "normalize_images": True,
         }
-    elif config.policy == "grid_resnet":  # residual variant on structured planes
-        import torch.nn as nn
-
+        if config.policy_activation is not None:
+            policy_kwargs["activation_fn"] = activation_by_name[config.policy_activation]
+        if config.ortho_init is not None:
+            policy_kwargs["ortho_init"] = config.ortho_init
+        effective_activation = config.policy_activation or "tanh"
+        effective_ortho_init = True if config.ortho_init is None else config.ortho_init
+    elif config.policy == "grid_resnet":
         from src.models.grid_cnn import GridPlanesResNet
 
         policy_name = "MlpPolicy"
+        effective_activation = config.policy_activation or "relu"
+        effective_ortho_init = False if config.ortho_init is None else config.ortho_init
         policy_kwargs = {
             "features_extractor_class": GridPlanesResNet,
             "features_extractor_kwargs": {
@@ -720,22 +855,16 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
                 "n_blocks": config.n_conv_layers,
             },
             "net_arch": dict(pi=[128, 128], vf=[128, 128]),
-            # SB3's default Tanh heads saturate on the unbounded ReLU features
-            # these extractors emit (62% of units past |2| at init on 16x16),
-            # crushing gradients for both BC and PPO.
-            "activation_fn": nn.ReLU,
-            # Keep the extractor's default PyTorch init: SB3's orthogonal
-            # sqrt(2) init compounds through residual branches and inflates
-            # feature scale, stalling supervised cloning.
-            "ortho_init": False,
+            "activation_fn": activation_by_name[effective_activation],
+            "ortho_init": effective_ortho_init,
             "normalize_images": False,
         }
-    else:  # grid_cnn on structured planes (already float in [0, 1])
-        import torch.nn as nn
-
+    else:
         from src.models.grid_cnn import GridPlanesCnn
 
         policy_name = "MlpPolicy"
+        effective_activation = config.policy_activation or "relu"
+        effective_ortho_init = False if config.ortho_init is None else config.ortho_init
         policy_kwargs = {
             "features_extractor_class": GridPlanesCnn,
             "features_extractor_kwargs": {
@@ -744,11 +873,35 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
                 "n_conv_layers": config.n_conv_layers,
             },
             "net_arch": dict(pi=[128, 128], vf=[128, 128]),
-            "activation_fn": nn.ReLU,
-            "ortho_init": False,
+            "activation_fn": activation_by_name[effective_activation],
+            "ortho_init": effective_ortho_init,
             "normalize_images": False,
         }
-    return PPO(
+
+    def safe_value(value: Any) -> Any:
+        if isinstance(value, type):
+            return f"{value.__module__}.{value.__qualname__}"
+        if isinstance(value, Mapping):
+            return {str(key): safe_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [safe_value(item) for item in value]
+        return value
+
+    effective = {
+        "policy_name": policy_name,
+        "activation": effective_activation,
+        "ortho_init": effective_ortho_init,
+        "policy_kwargs": safe_value(policy_kwargs),
+    }
+    return policy_name, policy_kwargs, effective
+
+
+def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) -> Any:
+    """Construct the PPO model selected by ``config.policy`` on ``vec_env``."""
+    from stable_baselines3 import PPO
+
+    policy_name, policy_kwargs, effective = _policy_construction(config)
+    model = PPO(
         policy_name,
         vec_env,
         device=device,
@@ -766,6 +919,8 @@ def _build_model(vec_env: Any, config: Phase2Config, *, seed: int, device: str) 
         policy_kwargs=policy_kwargs,
         verbose=0,
     )
+    model._phase2_effective_policy = effective
+    return model
 
 
 def _bc_dataset(
@@ -804,6 +959,26 @@ def _bc_dataset(
     return np.stack(observations), np.asarray(actions, dtype=np.int64)
 
 
+def _observation_probe(
+    puzzles: Sequence[PuzzleMetadata],
+    config: Phase2Config,
+    *,
+    seed: int,
+) -> np.ndarray:
+    """Build a small fixed initial-state probe from training membership."""
+    selected = sorted(puzzles, key=_puzzle_id)[: config.health_probe_puzzles]
+    observations: List[np.ndarray] = []
+    for puzzle in selected:
+        layout = create_fixed_layout_from_seed(puzzle)
+        env = RicochetRobotsEnv(**config.environment_spec(seed).to_env_kwargs(fixed_layout=layout))
+        obs, _ = env.reset()
+        observations.append(np.asarray(obs))
+        env.close()
+    if not observations:
+        raise ValueError("Policy-health probe requires at least one training puzzle")
+    return np.stack(observations)
+
+
 def _bc_pretrain(
     model: Any,
     puzzles: Sequence[PuzzleMetadata],
@@ -828,9 +1003,11 @@ def _bc_pretrain(
     action_tensor = torch.as_tensor(actions, device=device)
     # PPO's action head ships with orthogonal gain 0.01, which scales all
     # upstream supervised gradients down ~100x and leaves cross-entropy stuck
-    # on the uniform plateau. Re-initialize it at unit gain for cloning.
-    torch.nn.init.orthogonal_(model.policy.action_net.weight, gain=1.0)
-    torch.nn.init.zeros_(model.policy.action_net.bias)
+    # on the uniform plateau. Structured BC runs explicitly opt into a larger
+    # gain; record the choice rather than hiding it in this helper.
+    if config.bc_reinitialize_action_head:
+        torch.nn.init.orthogonal_(model.policy.action_net.weight, gain=config.bc_action_head_gain)
+        torch.nn.init.zeros_(model.policy.action_net.bias)
     optimizer = torch.optim.Adam(model.policy.parameters(), lr=config.bc_learning_rate)
     generator = torch.Generator().manual_seed(seed)
     history: List[Dict[str, float]] = []
@@ -868,6 +1045,8 @@ def _bc_pretrain(
         "puzzles": len(puzzles),
         "dataset_seconds": build_seconds,
         "epochs": history,
+        "action_head_reinitialized": config.bc_reinitialize_action_head,
+        "action_head_gain": config.bc_action_head_gain,
         "total_seconds": time.perf_counter() - started,
     }
 
@@ -879,15 +1058,73 @@ def _maybe_init_wandb(config: Phase2Config, *, seed: int, output_dir: Path) -> A
     import wandb
 
     run_name = config.wandb_run_name or output_dir.name
-    return wandb.init(
+    run = wandb.init(
         project=config.wandb_project,
         name=f"{run_name}-seed{seed}",
         config=asdict(config),
         dir=str(output_dir),
     )
+    # Keep BC epochs and PPO timesteps as independent chart axes. In
+    # particular, do not let 25 BC log calls make a later PPO step-0 point look
+    # non-monotonic and get silently discarded.
+    run.define_metric("bc/epoch")
+    run.define_metric("bc/*", step_metric="bc/epoch")
+    run.define_metric("train/timesteps")
+    for pattern in ("train/*", "rollout/*", "health/*", "curriculum/*", "eval_*/*", "final/*"):
+        run.define_metric(pattern, step_metric="train/timesteps")
+    return run
 
 
-def _make_wandb_rollout_callback(wandb_run: Any, manager: Any, log_every_rollouts: int = 5) -> Any:
+def _policy_health_payload(model: Any, observations: np.ndarray) -> Dict[str, float]:
+    """Summarize representation and head health on a fixed training probe."""
+    import torch
+
+    def tensor_stats(prefix: str, value: Any) -> Dict[str, float]:
+        tensor = value.detach().float()
+        flattened = tensor.reshape(tensor.shape[0], -1)
+        return {
+            f"health/{prefix}_mean": float(flattened.mean().cpu()),
+            f"health/{prefix}_std": float(flattened.std(unbiased=False).cpu()),
+            f"health/{prefix}_abs_max": float(flattened.abs().max().cpu()),
+            f"health/{prefix}_zero_fraction": float((flattened == 0).float().mean().cpu()),
+            f"health/{prefix}_between_state_variance": float(flattened.var(dim=0, unbiased=False).mean().cpu()),
+        }
+
+    policy = model.policy
+    policy.eval()
+    with torch.no_grad():
+        obs_tensor, _ = policy.obs_to_tensor(observations)
+        features = policy.extract_features(obs_tensor)
+        if isinstance(features, tuple):
+            policy_features, value_features = features
+        else:
+            policy_features = value_features = features
+        latent_pi = policy.mlp_extractor.forward_actor(policy_features)
+        latent_vf = policy.mlp_extractor.forward_critic(value_features)
+        logits = policy.action_net(latent_pi)
+        values = policy.value_net(latent_vf)
+        probabilities = torch.softmax(logits, dim=-1)
+        entropy = -(probabilities * torch.log(probabilities.clamp_min(1e-12))).sum(dim=-1)
+        normalized_entropy = entropy / math.log(probabilities.shape[-1])
+        payload: Dict[str, float] = {}
+        payload.update(tensor_stats("extractor_output", policy_features))
+        payload.update(tensor_stats("policy_latent", latent_pi))
+        payload.update(tensor_stats("value_latent", latent_vf))
+        payload.update(tensor_stats("logit", logits))
+        payload.update(tensor_stats("value", values))
+        payload["health/policy_normalized_entropy"] = float(normalized_entropy.mean().cpu())
+        payload["health/mean_max_action_probability"] = float(probabilities.max(dim=-1).values.mean().cpu())
+    policy.train()
+    return payload
+
+
+def _make_wandb_rollout_callback(
+    wandb_run: Any,
+    manager: Any,
+    *,
+    health_observations: np.ndarray,
+    log_every_rollouts: int = 5,
+) -> Any:
     """Log rollout-level training stats and curriculum state to W&B."""
     import numpy as _np
     from stable_baselines3.common.callbacks import BaseCallback
@@ -900,11 +1137,18 @@ def _make_wandb_rollout_callback(wandb_run: Any, manager: Any, log_every_rollout
         def _on_step(self) -> bool:
             return True
 
-        def _on_rollout_end(self) -> None:
+        def _on_rollout_start(self) -> None:
             self._rollouts += 1
             if self._rollouts % log_every_rollouts != 0:
                 return
             payload: Dict[str, Any] = {"train/timesteps": self.num_timesteps}
+            # PPO populates these values in train(), after the previous
+            # rollout. Logging at the next rollout start labels that one-update
+            # offset honestly instead of attaching stale values to the rollout
+            # that just finished.
+            for key, value in self.model.logger.name_to_value.items():
+                if key.startswith("train/") and isinstance(value, (int, float, np.number)):
+                    payload[key] = float(value)
             buffer = list(self.model.ep_info_buffer or [])
             if buffer:
                 payload["rollout/ep_rew_mean"] = float(_np.mean([e["r"] for e in buffer]))
@@ -913,7 +1157,8 @@ def _make_wandb_rollout_callback(wandb_run: Any, manager: Any, log_every_rollout
                 payload["curriculum/level"] = manager.get_current_level()
                 payload["curriculum/window_success_rate"] = manager.get_success_rate()
                 payload["curriculum/episodes_at_level"] = manager.get_episodes_at_level()
-            wandb_run.log(payload, step=self.num_timesteps)
+            payload.update(_policy_health_payload(self.model, health_observations))
+            wandb_run.log(payload)
 
     return _WandbRolloutCallback()
 
@@ -1118,6 +1363,29 @@ def train_overfit_milestone(
     return result
 
 
+def _curriculum_checkpoint_state(manager: Any) -> Dict[str, Any]:
+    return {
+        "current_level": int(manager.get_current_level()),
+        "episode_count": int(manager.episode_count),
+        "level_start_episode": int(manager.level_start_episode),
+        "episodes_at_level": int(manager.get_episodes_at_level()),
+        "success_rate_window": [bool(value) for value in manager.success_rate_window],
+        "window_success_rate": float(manager.get_success_rate()),
+    }
+
+
+def _select_curve_point(curve: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    """Select by stochastic validation, deterministic validation, then age."""
+    return max(
+        curve,
+        key=lambda point: (
+            float(point["stochastic"]["success_rate"]),
+            float(point["deterministic"]["success_rate"]),
+            -int(point["actual_timesteps"]),
+        ),
+    )
+
+
 def train_seed(
     bank: PuzzleBank,
     training_suite: Sequence[PuzzleMetadata],
@@ -1136,9 +1404,16 @@ def train_seed(
     factory = _training_factory(bank, config, seed)
     vec_env = make_vec_env(factory, n_envs=config.n_envs, seed=seed)
     model = _build_model(vec_env, config, seed=seed, device=device)
+    effective_policy = dict(model._phase2_effective_policy)
+    health_observations = _observation_probe(training_suite, config, seed=seed + 70_000)
     wandb_run = _maybe_init_wandb(config, seed=seed, output_dir=output_dir)
     learn_callback = (
-        _make_wandb_rollout_callback(wandb_run, factory.curriculum_manager)
+        _make_wandb_rollout_callback(
+            wandb_run,
+            factory.curriculum_manager,
+            health_observations=health_observations,
+            log_every_rollouts=config.health_log_every_rollouts,
+        )
         if wandb_run is not None
         else None
     )
@@ -1150,6 +1425,7 @@ def train_seed(
         # the cloned policy on its own, before any PPO fine-tuning.
         bc_stats = _bc_pretrain(model, bc_puzzles, config, seed=seed, device=device, wandb_run=wandb_run)
     curve: List[Dict[str, Any]] = []
+    checkpoint_records: List[Dict[str, Any]] = []
     training_seconds = 0.0
     for checkpoint_index, checkpoint in enumerate(config.checkpoints):
         if checkpoint_index > 0:
@@ -1159,54 +1435,82 @@ def train_seed(
             if device == "mps":
                 torch.mps.synchronize()
             training_seconds += time.perf_counter() - started
+        evaluation_seed_step = 0 if config.fixed_validation_seeds else checkpoint
         training_deterministic_eval = evaluate_controller(
             "model",
             training_suite,
             config.environment_spec(seed + 50_000),
             episodes_per_puzzle=config.validation_episodes_per_puzzle,
-            seed=seed + checkpoint + 11,
+            seed=seed + evaluation_seed_step + 11,
             model=model,
             deterministic=True,
+            bootstrap_samples=config.validation_bootstrap_samples,
         )
         training_stochastic_eval = evaluate_controller(
             "model",
             training_suite,
             config.environment_spec(seed + 60_000),
             episodes_per_puzzle=config.validation_episodes_per_puzzle,
-            seed=seed + checkpoint + 12,
+            seed=seed + evaluation_seed_step + 12,
             model=model,
             deterministic=False,
+            bootstrap_samples=config.validation_bootstrap_samples,
         )
         deterministic_eval = evaluate_controller(
             "model",
             validation_suite,
             config.environment_spec(seed + 100_000),
             episodes_per_puzzle=config.validation_episodes_per_puzzle,
-            seed=seed + checkpoint + 1,
+            seed=seed + evaluation_seed_step + 1,
             model=model,
             deterministic=True,
+            bootstrap_samples=config.validation_bootstrap_samples,
         )
         stochastic_eval = evaluate_controller(
             "model",
             validation_suite,
             config.environment_spec(seed + 200_000),
             episodes_per_puzzle=config.validation_episodes_per_puzzle,
-            seed=seed + checkpoint + 2,
+            seed=seed + evaluation_seed_step + 2,
             model=model,
             deterministic=False,
+            bootstrap_samples=config.validation_bootstrap_samples,
         )
-        curve.append(
-            {
-                "requested_checkpoint": checkpoint,
-                "actual_timesteps": int(model.num_timesteps),
-                "training": {
-                    "deterministic": training_deterministic_eval["summary"],
-                    "stochastic": training_stochastic_eval["summary"],
+        point = {
+            "requested_checkpoint": checkpoint,
+            "actual_timesteps": int(model.num_timesteps),
+            "training": {
+                "deterministic": training_deterministic_eval["summary"],
+                "stochastic": training_stochastic_eval["summary"],
+            },
+            "deterministic": deterministic_eval["summary"],
+            "stochastic": stochastic_eval["summary"],
+            "health": _policy_health_payload(model, health_observations),
+        }
+        curve.append(point)
+        checkpoint_record: Dict[str, Any] = {
+            "requested_checkpoint": int(checkpoint),
+            "actual_timesteps": int(model.num_timesteps),
+            "model": None,
+        }
+        if config.save_checkpoint_weights:
+            checkpoint_dir = output_dir / f"seed_{seed}" / "checkpoints" / f"step_{int(model.num_timesteps)}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_model = checkpoint_dir / "model"
+            model.save(checkpoint_model)
+            checkpoint_record["model"] = str(checkpoint_model.with_suffix(".zip"))
+            _atomic_json(checkpoint_dir / "evaluation.json", point)
+            _atomic_json(checkpoint_dir / "curriculum.json", _curriculum_checkpoint_state(factory.curriculum_manager))
+            _atomic_json(
+                checkpoint_dir / "provenance.json",
+                {
+                    "seed": seed,
+                    "effective_policy": effective_policy,
+                    "config": asdict(config),
+                    "runtime": _runtime_provenance(device),
                 },
-                "deterministic": deterministic_eval["summary"],
-                "stochastic": stochastic_eval["summary"],
-            }
-        )
+            )
+        checkpoint_records.append(checkpoint_record)
         by_length = {
             length: f"{summary['success_rate']:.0%}"
             for length, summary in stochastic_eval["summary"]["by_optimal_length"].items()
@@ -1222,35 +1526,57 @@ def train_seed(
         if wandb_run is not None:
             wandb_run.log(
                 {
+                    "train/timesteps": int(model.num_timesteps),
                     **_wandb_eval_payload("eval_train_det", training_deterministic_eval["summary"]),
                     **_wandb_eval_payload("eval_train_stoch", training_stochastic_eval["summary"]),
                     **_wandb_eval_payload("eval_val_det", deterministic_eval["summary"]),
                     **_wandb_eval_payload("eval_val_stoch", stochastic_eval["summary"]),
-                },
-                step=int(model.num_timesteps),
+                    **point["health"],
+                }
             )
-
-    deterministic_test = evaluate_controller(
-        "model",
-        test_suite,
-        config.environment_spec(seed + 300_000),
-        episodes_per_puzzle=1,
-        seed=seed + 3,
-        model=model,
-        deterministic=True,
-    )
-    stochastic_test = evaluate_controller(
-        "model",
-        test_suite,
-        config.environment_spec(seed + 400_000),
-        episodes_per_puzzle=config.final_stochastic_episodes_per_puzzle,
-        seed=seed + 4,
-        model=model,
-        deterministic=False,
-    )
     checkpoint_path = output_dir / f"seed_{seed}" / "model"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     model.save(checkpoint_path)
+    selected_point = _select_curve_point(curve) if config.select_checkpoint_by_validation else curve[-1]
+    selected_timesteps = int(selected_point["actual_timesteps"])
+    selected_record = next(
+        record for record in checkpoint_records if int(record["actual_timesteps"]) == selected_timesteps
+    )
+    selected_model = model
+    if config.select_checkpoint_by_validation and selected_timesteps != int(model.num_timesteps):
+        if not selected_record["model"]:
+            raise RuntimeError("Selected checkpoint has no saved model")
+        selected_model = type(model).load(selected_record["model"], device=device)
+
+    def test_model(candidate: Any, *, seed_offset: int) -> Dict[str, Any]:
+        return {
+            "deterministic": evaluate_controller(
+                "model",
+                test_suite,
+                config.environment_spec(seed + 300_000 + seed_offset),
+                episodes_per_puzzle=1,
+                seed=seed + 3 + seed_offset,
+                model=candidate,
+                deterministic=True,
+                bootstrap_samples=config.validation_bootstrap_samples,
+            ),
+            "stochastic": evaluate_controller(
+                "model",
+                test_suite,
+                config.environment_spec(seed + 400_000 + seed_offset),
+                episodes_per_puzzle=config.final_stochastic_episodes_per_puzzle,
+                seed=seed + 4 + seed_offset,
+                model=candidate,
+                deterministic=False,
+                bootstrap_samples=config.validation_bootstrap_samples,
+            ),
+        }
+
+    test_final: Dict[str, Any] | None = None
+    test_selected: Dict[str, Any] | None = None
+    if config.run_final_test:
+        test_final = test_model(model, seed_offset=0)
+        test_selected = test_final if selected_model is model else test_model(selected_model, seed_offset=10_000)
     result = {
         "seed": seed,
         "device": device,
@@ -1258,12 +1584,17 @@ def train_seed(
         "training_seconds": training_seconds,
         "training_steps_per_second": int(model.num_timesteps) / training_seconds if training_seconds else 0.0,
         "policy": {
+            "algorithm_class": type(model).__name__,
             "class": type(model.policy).__name__,
             "parameter_count": sum(parameter.numel() for parameter in model.policy.parameters()),
             "observation_space": str(model.observation_space),
             "action_space": str(model.action_space),
+            "effective_construction": effective_policy,
         },
         "curve": curve,
+        "checkpoints": checkpoint_records,
+        "selected_checkpoint_timesteps": selected_timesteps,
+        "selected_checkpoint": selected_record["model"],
         "bc_pretrain": bc_stats,
         "curriculum": {
             "staged": config.curriculum_stage_max_lengths is not None,
@@ -1272,22 +1603,26 @@ def train_seed(
             "episodes_at_final_level": factory.curriculum_manager.get_episodes_at_level(),
             "window_success_rate": factory.curriculum_manager.get_success_rate(),
         },
-        "test": {
-            "deterministic": deterministic_test,
-            "stochastic": stochastic_test,
-        },
+        "test_status": "run" if config.run_final_test else "sealed_not_run",
+        "test": test_selected,
+        "test_selected": test_selected,
+        "test_final": test_final,
         "checkpoint": str(checkpoint_path.with_suffix(".zip")),
     }
     if wandb_run is not None:
-        wandb_run.log(
-            {
-                **_wandb_eval_payload("test_det", deterministic_test["summary"]),
-                **_wandb_eval_payload("test_stoch", stochastic_test["summary"]),
+        final_payload = {
+                "train/timesteps": int(model.num_timesteps),
                 "final/training_steps_per_second": result["training_steps_per_second"],
                 "final/curriculum_level": result["curriculum"]["final_level"],
-            },
-            step=int(model.num_timesteps),
-        )
+                "final/selected_checkpoint_timesteps": selected_timesteps,
+            }
+        if test_selected is not None:
+            final_payload.update(_wandb_eval_payload("test_selected_det", test_selected["deterministic"]["summary"]))
+            final_payload.update(_wandb_eval_payload("test_selected_stoch", test_selected["stochastic"]["summary"]))
+        if test_final is not None:
+            final_payload.update(_wandb_eval_payload("test_final_det", test_final["deterministic"]["summary"]))
+            final_payload.update(_wandb_eval_payload("test_final_stoch", test_final["stochastic"]["summary"]))
+        wandb_run.log(final_payload)
         wandb_run.finish()
     _atomic_json(output_dir / f"seed_{seed}" / "result.json", result)
     vec_env.close()
@@ -1295,9 +1630,10 @@ def train_seed(
 
 
 def _seed_aggregate(results: Sequence[Mapping[str, Any]], mode: str) -> Dict[str, Any]:
-    rates = [float(result["test"][mode]["summary"]["success_rate"]) for result in results]
-    successes = sum(int(result["test"][mode]["summary"]["successes"]) for result in results)
-    episodes = sum(int(result["test"][mode]["summary"]["episodes"]) for result in results)
+    tested = [result for result in results if result.get("test_selected") is not None]
+    rates = [float(result["test_selected"][mode]["summary"]["success_rate"]) for result in tested]
+    successes = sum(int(result["test_selected"][mode]["summary"]["successes"]) for result in tested)
+    episodes = sum(int(result["test_selected"][mode]["summary"]["episodes"]) for result in tested)
     mean = float(np.mean(rates)) if rates else 0.0
     std = float(np.std(rates, ddof=1)) if len(rates) > 1 else 0.0
     return {
@@ -1326,7 +1662,15 @@ def _runtime_provenance(device: str) -> Dict[str, Any]:
     import torch
 
     packages = {}
-    for package in ("numpy", "gymnasium", "torch", "stable-baselines3", "pandas", "pyarrow"):
+    for package in (
+        "numpy",
+        "gymnasium",
+        "torch",
+        "stable-baselines3",
+        "sb3-contrib",
+        "pandas",
+        "pyarrow",
+    ):
         try:
             packages[package] = importlib_metadata.version(package)
         except importlib_metadata.PackageNotFoundError:
@@ -1379,6 +1723,7 @@ def render_markdown_report(result: Mapping[str, Any]) -> str:
             f"{overfit['actual_timesteps']} timesteps. Acceptance (≥80% stochastic): "
             f"**{'passed' if overfit['passed'] else 'failed'}**.",
         ]
+    tested = all(seed_result.get("test_selected") is not None for seed_result in result["seeds"])
     lines.extend([
         "",
         "## Tiny-set overfit milestone",
@@ -1387,32 +1732,53 @@ def render_markdown_report(result: Mapping[str, Any]) -> str:
         "",
         "## Multi-seed PPO result",
         "",
-        "| Seed | Timesteps | Train steps/s | Deterministic test | Stochastic test |",
-        "|---:|---:|---:|---:|---:|",
+        (
+            "| Seed | Timesteps | Selected checkpoint | Train steps/s | Deterministic test | Stochastic test |"
+            if tested
+            else "| Seed | Timesteps | Selected checkpoint | Train steps/s | Selected val det | Selected val stoch |"
+        ),
+        "|---:|---:|---:|---:|---:|---:|",
     ])
     for seed_result in result["seeds"]:
+        selected = next(
+            point for point in seed_result["curve"]
+            if int(point["actual_timesteps"]) == int(seed_result["selected_checkpoint_timesteps"])
+        )
+        deterministic_rate = (
+            seed_result["test_selected"]["deterministic"]["summary"]["success_rate"]
+            if tested else selected["deterministic"]["success_rate"]
+        )
+        stochastic_rate = (
+            seed_result["test_selected"]["stochastic"]["summary"]["success_rate"]
+            if tested else selected["stochastic"]["success_rate"]
+        )
         lines.append(
             f"| {seed_result['seed']} | {seed_result['actual_timesteps']} | "
+            f"{seed_result['selected_checkpoint_timesteps']} | "
             f"{seed_result['training_steps_per_second']:.0f} | "
-            f"{seed_result['test']['deterministic']['summary']['success_rate']:.1%} | "
-            f"{seed_result['test']['stochastic']['summary']['success_rate']:.1%} |"
+            f"{deterministic_rate:.1%} | {stochastic_rate:.1%} |"
         )
-    deterministic = result["aggregate"]["deterministic"]
-    stochastic = result["aggregate"]["stochastic"]
-    deterministic_interval = deterministic["pooled_success_rate_wilson_95"]
-    stochastic_interval = stochastic["pooled_success_rate_wilson_95"]
-    heldout = result["heldout_milestone"]
+    if tested:
+        deterministic = result["aggregate"]["deterministic"]
+        stochastic = result["aggregate"]["stochastic"]
+        deterministic_interval = deterministic["pooled_success_rate_wilson_95"]
+        stochastic_interval = stochastic["pooled_success_rate_wilson_95"]
+        heldout = result["heldout_milestone"]
+        lines.extend([
+            "",
+            f"Deterministic mean across seeds: **{deterministic['mean']:.1%}** "
+            f"(sample SD {deterministic['sample_std']:.1%}; episode-pooled 95% Wilson interval "
+            f"{deterministic_interval[0]:.1%}–{deterministic_interval[1]:.1%}).",
+            f"Stochastic mean across seeds: **{stochastic['mean']:.1%}** "
+            f"(sample SD {stochastic['sample_std']:.1%}; episode-pooled 95% Wilson interval "
+            f"{stochastic_interval[0]:.1%}–{stochastic_interval[1]:.1%}).",
+            f"Held-out acceptance ({heldout['acceptance_rule']}): "
+            f"**{'passed' if heldout['passed'] else 'failed'}** "
+            f"({heldout['observed']:.1%} observed versus {heldout['acceptance_threshold']:.1%} required).",
+        ])
+    else:
+        lines.extend(["", "Final test remained sealed for this validation-only run."])
     lines.extend([
-        "",
-        f"Deterministic mean across seeds: **{deterministic['mean']:.1%}** "
-        f"(sample SD {deterministic['sample_std']:.1%}; episode-pooled 95% Wilson interval "
-        f"{deterministic_interval[0]:.1%}–{deterministic_interval[1]:.1%}).",
-        f"Stochastic mean across seeds: **{stochastic['mean']:.1%}** "
-        f"(sample SD {stochastic['sample_std']:.1%}; episode-pooled 95% Wilson interval "
-        f"{stochastic_interval[0]:.1%}–{stochastic_interval[1]:.1%}).",
-        f"Held-out acceptance ({heldout['acceptance_rule']}): "
-        f"**{'passed' if heldout['passed'] else 'failed'}** "
-        f"({heldout['observed']:.1%} observed versus {heldout['acceptance_threshold']:.1%} required).",
         "",
         "## Validation curves",
         "",
@@ -1533,6 +1899,7 @@ def run_phase2_benchmark(
         "stochastic": _seed_aggregate(seed_results, "stochastic"),
     }
     heldout_threshold = baselines["target_robot_only"]["summary"]["success_rate"]
+    tests_ran = all(seed_result.get("test_selected") is not None for seed_result in seed_results)
     result = {
         "schema_version": 1,
         "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1548,8 +1915,8 @@ def run_phase2_benchmark(
             "metric": "mean stochastic test success across training seeds",
             "acceptance_rule": "at least the target-robot-only baseline success rate",
             "acceptance_threshold": heldout_threshold,
-            "observed": aggregate["stochastic"]["mean"],
-            "passed": aggregate["stochastic"]["mean"] >= heldout_threshold,
+            "observed": aggregate["stochastic"]["mean"] if tests_ran else None,
+            "passed": aggregate["stochastic"]["mean"] >= heldout_threshold if tests_ran else None,
         },
     }
     _atomic_json(output_dir / "results.json", result)

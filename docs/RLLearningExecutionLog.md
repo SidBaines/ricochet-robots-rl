@@ -6,19 +6,22 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 13:29 EDT
+- Updated: 2026-07-17 14:05 EDT
 - Branch: `sid-learnable-agent`
-- Phase: documentation foundation
-- Latest completed commit: `a863b53 feat: 2-D difficulty heatmaps + persist per-checkpoint joint table`
+- Phase: observability/evaluation foundation complete; masking next
+- Latest completed commit: `2f1cb44 docs: synthesize RL remediation execution plan`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
-- Last test gate: 88 passed, 9 intentionally skipped, 1 warning in 6.51s
+- Last test gate: 92 passed, 9 intentionally skipped, 1 warning in 6.74s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
-- Current action: commit the plan/log foundation, then implement observability
-  and evaluation controls
+- Sealed confirmation: 375 unique puzzles/layouts, fingerprint
+  `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
+  no learning model has been evaluated on it
+- Current action: commit observability/evaluation, then implement movement
+  masks and MaskablePPO
 - Exact next command after handoff: `.venv-phase2/bin/python -m pytest src/tests/ -q`
 
 ## Locked decisions
@@ -69,3 +72,21 @@ state changes. Append chronological entries; never rewrite historical entries.
   mastery gate. Reverse thresholds will be derived from persisted baselines.
 - Decision: full reverse training is deferred because the existing BC dataset
   already includes every on-plan state used by reverse resets.
+
+### 2026-07-17 14:05 EDT — observability and evaluation foundation complete
+
+- Made requested/effective policy activation, orthogonal initialization, and
+  BC action-head initialization explicit and persisted.
+- Added step-0/intermediate checkpoint model, evaluation, curriculum, config,
+  and runtime provenance artifacts plus validation-based checkpoint selection.
+- Added validation-only runs (`test_status=sealed_not_run`), fixed validation
+  RNG support, and puzzle-clustered bootstrap intervals.
+- Separated BC epoch and PPO timestep axes in W&B. PPO optimizer metrics are
+  forwarded with their one-update offset documented; fixed training probes log
+  extractor, latent, logit, value, entropy, and confidence health.
+- Created the sealed confirmation manifest from unused Phase 4 test membership:
+  375 unique puzzle/layout pairs, fingerprint
+  `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`.
+  Verified zero puzzle-ID and layout-hash overlap with train, validation, and
+  the exposed development-test suite. No model was evaluated.
+- Test gate: 92 passed, 9 legacy recurrent tests skipped.
