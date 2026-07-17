@@ -307,3 +307,15 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   formal RL-only/BC-only/BC→RL comparison remain explicitly deferred; details,
   commands, fingerprints, and the full deferred register are in
   `docs/RLLearningExecutionLog.md`.
+
+### 16×16 reverse dry run complete (2026-07-17 14:58 EDT)
+
+- The immutable Phase 4 fixture/split and baselines reproduced exactly. The
+  200,704-step run sustained 662 training steps/s and emitted both planned
+  checkpoints without touching the final test.
+- Its d1 frontier reached 72.0%, below the calibrated 79.5% gate, so it stayed
+  at level 0 with no forced transition. Masking held no-movement at zero;
+  disabling masks counterfactually produced 80.7% stochastic no-movement at
+  the endpoint and only 0.8% success.
+- Reverse machinery is validated and full RL-only training remains deferred.
+  Work now returns to the performance-first canonical BC→PPO screens.

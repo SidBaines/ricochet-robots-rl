@@ -6,10 +6,10 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 14:44 EDT
+- Updated: 2026-07-17 14:58 EDT
 - Branch: `sid-learnable-agent`
-- Phase: reverse-curriculum smoke passed; preparing bounded 16×16 dry run
-- Latest completed commit: `661cadf fix: use supported wandb metric globs`
+- Phase: reverse-curriculum validation complete; preparing canonical BC init
+- Latest completed commit: `f15c010 test: validate reverse curriculum smoke`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
@@ -21,9 +21,10 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: commit the smoke result and validation-only CLI reporting
-  fix, then launch the bounded 16×16 reverse dry run
-- Exact next command: `.venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_reverse_dryrun_16x16.yaml --bank-dir artifacts/phase4_bank --output-dir artifacts/phase2_experiments/phase5_reverse_dryrun_16x16`
+- Current action: record the 16×16 dry-run result, then define and validate the
+  canonical seed-11 BC initialization and matched PPO screen configs
+- Exact next command: create the canonical BC-only initialization config and
+  verify its output/checkpoint contract without touching the sealed test
 
 ## Locked decisions
 
@@ -167,3 +168,27 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Next bounded check: run the 16×16 no-BC dry run for reset correctness,
   throughput, and early curriculum behavior. It is not a model-quality result
   and does not authorize the deferred full RL-only run.
+
+### 2026-07-17 14:58 EDT — 16×16 reverse dry run completed
+
+- Output: `artifacts/phase2_experiments/phase5_reverse_dryrun_16x16`; immutable
+  Phase 4 split fingerprint exactly `c0e97329b109…`. The 55,143-puzzle bank and
+  4.4% random / 8.5% target-only baselines reproduced unchanged.
+- The 200,704-step run completed in 303.4 training seconds at 662 steps/s,
+  close to historical 16×16 throughput. Checkpoint model/evaluation artifacts
+  exist at step 0 and step 200,704; the final test remained sealed.
+- The calibrated d1 frontier ended at 72.0% versus its 79.5% mastery threshold,
+  so the manager correctly remained at level 0 with **no mastery or forced
+  transition**. This bounded run was not expected to train a useful RL-only
+  model, and the threshold was not relaxed after seeing the result.
+- Masked validation was 1.7% deterministic / 6.1% stochastic at step 0 and
+  5.8% / 5.8% at step 200,704. Selection correctly retained step 0 by the
+  primary stochastic metric. At the endpoint, the explicitly labelled
+  unmasked counterfactual fell to 0.8%/0.8% with 95.1% deterministic and 80.7%
+  stochastic no-movement actions, while the masked policy had zero
+  no-movement actions. This is direct real-board evidence that movement masking
+  is necessary, not merely a synthetic correctness result.
+- Acceptance decision: reverse infrastructure is ready for the deferred
+  RL-only program. Do not launch `phase5_reverse_16x16_deferred.yaml` in this
+  session. Proceed to the performance-first canonical BC initialization and
+  matched masked BC→PPO screens.
