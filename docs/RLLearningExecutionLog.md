@@ -12,8 +12,8 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: recipe A completed; launching `phase5_screen_b_rung1` to
-  the same predeclared 512k boundary
+- Active experiment: `phase5_screen_b_rung1`, PID 59686, training from the
+  reproduced step-0 boundary toward the same predeclared 512k boundary
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
