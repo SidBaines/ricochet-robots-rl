@@ -1,4 +1,5 @@
 import json
+import sys
 from dataclasses import replace
 
 import numpy as np
@@ -8,6 +9,7 @@ from src.benchmarking.phase2 import (
     Phase2Config,
     _build_model,
     _make_cumulative_schedule_callback,
+    _maybe_init_wandb,
     _make_wandb_rollout_callback,
     _puzzle_clustered_bootstrap,
     build_confirmation_manifest,
@@ -108,6 +110,29 @@ def test_wandb_callback_forwards_train_and_health_metrics() -> None:
     assert any("train/explained_variance" in payload for payload in run.payloads)
     assert any("health/logit_between_state_variance" in payload for payload in run.payloads)
     vec_env.close()
+
+
+def test_wandb_metric_patterns_use_supported_suffix_globs(monkeypatch, tmp_path) -> None:
+    class FakeRun:
+        def __init__(self) -> None:
+            self.patterns = []
+
+        def define_metric(self, name, **kwargs) -> None:
+            if "*" in name and not name.endswith("/*"):
+                raise AssertionError(f"unsupported non-suffix glob: {name}")
+            self.patterns.append((name, kwargs))
+
+    run = FakeRun()
+
+    class FakeWandb:
+        @staticmethod
+        def init(**kwargs):
+            return run
+
+    monkeypatch.setitem(sys.modules, "wandb", FakeWandb)
+    config = replace(_tiny_config(), wandb_project="test-project")
+    assert _maybe_init_wandb(config, seed=3, output_dir=tmp_path) is run
+    assert ("eval_val_stoch/*", {"step_metric": "train/timesteps"}) in run.patterns
 
 
 def test_cumulative_optimizer_schedule_reaches_declared_endpoints() -> None:

@@ -1320,7 +1320,22 @@ def _maybe_init_wandb(config: Phase2Config, *, seed: int, output_dir: Path) -> A
     run.define_metric("bc/epoch")
     run.define_metric("bc/*", step_metric="bc/epoch")
     run.define_metric("train/timesteps")
-    for pattern in ("train/*", "rollout/*", "health/*", "curriculum/*", "eval_*/*", "final/*"):
+    metric_prefixes = (
+        "train/*",
+        "rollout/*",
+        "health/*",
+        "curriculum/*",
+        "eval_train_det/*",
+        "eval_train_stoch/*",
+        "eval_val_det/*",
+        "eval_val_stoch/*",
+        "test_selected_det/*",
+        "test_selected_stoch/*",
+        "test_final_det/*",
+        "test_final_stoch/*",
+        "final/*",
+    )
+    for pattern in metric_prefixes:
         run.define_metric(pattern, step_metric="train/timesteps")
     return run
 

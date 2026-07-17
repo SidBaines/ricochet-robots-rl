@@ -6,23 +6,23 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 15:15 EDT
+- Updated: 2026-07-17 15:30 EDT
 - Branch: `sid-learnable-agent`
 - Phase: reverse-curriculum implementation complete; smoke pending
-- Latest completed commit: `6373fa2 feat: add masked PPO and stable BC transfer controls`
+- Latest completed commit: `915b87e feat: add calibrated reverse curriculum infrastructure`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
-- Last test gate: 103 passed, 9 intentionally skipped, 1 warning in 13.73s
+- Last test gate: 104 passed, 9 intentionally skipped, 1 warning in 11.50s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: commit reverse infrastructure, then run the 8×8 smoke in the
-  foreground
-- Exact next command: `.venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_reverse_smoke_8x8.yaml --bank-dir artifacts/phase2b_bank --output-dir artifacts/phase2_experiments/phase5_reverse_smoke_8x8`
+- Current action: commit the W&B compatibility fix, then rerun the 8×8 smoke
+  in a fresh output directory
+- Exact next command: `.venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_reverse_smoke_8x8.yaml --bank-dir artifacts/phase2b_bank --output-dir artifacts/phase2_experiments/phase5_reverse_smoke_8x8_retry1`
 - Exact next command after handoff: `.venv-phase2/bin/python -m pytest src/tests/ -q`
 
 ## Locked decisions
@@ -132,3 +132,13 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Re-derived the immutable Phase 4 contracts after the changes: fixture
   `3579113b230a…`, split `c0e97329b109…`, unchanged.
 - Test gate: 103 passed, 9 legacy recurrent tests skipped.
+
+### 2026-07-17 15:30 EDT — smoke attempt 1 stopped before training
+
+- Command used output `artifacts/phase2_experiments/phase5_reverse_smoke_8x8`.
+- W&B run `o5tjfizz` failed during initialization before step 0 because W&B
+  0.28.0 rejects `eval_*/*`; it supports suffix globs only.
+- Replaced the generic glob with concrete evaluation-prefix suffix globs and
+  added a fake-W&B regression test enforcing the installed API contract.
+- No training steps ran, no checkpoint was produced, and no bank data changed.
+- Full gate after the fix: 104 passed, 9 legacy recurrent tests skipped.
