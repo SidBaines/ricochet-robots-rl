@@ -69,6 +69,7 @@ class Phase2Config:
     ortho_init: bool | None = None
     bc_reinitialize_action_head: bool = True
     bc_action_head_gain: float = 1.0
+    bc_apply_action_masks: bool = False
     two_robot_band_weight: float | None = None
     run_overfit_milestone: bool = True
     curriculum_stage_max_lengths: tuple[int, ...] | None = None
@@ -154,6 +155,8 @@ class Phase2Config:
             raise ValueError("policy_activation must be one of: relu, tanh")
         if self.bc_action_head_gain <= 0:
             raise ValueError("bc_action_head_gain must be positive")
+        if self.bc_apply_action_masks and not self.use_action_masking:
+            raise ValueError("bc_apply_action_masks requires use_action_masking")
         if self.validation_bootstrap_samples < 0:
             raise ValueError("validation_bootstrap_samples must be non-negative")
         if self.select_checkpoint_by_validation and not self.save_checkpoint_weights:
@@ -1199,7 +1202,7 @@ def _bc_pretrain(
 
     def distribution_for(batch_obs: Any, batch_masks: Any = None) -> Any:
         distribution = model.policy.get_distribution(batch_obs)
-        if batch_masks is not None:
+        if config.bc_apply_action_masks and batch_masks is not None:
             distribution.apply_masking(batch_masks)
         return distribution
 
@@ -1297,6 +1300,7 @@ def _bc_pretrain(
         "best_validation_accuracy": best_validation_accuracy if best_epoch is not None else None,
         "action_head_reinitialized": config.bc_reinitialize_action_head,
         "action_head_gain": config.bc_action_head_gain,
+        "loss_action_masking": config.bc_apply_action_masks,
         "total_seconds": time.perf_counter() - started,
     }
 

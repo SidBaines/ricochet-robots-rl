@@ -15,13 +15,14 @@ def _load_config(name: str) -> Phase2Config:
 
 
 def test_canonical_bc_config_is_validation_only_and_saves_step_zero() -> None:
-    config = _load_config("phase5_canonical_bc_seed11.yaml")
+    config = _load_config("phase5_canonical_bc_seed11_retry1.yaml")
 
     assert config.training_seeds == (11,)
     assert config.checkpoints == (0,)
     assert config.bc_pretrain_epochs == 25
     assert config.bc_select_best_by_validation
     assert config.use_action_masking
+    assert not config.bc_apply_action_masks
     assert config.save_checkpoint_weights
     assert config.select_checkpoint_by_validation
     assert not config.run_final_test

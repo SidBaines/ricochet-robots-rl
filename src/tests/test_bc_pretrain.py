@@ -82,7 +82,8 @@ def test_bc_requires_plane_observations() -> None:
         Phase2Config(bc_pretrain_epochs=1, obs_mode="rgb_cell_image", policy="stock_cnn")
 
 
-def test_masked_bc_tracks_validation_and_restores_best_epoch() -> None:
+@pytest.mark.parametrize("bc_apply_action_masks", [False, True])
+def test_masked_bc_tracks_validation_and_restores_best_epoch(bc_apply_action_masks) -> None:
     from stable_baselines3.common.env_util import make_vec_env
 
     from src.env.ricochet_env import RicochetRobotsEnv
@@ -91,6 +92,7 @@ def test_masked_bc_tracks_validation_and_restores_best_epoch() -> None:
         bc_pretrain_epochs=5,
         bc_select_best_by_validation=True,
         use_action_masking=True,
+        bc_apply_action_masks=bc_apply_action_masks,
     )
     puzzles = _labelled_puzzles(config, count=10)
     train, validation = puzzles[:6], puzzles[6:]
@@ -108,4 +110,10 @@ def test_masked_bc_tracks_validation_and_restores_best_epoch() -> None:
     assert stats["selected_epoch"] in range(1, 6)
     assert stats["validation_pairs"] == sum(p.optimal_length for p in validation)
     assert all("validation_loss" in epoch for epoch in stats["epochs"])
+    assert stats["loss_action_masking"] is bc_apply_action_masks
     vec_env.close()
+
+
+def test_bc_action_mask_loss_requires_maskable_policy() -> None:
+    with pytest.raises(ValueError, match="bc_apply_action_masks requires"):
+        _small_config(bc_apply_action_masks=True)

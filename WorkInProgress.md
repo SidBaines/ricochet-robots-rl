@@ -330,3 +330,17 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   saves the exact post-BC step-0 model, evaluates validation with five fixed
   repetitions, and does not touch the final test. Both PPO screens will load
   this same checkpoint; they must not start until its artifacts are audited.
+
+### Canonical BC attempt 1 stopped and diagnosed (2026-07-17 15:33 EDT)
+
+- W&B `bfh8kzng` was stopped after three epochs stayed at masked chance
+  (train/validation losses ≈2.520; accuracies ≈8–9%). It produced no checkpoint
+  and did not evaluate rollouts or the final test.
+- Gradient and algorithm-class audits were healthy. An exact full-data audit
+  changing only the supervised mask reproduced historical unmasked epoch 1
+  exactly (loss 2.522, accuracy 15.0%), proving the BC-loss mask caused the
+  stall. Invalid expert actions are still checked, and PPO rollout/evaluation
+  stays masked; only BC cross-entropy now retains all 16 logits.
+- Retry config `configs/phase5_canonical_bc_seed11_retry1.yaml` has a unique
+  output/W&B identity, and both screen configs point to its future step-0 model.
+  Gate: 110 passed, 9 skipped. Full evidence is in the execution log.

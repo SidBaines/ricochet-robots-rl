@@ -6,25 +6,24 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 15:07 EDT
+- Updated: 2026-07-17 15:33 EDT
 - Branch: `sid-learnable-agent`
-- Phase: canonical seed-11 BC run active
+- Phase: canonical BC supervised-mask stall diagnosed and fixed; retry pending
 - Latest completed commit: `b82f899 exp: define matched BC to PPO screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: `phase5_canonical_bc_seed11`, detached screen session
-  `phase5_bc` (screen PID 28369; launch-time Python PID 28372)
-- Last test gate: 108 passed, 9 intentionally skipped, 1 benign small-rollout
-  batch-size warning in 20.97s
+- Active experiment: none
+- Last test gate: 110 passed, 9 intentionally skipped, 1 benign small-rollout
+  batch-size warning in 13.14s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: monitor canonical BC validation loss/accuracy and verify the
-  selected epoch plus post-BC masked rollout before starting either PPO screen
-- Exact monitor commands: `screen -ls` and `tail -n 50 artifacts/phase2_experiments/phase5_canonical_bc_seed11.log`
+- Current action: commit the independent BC-loss masking control and launch the
+  canonical retry in a fresh output directory
+- Exact next command: `screen -dmS phase5_bc_retry1 zsh -lc 'exec caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_canonical_bc_seed11_retry1.yaml --bank-dir artifacts/phase4_bank --output-dir artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1 >> artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1.log 2>&1'`
 
 ## Locked decisions
 
@@ -229,3 +228,31 @@ state changes. Append chronological entries; never rewrite historical entries.
 - This run performs 25 BC epochs, restores the minimum held-out BC-loss epoch,
   evaluates/saves step 0, and keeps the final test sealed. Do not start either
   PPO screen until the checkpoint and BC result metadata have been audited.
+
+### 2026-07-17 15:33 EDT — canonical attempt stopped; supervised mask stall fixed
+
+- Attempt output/log/W&B were preserved at
+  `phase5_canonical_bc_seed11` / W&B `bfh8kzng`. The run was interrupted during
+  epoch 4 after three completed epochs stayed at masked chance:
+  - epoch 1: train 2.534/9.0%, validation 2.519/8.4%;
+  - epoch 2: train 2.520/8.4%, validation 2.519/8.8%;
+  - epoch 3: train 2.520/8.7%, validation 2.519/8.5%.
+  It produced no model checkpoint and never reached rollout or final-test
+  evaluation.
+- A same-batch real-residual audit showed nonzero action-head/extractor
+  gradients in both modes, ruling out a disconnected MaskablePPO graph.
+  Standard PPO and MaskablePPO also behaved identically on matched subsets,
+  ruling out the algorithm-class swap.
+- The decisive full 210,947-pair, same-seed, same-model, same-optimizer audit
+  changed only the supervised loss mask. One **unmasked** epoch reproduced the
+  historical Phase 4b number exactly: loss 2.522, accuracy 15.0%, in 296.7s.
+  The first masked epoch was 2.534/9.0% and then plateaued. Conclusion: masking
+  the BC softmax removes useful invalid-action contrast and traps this large
+  model near its masked action prior; rollout masking itself is not implicated.
+- Added independent `bc_apply_action_masks` provenance/control, default false.
+  When rollout masking is enabled, BC dataset construction still calculates
+  masks and rejects any invalid stored expert action. The canonical loss uses
+  all 16 logits, while MaskablePPO collection and every headline rollout remain
+  masked. The optional masked BC-loss path remains tested.
+- Added unique retry config/output/W&B identity and repointed both screens to
+  its exact future step-0 checkpoint. Full gate: 110 passed, 9 skipped.

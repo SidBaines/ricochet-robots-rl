@@ -27,6 +27,9 @@ policy_activation: relu
 ortho_init: false
 bc_reinitialize_action_head: true
 bc_action_head_gain: 1.0
+# Keep all 16 logits in the supervised objective. Expert actions are still
+# checked against movement masks; rollout collection/evaluation remains masked.
+bc_apply_action_masks: false
 two_robot_band_weight: 1.0
 run_overfit_milestone: false
 curriculum_stage_max_lengths: [2, 4, 6, 8]
