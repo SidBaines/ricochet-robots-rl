@@ -6,14 +6,14 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 19:14 EDT
+- Updated: 2026-07-17 19:55 EDT
 - Branch: `sid-learnable-agent`
 - Phase: acceleration steps 2–8 complete; canonical 512k A/B rung next
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: `phase5_screen_a_rung1`, PID 56740, training from the
-  predeclared step-0 boundary toward 512k; recipe B follows on the same machine
+- Active experiment: recipe A completed; launching `phase5_screen_b_rung1` to
+  the same predeclared 512k boundary
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -542,3 +542,18 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Recipe B will run sequentially after A so the single saturated MPS device is
   not contended. Adjudication will consume both completed results and the
   already-committed prospective rules; the sealed final test remains disabled.
+
+### 2026-07-17 19:55 EDT — recipe A rung complete; recipe B starting
+
+- Recipe A completed 512k in 756.3 training seconds at 676.9 steps/s. Validation
+  deterministic/stochastic success progressed `30.58%/33.88%` at step 0,
+  `28.10%/35.21%` at 102.4k, `33.88%/37.02%` at 256k, and
+  `33.88%/39.01%` at 512k. The selected rung checkpoint is 512k.
+- Health gates improved: two-robot stochastic success rose 26.19%→31.90% and
+  three-robot success 12.26%→21.29%; masked no-movement and invalid-action
+  rates remained exactly zero. The curriculum advanced by mastery through
+  levels 0 and 1 and is currently at level 2 of 4.
+- Every A checkpoint contains its bound `model.zip` and `training_state.pkl`,
+  so it is exactly promotable. Recipe B now starts from the byte-identical
+  canonical BC checkpoint under the matched first-rung protocol. Final test
+  remains sealed.
