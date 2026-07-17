@@ -382,3 +382,12 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   10.16× stochastic speedup at batch 64, with record-level parity. Full gate:
   114 passed, 9 intentionally skipped. Next: bounded PPO rollout-geometry
   comparison at `16×128`, `32×64`, and `64×32`.
+
+### PPO rollout geometry retained at 16×128 (2026-07-17 17:34 EDT)
+
+- Matched 102,400-step runs measured 622.6 steps/s (`16×128`), 603.4 (`32×64`),
+  and 550.1 (`64×32`), all preserving a 2,048-transition buffer and reaching
+  curriculum level 2 by mastery.
+- Retain `16×128`: wider batches were slower on the serial `DummyVecEnv` and
+  did not improve short-run validation. Next work package is exact resumable
+  promotion, including optimizer, timesteps/schedules, RNG, and curriculum.

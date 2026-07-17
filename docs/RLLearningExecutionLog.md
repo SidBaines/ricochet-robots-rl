@@ -6,11 +6,10 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 17:21 EDT
+- Updated: 2026-07-17 17:34 EDT
 - Branch: `sid-learnable-agent`
-- Phase: canonical BC complete; acceleration changes verified; PPO rollout
-  geometry benchmark next
-- Latest completed commit: `637f5d2 config: enable batched Phase 5 evaluation`
+- Phase: PPO rollout geometry selected; resumable promotion implementation next
+- Latest completed commit: `02cd3c6 exp: define PPO rollout geometry benchmark`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
@@ -22,8 +21,8 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: define and run the bounded `16×128` / `32×64` / `64×32`
-  PPO rollout-geometry benchmark from the canonical step-0 checkpoint
+- Current action: implement exact resumable promotion state, retaining the
+  selected `16×128` rollout geometry
 - Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
   SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
@@ -378,3 +377,29 @@ state changes. Append chronological entries; never rewrite historical entries.
   29× cheaper than the previous serial five-repeat protocol. The current work
   package's parity, reproducibility, masking, full-test, and measured-throughput
   gates are satisfied.
+
+### 2026-07-17 17:34 EDT — PPO rollout geometry benchmark complete
+
+- Commit `02cd3c6` defined three configs that differ only in `n_envs` and
+  `n_steps`, all with the same canonical checkpoint, stable optimizer bundle,
+  2,048-transition rollout buffer, 102,400-step budget, evaluation protocol,
+  fixture/split, seed, and sealed final test. The config contract test passed.
+- All candidates reproduced the identical batched step-0 validation result
+  (30.6% deterministic / 33.9% stochastic) and advanced through the first two
+  curriculum boundaries by mastery, so the timing comparison includes matched
+  reset/curriculum work.
+- Results:
+
+  | Geometry | Training seconds | Steps/s | 102.4k val det/stoch |
+  |---|---:|---:|---:|
+  | `16×128` | 164.47 | **622.60** | **34.7% / 39.5%** |
+  | `32×64` | 169.70 | 603.41 | 34.7% / 36.0% |
+  | `64×32` | 186.14 | 550.13 | 31.4% / 36.4% |
+
+- Decision: retain `16×128`. `32×64` was 3.1% slower and `64×32` was 11.6%
+  slower; widening batches does not amortize enough MPS synchronization to
+  offset serial `DummyVecEnv` work on this machine. The short quality values
+  are supporting non-regression evidence, not standalone recipe selection.
+- The three bounded results are stored under
+  `artifacts/phase2_experiments/phase5_geometry_{16x128,32x64,64x32}`. No final
+  test was run.
