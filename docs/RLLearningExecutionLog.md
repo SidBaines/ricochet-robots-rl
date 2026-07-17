@@ -6,10 +6,11 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 17:10 EDT
+- Updated: 2026-07-17 17:16 EDT
 - Branch: `sid-learnable-agent`
-- Phase: canonical BC retry 1 active
-- Latest completed commit: `baecf88 fix: preserve full contrast in BC loss`
+- Phase: canonical BC retry 1 step-0 evaluation active; acceleration changes
+  implemented and under verification
+- Latest completed commit: `d4ec33e perf: batch evaluation and reduce BC syncs`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: `phase5_canonical_bc_seed11_retry1`, detached screen
@@ -22,9 +23,9 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: leave the canonical BC retry undisturbed while implementing
-  BC/evaluation throughput improvements; then audit best-epoch selection and
-  step-0 rollout when the active run finishes
+- Current action: leave the canonical retry's launch-time serial evaluator
+  undisturbed; finish parity/throughput verification of the newly committed
+  BC and batched-evaluation implementation, then audit the step-0 artifacts
 - Exact monitor command: `tail -n 50 artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1.log`
 
 ## Locked decisions
@@ -326,3 +327,26 @@ state changes. Append chronological entries; never rewrite historical entries.
   aggregation parity, deterministic reproducibility, batch-width-invariant
   stochastic RNG behavior, action-mask parity, and materially improved
   measured evaluation throughput.
+
+### 2026-07-17 17:16 EDT — BC and batched-evaluation implementation complete
+
+- Commit `d4ec33e` keeps BC validation tensors resident on the selected device,
+  retains expert-action mask validation without transferring/gathering unused
+  loss masks, accumulates train/validation metrics on-device, and reduces
+  hundreds of minibatch scalar synchronizations to one metric transfer per
+  phase and epoch.
+- Fixed-puzzle deterministic model evaluation now runs exactly once per puzzle
+  even when stochastic evaluation requests multiple repetitions.
+- Model evaluation now advances configurable batches of independent episodes
+  per policy call (`evaluation_batch_size`, default 64). Stochastic sampling
+  uses a stable RNG stream derived separately for each puzzle/repetition, so
+  records do not depend on evaluator batch width and evaluation does not
+  perturb PyTorch's training RNG.
+- Added exact CPU model-update parity, serial-versus-batched deterministic
+  record parity, batch-width-invariant stochastic record/aggregate parity,
+  RNG isolation, and action-mask tests. Targeted gates passed: 7 existing BC
+  tests, then 15 BC/batched/masking tests, plus the existing Phase 2/Phase 5
+  contract tests.
+- The active canonical process had already imported the launch-time code. It
+  completed all 25 original BC epochs unchanged and is now running the old
+  serial step-0 evaluator; its timing/result remains the intended reference.
