@@ -6,25 +6,24 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 14:58 EDT
+- Updated: 2026-07-17 15:08 EDT
 - Branch: `sid-learnable-agent`
-- Phase: reverse-curriculum validation complete; preparing canonical BC init
-- Latest completed commit: `f15c010 test: validate reverse curriculum smoke`
+- Phase: canonical BC and matched screen configs ready; canonical run pending
+- Latest completed commit: `7716d73 docs: record reverse curriculum dry run`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
-- Last test gate: 106 passed, 9 intentionally skipped, 1 benign small-rollout
-  batch-size warning in 11.21s
+- Last test gate: 108 passed, 9 intentionally skipped, 1 benign small-rollout
+  batch-size warning in 20.97s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: record the 16×16 dry-run result, then define and validate the
-  canonical seed-11 BC initialization and matched PPO screen configs
-- Exact next command: create the canonical BC-only initialization config and
-  verify its output/checkpoint contract without touching the sealed test
+- Current action: commit the canonical/matched config contract, then launch the
+  canonical seed-11 BC-only run detached
+- Exact next command: `nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_canonical_bc_seed11.yaml --bank-dir artifacts/phase4_bank --output-dir artifacts/phase2_experiments/phase5_canonical_bc_seed11 > artifacts/phase2_experiments/phase5_canonical_bc_seed11.log 2>&1 &`
 
 ## Locked decisions
 
@@ -192,3 +191,23 @@ state changes. Append chronological entries; never rewrite historical entries.
   RL-only program. Do not launch `phase5_reverse_16x16_deferred.yaml` in this
   session. Proceed to the performance-first canonical BC initialization and
   matched masked BC→PPO screens.
+
+### 2026-07-17 15:08 EDT — canonical BC and matched screens defined
+
+- Added `phase5_canonical_bc_seed11.yaml`: 25 masked BC epochs over every Phase
+  4 training trajectory, held-out expert-state validation each epoch,
+  best-validation-loss epoch restoration, and a saved/evaluated step-0 policy
+  with no PPO updates or final-test access.
+- Added two 2.048M-step masked BC→PPO screens that load that exact step-0 model:
+  - A uses historical Phase 4b optimization (`lr=3e-4`, `ent_coef=0.01`, no KL
+    guard).
+  - B uses the stability bundle (`lr=1e-4`, `ent_coef=0.001`,
+    `target_kl=0.03`).
+- Both screens otherwise have identical explicit model/init/masking, Phase 4
+  fixture/split, length curriculum, seed 11, checkpoint schedule
+  0/102.4k/256k/512k/1.024M/2.048M, five fixed-seed validation repetitions,
+  puzzle-clustered bootstrap, masked/unmasked counterfactual evaluation,
+  validation selection, and sealed final test.
+- Added a config contract test that fails on any undeclared screen difference
+  and verifies that canonical BC is validation-only and saves step 0. Full gate:
+  108 passed, 9 intentionally skipped.
