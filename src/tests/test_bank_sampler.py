@@ -182,6 +182,53 @@ def test_repeated_single_draw_stratification_advances_and_reseeds() -> None:
         assert replay == first
 
 
+def test_sampler_resume_state_replays_cached_and_stratified_streams() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        bank = PuzzleBank(tmp)
+        spec = SpecKey(16, 16, 4, 2, 2)
+        bank.add_puzzles([
+            _make_metadata(spec, length * 10_000 + i, optimal_length=length, robots_moved=1)
+            for length in range(1, 4)
+            for i in range(20)
+        ])
+        bands = [
+            {
+                "min_optimal_length": length,
+                "max_optimal_length": length,
+                "min_robots_moved": 1,
+                "max_robots_moved": 1,
+                "weight": float(length),
+            }
+            for length in range(1, 4)
+        ]
+        original = BankSampler(bank, seed=77)
+        for _ in range(7):
+            original.sample_puzzle(spec, min_optimal_length=1, max_optimal_length=2)
+            original.sample_puzzles_stratified(spec, total_count=1, bands=bands)
+        state = original.get_resume_state()
+        expected_plain = [
+            original.sample_puzzle(spec, min_optimal_length=1, max_optimal_length=2).seed
+            for _ in range(25)
+        ]
+        expected_stratified = [
+            original.sample_puzzles_stratified(spec, total_count=1, bands=bands)[0].seed
+            for _ in range(25)
+        ]
+
+        resumed = BankSampler(bank, seed=77)
+        resumed.set_resume_state(state)
+        actual_plain = [
+            resumed.sample_puzzle(spec, min_optimal_length=1, max_optimal_length=2).seed
+            for _ in range(25)
+        ]
+        actual_stratified = [
+            resumed.sample_puzzles_stratified(spec, total_count=1, bands=bands)[0].seed
+            for _ in range(25)
+        ]
+        assert actual_plain == expected_plain
+        assert actual_stratified == expected_stratified
+
+
 def test_append_invalidates_partition_read_cache():
     with tempfile.TemporaryDirectory() as tmp:
         bank = PuzzleBank(tmp)

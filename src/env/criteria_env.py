@@ -7,6 +7,7 @@ puzzles matching specific criteria without requiring online solving.
 
 from __future__ import annotations
 
+import copy
 import numpy as np
 from collections import deque
 from typing import Dict, List, Optional, Any, Tuple
@@ -462,6 +463,32 @@ class CriteriaFilteredEnv(GymEnvBase):
                 if self._total_episodes > 0 else 0
             )
         }
+
+    def get_resume_stream_state(self) -> Dict[str, Any]:
+        """Capture the pre-reset sampling streams for a clean resume boundary."""
+        return {
+            "schema_version": 1,
+            "sampler": self.sampler.get_resume_state(),
+            "band_rng_state": copy.deepcopy(self._band_rng.bit_generator.state),
+            "total_episodes": int(self._total_episodes),
+            "successful_episodes": int(self._successful_episodes),
+            "failed_samples": int(self._failed_samples),
+        }
+
+    def set_resume_stream_state(self, state: Dict[str, Any]) -> None:
+        """Restore streams immediately before the checkpoint's canonical reset."""
+        if int(state.get("schema_version", 0)) != 1:
+            raise ValueError("Unsupported CriteriaFilteredEnv resume-state schema")
+        self.sampler.set_resume_state(state["sampler"])
+        self._band_rng = np.random.default_rng()
+        self._band_rng.bit_generator.state = copy.deepcopy(state["band_rng_state"])
+        self._total_episodes = int(state["total_episodes"])
+        self._successful_episodes = int(state["successful_episodes"])
+        self._failed_samples = int(state["failed_samples"])
+        self._episode_steps = 0
+        self._current_metadata = None
+        self._current_band_key = None
+        self._current_start_distance = None
     
     def update_criteria(self, new_criteria: PuzzleCriteria) -> None:
         """Update puzzle criteria.

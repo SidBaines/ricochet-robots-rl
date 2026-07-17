@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import copy
 from dataclasses import dataclass, asdict
 import struct
 from pathlib import Path
@@ -513,6 +514,7 @@ class BankSampler:
         # key -> { 'df': DataFrame, 'order': np.ndarray[int], 'pos': int, 'rng': np.random.Generator }
         self._criteria_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._cache_order: List[Tuple[Any, ...]] = []
+        self._resume_iterator_states: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._max_cache_entries: int = 128
         # Monitoring
         self._last_stratified_plan: Optional[Dict[str, Any]] = None
@@ -523,6 +525,39 @@ class BankSampler:
         self._stratified_rng = np.random.default_rng(seed)
         self._criteria_cache.clear()
         self._cache_order.clear()
+        self._resume_iterator_states.clear()
+
+    def get_resume_state(self) -> Dict[str, Any]:
+        """Capture deterministic sampling streams without serializing DataFrames."""
+        iterators: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for key, iterator in self._criteria_cache.items():
+            iterators[key] = {
+                "order": np.asarray(iterator["order"], dtype=np.int64).copy(),
+                "pos": int(iterator["pos"]),
+                "rng_state": copy.deepcopy(iterator["rng"].bit_generator.state),
+            }
+        for key, state in self._resume_iterator_states.items():
+            iterators.setdefault(key, copy.deepcopy(state))
+        return {
+            "schema_version": 1,
+            "seed": self.seed,
+            "stratified_rng_state": copy.deepcopy(self._stratified_rng.bit_generator.state),
+            "iterators": iterators,
+            "last_stratified_plan": copy.deepcopy(self._last_stratified_plan),
+        }
+
+    def set_resume_state(self, state: Dict[str, Any]) -> None:
+        """Restore streams lazily; cached DataFrame views are rebuilt on demand."""
+        if int(state.get("schema_version", 0)) != 1:
+            raise ValueError("Unsupported BankSampler resume-state schema")
+        if state.get("seed") != self.seed:
+            raise ValueError(f"BankSampler seed mismatch: {state.get('seed')} != {self.seed}")
+        self._criteria_cache.clear()
+        self._cache_order.clear()
+        self._stratified_rng = np.random.default_rng()
+        self._stratified_rng.bit_generator.state = copy.deepcopy(state["stratified_rng_state"])
+        self._resume_iterator_states = copy.deepcopy(dict(state.get("iterators", {})))
+        self._last_stratified_plan = copy.deepcopy(state.get("last_stratified_plan"))
 
     def _split_mask(self, df: "pd.DataFrame") -> "pd.Series":
         """Return stable hash-based split membership independent of row order."""
@@ -610,6 +645,17 @@ class BankSampler:
             order = np.arange(len(filtered))
             rng.shuffle(order)
             it = {"df": filtered.reset_index(drop=True), "order": order, "pos": 0, "rng": rng}
+            resume_state = self._resume_iterator_states.pop(key, None)
+            if resume_state is not None:
+                restored_order = np.asarray(resume_state["order"], dtype=np.int64)
+                if restored_order.shape != order.shape or set(restored_order.tolist()) != set(order.tolist()):
+                    raise ValueError(f"BankSampler iterator membership changed for resume key {key}")
+                restored_pos = int(resume_state["pos"])
+                if not 0 <= restored_pos <= len(restored_order):
+                    raise ValueError(f"Invalid BankSampler resume position {restored_pos} for {key}")
+                it["order"] = restored_order.copy()
+                it["pos"] = restored_pos
+                it["rng"].bit_generator.state = copy.deepcopy(resume_state["rng_state"])
             # Evict LRU if over capacity
             self._criteria_cache[key] = it
             self._cache_order.append(key)

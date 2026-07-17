@@ -760,6 +760,32 @@ class BankCurriculumWrapper(GymEnvBase):
         """Get comprehensive curriculum statistics."""
         return self.curriculum_manager.get_stats()
 
+    def get_resume_stream_state(self) -> Dict[str, Any]:
+        """Capture this worker's bank streams before a canonical reset."""
+        return {
+            "schema_version": 1,
+            "worker_seed": self._worker_seed,
+            "last_known_level": int(self._last_known_level),
+            "criteria_env": self._current_env.get_resume_stream_state(),
+        }
+
+    def set_resume_stream_state(self, state: Dict[str, Any]) -> None:
+        """Rebuild this worker at the restored curriculum level and streams."""
+        if int(state.get("schema_version", 0)) != 1:
+            raise ValueError("Unsupported BankCurriculumWrapper resume-state schema")
+        restored_level = int(state["last_known_level"])
+        if restored_level != int(self.curriculum_manager.current_level):
+            raise ValueError(
+                f"Worker curriculum level {restored_level} does not match manager "
+                f"level {self.curriculum_manager.current_level}"
+            )
+        self._worker_seed = state.get("worker_seed")
+        self._last_known_level = restored_level
+        if self._current_env is not None:
+            self._current_env.close()
+        self._create_current_env()
+        self._current_env.set_resume_stream_state(state["criteria_env"])
+
     def sync_curriculum_level(self, level: int) -> None:
         """Move a read-only evaluation wrapper to a training level.
 

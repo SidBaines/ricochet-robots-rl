@@ -7,10 +7,12 @@ import json
 import math
 import platform
 import copy
+import pickle
+import random
 import subprocess
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -90,6 +92,8 @@ class Phase2Config:
     bc_max_puzzles: int | None = None
     bc_select_best_by_validation: bool = False
     initial_checkpoint_path: str | None = None
+    resume_checkpoint_path: str | None = None
+    resume_state_path: str | None = None
     use_action_masking: bool = False
     evaluate_both_mask_modes: bool = False
     training_seeds: tuple[int, ...] = (11, 29, 47)
@@ -129,8 +133,12 @@ class Phase2Config:
             raise ValueError("heldout_fraction must be in (0, 1)")
         if not self.training_seeds:
             raise ValueError("At least one training seed is required")
-        if not self.checkpoints or self.checkpoints[0] != 0:
-            raise ValueError("checkpoints must start at zero")
+        if not self.checkpoints:
+            raise ValueError("checkpoints must not be empty")
+        if self.resume_checkpoint_path is None and self.checkpoints[0] != 0:
+            raise ValueError("checkpoints must start at zero unless resuming")
+        if self.checkpoints[0] < 0:
+            raise ValueError("checkpoints cannot be negative")
         if tuple(sorted(set(self.checkpoints))) != self.checkpoints:
             raise ValueError("checkpoints must be unique and increasing")
         if self.max_optimal_length > self.max_steps:
@@ -151,6 +159,12 @@ class Phase2Config:
             raise ValueError("BC pretraining requires the structured-plane 'image' observation mode")
         if self.initial_checkpoint_path is not None and self.bc_pretrain_epochs > 0:
             raise ValueError("initial_checkpoint_path and BC pretraining are mutually exclusive")
+        if self.resume_checkpoint_path is not None and self.bc_pretrain_epochs > 0:
+            raise ValueError("resume_checkpoint_path and BC pretraining are mutually exclusive")
+        if self.resume_checkpoint_path is not None and self.initial_checkpoint_path is not None:
+            raise ValueError("resume_checkpoint_path and initial_checkpoint_path are mutually exclusive")
+        if self.resume_state_path is not None and self.resume_checkpoint_path is None:
+            raise ValueError("resume_state_path requires resume_checkpoint_path")
         if self.policy_activation not in {None, "relu", "tanh"}:
             raise ValueError("policy_activation must be one of: relu, tanh")
         if self.bc_action_head_gain <= 0:
@@ -258,6 +272,31 @@ def _atomic_json(path: Path, value: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def _atomic_pickle(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        pickle.dump(value, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    temporary.replace(path)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _array_sha256(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(json.dumps(list(array.shape), separators=(",", ":")).encode("ascii"))
+    digest.update(array.tobytes())
+    return digest.hexdigest()
 
 
 def _sha256_json(value: Any) -> str:
@@ -1875,6 +1914,7 @@ def train_overfit_milestone(
 
 def _curriculum_checkpoint_state(manager: Any) -> Dict[str, Any]:
     return {
+        "schema_version": 2,
         "current_level": int(manager.get_current_level()),
         "episode_count": int(manager.episode_count),
         "level_start_episode": int(manager.level_start_episode),
@@ -1883,8 +1923,230 @@ def _curriculum_checkpoint_state(manager: Any) -> Dict[str, Any]:
         "window_success_rate": float(manager.get_success_rate()),
         "frontier_success_rate": manager.get_frontier_success_rate(),
         "band_success_rates": manager.get_band_success_rates(),
+        "band_windows": {
+            str(key): {
+                "values": [bool(value) for value in window],
+                "maxlen": window.maxlen,
+            }
+            for key, window in sorted(manager.band_windows.items())
+        },
         "transitions": list(manager.transitions),
     }
+
+
+def _restore_curriculum_checkpoint_state(manager: Any, state: Mapping[str, Any]) -> None:
+    schema_version = int(state.get("schema_version", 1))
+    if schema_version not in {1, 2}:
+        raise ValueError(f"Unsupported curriculum resume-state schema: {schema_version}")
+    current_level = int(state["current_level"])
+    if not 0 <= current_level < len(manager.curriculum_levels):
+        raise ValueError(f"Invalid resumed curriculum level: {current_level}")
+    episode_count = int(state["episode_count"])
+    level_start_episode = int(state["level_start_episode"])
+    if not 0 <= level_start_episode <= episode_count:
+        raise ValueError("Invalid resumed curriculum episode counters")
+    success_window = [bool(value) for value in state.get("success_rate_window", [])]
+    if len(success_window) > manager.success_rate_window_size:
+        raise ValueError("Resumed curriculum success window exceeds configured size")
+    manager.current_level = current_level
+    manager.episode_count = episode_count
+    manager.level_start_episode = level_start_episode
+    manager.success_rate_window = success_window
+    manager.transitions = copy.deepcopy(list(state.get("transitions", [])))
+    manager.band_windows = {}
+    for key, window_state in dict(state.get("band_windows", {})).items():
+        values = [bool(value) for value in window_state.get("values", [])]
+        maxlen = window_state.get("maxlen")
+        manager.band_windows[str(key)] = deque(values, maxlen=int(maxlen) if maxlen is not None else None)
+
+
+def _capture_global_rng_state() -> Dict[str, Any]:
+    import torch
+
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "torch_mps": torch.mps.get_rng_state() if torch.backends.mps.is_available() else None,
+    }
+
+
+def _restore_global_rng_state(state: Mapping[str, Any]) -> None:
+    import torch
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if state.get("torch_cuda") is not None:
+        if not torch.cuda.is_available():
+            raise ValueError("Checkpoint contains CUDA RNG state but CUDA is unavailable")
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    if state.get("torch_mps") is not None:
+        if not torch.backends.mps.is_available():
+            raise ValueError("Checkpoint contains MPS RNG state but MPS is unavailable")
+        torch.mps.set_rng_state(state["torch_mps"])
+
+
+_RESUME_CONTRACT_EXCLUDED_FIELDS = {
+    "baseline_episodes_per_puzzle",
+    "bc_action_head_gain",
+    "bc_apply_action_masks",
+    "bc_batch_size",
+    "bc_learning_rate",
+    "bc_max_puzzles",
+    "bc_pretrain_epochs",
+    "bc_reinitialize_action_head",
+    "bc_select_best_by_validation",
+    "checkpoints",
+    "device",
+    "evaluation_batch_size",
+    "final_stochastic_episodes_per_puzzle",
+    "fixed_validation_seeds",
+    "health_log_every_rollouts",
+    "health_probe_puzzles",
+    "initial_checkpoint_path",
+    "overfit_puzzles_per_stratum",
+    "overfit_stochastic_episodes_per_puzzle",
+    "resume_checkpoint_path",
+    "resume_state_path",
+    "run_final_test",
+    "run_overfit_milestone",
+    "save_checkpoint_weights",
+    "select_checkpoint_by_validation",
+    "suite_per_stratum",
+    "training_seeds",
+    "validation_bootstrap_samples",
+    "validation_episodes_per_puzzle",
+    "validation_test_seed",
+    "wandb_project",
+    "wandb_run_name",
+}
+
+
+def _resume_contract(config: Phase2Config) -> Dict[str, Any]:
+    values = asdict(config)
+    return {
+        key: values[key]
+        for key in sorted(values)
+        if key not in _RESUME_CONTRACT_EXCLUDED_FIELDS
+    }
+
+
+def _save_resumable_checkpoint(
+    model: Any,
+    vec_env: Any,
+    manager: Any,
+    config: Phase2Config,
+    *,
+    seed: int,
+    model_path: Path,
+) -> Path:
+    """Save at a clean reset boundary that can be continued bit-for-bit."""
+    environment_streams = vec_env.env_method("get_resume_stream_state")
+    vec_env_seeds = copy.deepcopy(getattr(vec_env, "_seeds", None))
+    vec_env_options = copy.deepcopy(getattr(vec_env, "_options", None))
+    reset_observations = np.asarray(vec_env.reset()).copy()
+    model._last_obs = reset_observations.copy()
+    model._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
+    if getattr(model, "_last_original_obs", None) is not None:
+        model._last_original_obs = reset_observations.copy()
+    model.save(model_path)
+    saved_model_path = model_path.with_suffix(".zip")
+    state = {
+        "schema_version": 1,
+        "seed": int(seed),
+        "model_num_timesteps": int(model.num_timesteps),
+        "model_sha256": _file_sha256(saved_model_path),
+        "device": str(model.device),
+        "n_envs": int(vec_env.num_envs),
+        "resume_contract": _resume_contract(config),
+        "schedule_horizon": max(config.checkpoints),
+        "curriculum": _curriculum_checkpoint_state(manager),
+        "environment_streams_pre_reset": environment_streams,
+        "vec_env_seeds_pre_reset": vec_env_seeds,
+        "vec_env_options_pre_reset": vec_env_options,
+        "reset_observations_sha256": _array_sha256(reset_observations),
+        "global_rng_after_reset": _capture_global_rng_state(),
+    }
+    state_path = model_path.parent / "training_state.pkl"
+    _atomic_pickle(state_path, state)
+    return state_path
+
+
+def _load_resume_state(path: Path) -> Dict[str, Any]:
+    with path.open("rb") as handle:
+        state = pickle.load(handle)
+    if not isinstance(state, dict) or int(state.get("schema_version", 0)) != 1:
+        raise ValueError(f"Unsupported training resume state: {path}")
+    return state
+
+
+def _refresh_resume_rng_state(path: Path) -> None:
+    """Seal RNG state after all checkpoint-side logging and serialization."""
+    state = _load_resume_state(path)
+    state["global_rng_after_reset"] = _capture_global_rng_state()
+    _atomic_pickle(path, state)
+
+
+def _restore_resumable_checkpoint(
+    model: Any,
+    vec_env: Any,
+    manager: Any,
+    config: Phase2Config,
+    *,
+    seed: int,
+    model_path: Path,
+    state_path: Path,
+) -> Dict[str, Any]:
+    """Restore curriculum, sampler streams, clean observations, and all RNGs."""
+    state = _load_resume_state(state_path)
+    if int(state["seed"]) != int(seed):
+        raise ValueError(f"Resume seed mismatch: {state['seed']} != {seed}")
+    if int(state["n_envs"]) != int(vec_env.num_envs):
+        raise ValueError(f"Resume n_envs mismatch: {state['n_envs']} != {vec_env.num_envs}")
+    if int(state["model_num_timesteps"]) != int(model.num_timesteps):
+        raise ValueError("Resume model timestep does not match training state")
+    if state["model_sha256"] != _file_sha256(model_path):
+        raise ValueError("Resume model SHA-256 does not match training state")
+    if state["device"] != str(model.device):
+        raise ValueError(f"Resume device mismatch: {state['device']} != {model.device}")
+    expected_contract = state["resume_contract"]
+    actual_contract = _resume_contract(config)
+    if expected_contract != actual_contract:
+        differences = sorted(
+            key
+            for key in set(expected_contract) | set(actual_contract)
+            if expected_contract.get(key) != actual_contract.get(key)
+        )
+        raise ValueError(f"Resume training contract differs: {differences}")
+    if (
+        config.learning_rate_final is not None or config.ent_coef_final is not None
+    ) and int(state["schedule_horizon"]) != max(config.checkpoints):
+        raise ValueError("Scheduled runs must preserve their declared horizon when resuming")
+
+    _restore_curriculum_checkpoint_state(manager, state["curriculum"])
+    streams = list(state["environment_streams_pre_reset"])
+    if len(streams) != vec_env.num_envs:
+        raise ValueError("Resume environment-stream count does not match n_envs")
+    for index, stream_state in enumerate(streams):
+        vec_env.env_method("set_resume_stream_state", stream_state, indices=index)
+    if state.get("vec_env_seeds_pre_reset") is not None:
+        vec_env._seeds = copy.deepcopy(state["vec_env_seeds_pre_reset"])
+    if state.get("vec_env_options_pre_reset") is not None:
+        vec_env._options = copy.deepcopy(state["vec_env_options_pre_reset"])
+    restored_observations = np.asarray(vec_env.reset()).copy()
+    if _array_sha256(restored_observations) != state["reset_observations_sha256"]:
+        raise ValueError("Resumed environment observations do not match checkpoint boundary")
+    saved_last_obs = np.asarray(model._last_obs)
+    if not np.array_equal(saved_last_obs, restored_observations):
+        raise ValueError("Model last observations do not match restored environments")
+    model._last_obs = restored_observations
+    model._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
+    if getattr(model, "_last_original_obs", None) is not None:
+        model._last_original_obs = restored_observations.copy()
+    _restore_global_rng_state(state["global_rng_after_reset"])
+    return state
 
 
 def _select_curve_point(curve: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -1919,6 +2181,7 @@ def train_seed(
     vec_env = make_vec_env(factory, n_envs=config.n_envs, seed=seed)
     model = _build_model(vec_env, config, seed=seed, device=device)
     effective_policy = dict(model._phase2_effective_policy)
+    resume_metadata: Dict[str, Any] | None = None
     if config.initial_checkpoint_path is not None:
         initial_path = Path(config.initial_checkpoint_path)
         if not initial_path.exists():
@@ -1940,6 +2203,50 @@ def train_seed(
             target_kl=config.target_kl,
         )
         model._phase2_effective_policy = effective_policy
+    elif config.resume_checkpoint_path is not None:
+        resume_model_path = Path(config.resume_checkpoint_path)
+        if not resume_model_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_model_path}")
+        resume_state_path = (
+            Path(config.resume_state_path)
+            if config.resume_state_path is not None
+            else resume_model_path.parent / "training_state.pkl"
+        )
+        if not resume_state_path.exists():
+            raise FileNotFoundError(f"Resume training state not found: {resume_state_path}")
+        model = type(model).load(
+            resume_model_path,
+            env=vec_env,
+            device=device,
+            seed=seed,
+            force_reset=False,
+            n_steps=config.n_steps,
+            batch_size=config.batch_size,
+            n_epochs=config.n_epochs,
+            learning_rate=config.learning_rate,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
+            ent_coef=config.ent_coef,
+            vf_coef=config.vf_coef,
+            max_grad_norm=config.max_grad_norm,
+            target_kl=config.target_kl,
+        )
+        model._phase2_effective_policy = effective_policy
+        resume_metadata = _restore_resumable_checkpoint(
+            model,
+            vec_env,
+            factory.curriculum_manager,
+            config,
+            seed=seed,
+            model_path=resume_model_path,
+            state_path=resume_state_path,
+        )
+        if int(model.num_timesteps) != int(config.checkpoints[0]):
+            raise ValueError(
+                f"First resumed checkpoint {config.checkpoints[0]} does not match "
+                f"model timestep {model.num_timesteps}"
+            )
+    initial_timesteps = int(model.num_timesteps)
     health_observations, health_movement_masks = _observation_and_mask_probe(
         training_suite,
         config,
@@ -2085,12 +2392,21 @@ def train_seed(
             "actual_timesteps": int(model.num_timesteps),
             "model": None,
         }
+        checkpoint_training_state_path: Path | None = None
         if config.save_checkpoint_weights:
             checkpoint_dir = output_dir / f"seed_{seed}" / "checkpoints" / f"step_{int(model.num_timesteps)}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             checkpoint_model = checkpoint_dir / "model"
-            model.save(checkpoint_model)
+            checkpoint_training_state_path = _save_resumable_checkpoint(
+                model,
+                vec_env,
+                factory.curriculum_manager,
+                config,
+                seed=seed,
+                model_path=checkpoint_model,
+            )
             checkpoint_record["model"] = str(checkpoint_model.with_suffix(".zip"))
+            checkpoint_record["training_state"] = str(checkpoint_training_state_path)
             _atomic_json(checkpoint_dir / "evaluation.json", point)
             _atomic_json(checkpoint_dir / "curriculum.json", _curriculum_checkpoint_state(factory.curriculum_manager))
             _atomic_json(
@@ -2126,6 +2442,8 @@ def train_seed(
                     **point["health"],
                 }
             )
+        if checkpoint_training_state_path is not None:
+            _refresh_resume_rng_state(checkpoint_training_state_path)
     checkpoint_path = output_dir / f"seed_{seed}" / "model"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     model.save(checkpoint_path)
@@ -2205,8 +2523,12 @@ def train_seed(
         "seed": seed,
         "device": device,
         "actual_timesteps": int(model.num_timesteps),
+        "initial_timesteps": initial_timesteps,
         "training_seconds": training_seconds,
-        "training_steps_per_second": int(model.num_timesteps) / training_seconds if training_seconds else 0.0,
+        "training_steps_per_second": (
+            (int(model.num_timesteps) - initial_timesteps) / training_seconds
+            if training_seconds else 0.0
+        ),
         "policy": {
             "algorithm_class": type(model).__name__,
             "class": type(model.policy).__name__,
@@ -2221,6 +2543,9 @@ def train_seed(
         "selected_checkpoint": selected_record["model"],
         "bc_pretrain": bc_stats,
         "initial_checkpoint_path": config.initial_checkpoint_path,
+        "resume_checkpoint_path": config.resume_checkpoint_path,
+        "resume_state_path": config.resume_state_path,
+        "resumed": resume_metadata is not None,
         "curriculum": {
             "staged": (
                 config.curriculum_stage_max_lengths is not None
