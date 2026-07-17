@@ -121,6 +121,9 @@ class Phase2Config:
     overfit_stochastic_episodes_per_puzzle: int = 20
     save_checkpoint_weights: bool = False
     select_checkpoint_by_validation: bool = False
+    plateau_min_timesteps: int | None = None
+    plateau_patience_checkpoints: int | None = None
+    plateau_min_delta: float | None = None
     run_final_test: bool = True
     health_probe_puzzles: int = 64
     health_log_every_rollouts: int = 5
@@ -177,6 +180,26 @@ class Phase2Config:
             raise ValueError("evaluation_batch_size must be positive")
         if self.select_checkpoint_by_validation and not self.save_checkpoint_weights:
             raise ValueError("select_checkpoint_by_validation requires save_checkpoint_weights")
+        plateau_values = (
+            self.plateau_min_timesteps,
+            self.plateau_patience_checkpoints,
+            self.plateau_min_delta,
+        )
+        if any(value is not None for value in plateau_values):
+            if any(value is None for value in plateau_values):
+                raise ValueError("All plateau stopping fields must be set together")
+            if int(self.plateau_min_timesteps) < self.checkpoints[0]:
+                raise ValueError("plateau_min_timesteps cannot precede the first checkpoint")
+            if int(self.plateau_min_timesteps) > self.checkpoints[-1]:
+                raise ValueError("plateau_min_timesteps cannot exceed the final checkpoint")
+            if int(self.plateau_patience_checkpoints) <= 0:
+                raise ValueError("plateau_patience_checkpoints must be positive")
+            if float(self.plateau_min_delta) <= 0.0:
+                raise ValueError("plateau_min_delta must be positive")
+            if not self.fixed_validation_seeds:
+                raise ValueError("Plateau stopping requires fixed_validation_seeds")
+            if not self.select_checkpoint_by_validation:
+                raise ValueError("Plateau stopping requires validation checkpoint selection")
         if self.health_probe_puzzles <= 0:
             raise ValueError("health_probe_puzzles must be positive")
         if self.health_log_every_rollouts <= 0:
@@ -2008,6 +2031,9 @@ _RESUME_CONTRACT_EXCLUDED_FIELDS = {
     "initial_checkpoint_path",
     "overfit_puzzles_per_stratum",
     "overfit_stochastic_episodes_per_puzzle",
+    "plateau_min_delta",
+    "plateau_min_timesteps",
+    "plateau_patience_checkpoints",
     "resume_checkpoint_path",
     "resume_state_path",
     "run_final_test",
@@ -2161,6 +2187,61 @@ def _select_curve_point(curve: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]
     )
 
 
+def _plateau_stopping_status(
+    curve: Sequence[Mapping[str, Any]],
+    config: Phase2Config,
+) -> Dict[str, Any]:
+    """Evaluate the prospective stochastic-validation plateau contract."""
+    enabled = config.plateau_min_timesteps is not None
+    status: Dict[str, Any] = {
+        "enabled": enabled,
+        "metric": "validation_stochastic_success_rate",
+        "minimum_timesteps": config.plateau_min_timesteps,
+        "patience_checkpoints": config.plateau_patience_checkpoints,
+        "minimum_delta": config.plateau_min_delta,
+        "stopped_early": False,
+        "reason": None,
+        "best_success_rate": None,
+        "best_timesteps": None,
+        "non_improving_eligible_checkpoints": 0,
+    }
+    if not enabled or not curve:
+        return status
+
+    best = -math.inf
+    best_timesteps: int | None = None
+    non_improving = 0
+    minimum_timesteps = int(config.plateau_min_timesteps)
+    minimum_delta = float(config.plateau_min_delta)
+    for point in curve:
+        timesteps = int(point["actual_timesteps"])
+        success_rate = float(point["stochastic"]["success_rate"])
+        materially_improved = success_rate >= best + minimum_delta
+        if materially_improved:
+            best = success_rate
+            best_timesteps = timesteps
+            if timesteps >= minimum_timesteps:
+                non_improving = 0
+        elif timesteps >= minimum_timesteps:
+            non_improving += 1
+
+    status.update({
+        "best_success_rate": best,
+        "best_timesteps": best_timesteps,
+        "non_improving_eligible_checkpoints": non_improving,
+    })
+    if (
+        int(curve[-1]["actual_timesteps"]) >= minimum_timesteps
+        and non_improving >= int(config.plateau_patience_checkpoints)
+    ):
+        status["stopped_early"] = True
+        status["reason"] = (
+            f"validation stochastic success failed to improve by {minimum_delta:.4f} "
+            f"for {non_improving} eligible checkpoints"
+        )
+    return status
+
+
 def train_seed(
     bank: PuzzleBank,
     training_suite: Sequence[PuzzleMetadata],
@@ -2288,6 +2369,7 @@ def train_seed(
         )
     curve: List[Dict[str, Any]] = []
     checkpoint_records: List[Dict[str, Any]] = []
+    plateau_stopping = _plateau_stopping_status(curve, config)
     training_seconds = 0.0
     for checkpoint_index, checkpoint in enumerate(config.checkpoints):
         if checkpoint_index > 0:
@@ -2444,6 +2526,14 @@ def train_seed(
             )
         if checkpoint_training_state_path is not None:
             _refresh_resume_rng_state(checkpoint_training_state_path)
+        plateau_stopping = _plateau_stopping_status(curve, config)
+        if plateau_stopping["stopped_early"]:
+            print(
+                f"[phase2 seed={seed}] prospective plateau stop at "
+                f"{int(model.num_timesteps)} timesteps: {plateau_stopping['reason']}",
+                flush=True,
+            )
+            break
     checkpoint_path = output_dir / f"seed_{seed}" / "model"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     model.save(checkpoint_path)
@@ -2541,6 +2631,7 @@ def train_seed(
         "checkpoints": checkpoint_records,
         "selected_checkpoint_timesteps": selected_timesteps,
         "selected_checkpoint": selected_record["model"],
+        "plateau_stopping": plateau_stopping,
         "bc_pretrain": bc_stats,
         "initial_checkpoint_path": config.initial_checkpoint_path,
         "resume_checkpoint_path": config.resume_checkpoint_path,

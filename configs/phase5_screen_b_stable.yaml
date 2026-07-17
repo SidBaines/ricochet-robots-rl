@@ -39,7 +39,8 @@ evaluate_both_mask_modes: true
 bc_pretrain_epochs: 0
 initial_checkpoint_path: artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip
 training_seeds: [11]
-checkpoints: [0, 102400, 256000, 512000, 1024000, 2048000]
+# Successive-halving rung 1. Continue only via adjudicate_phase5_rung.py.
+checkpoints: [0, 102400, 256000, 512000]
 n_envs: 16
 n_steps: 128
 batch_size: 1024

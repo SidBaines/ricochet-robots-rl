@@ -40,7 +40,7 @@ def test_phase5_screens_are_matched_except_for_declared_optimizer_bundle() -> No
 
     assert differences == allowed_differences
     assert historical["initial_checkpoint_path"] == stable["initial_checkpoint_path"]
-    assert historical["checkpoints"] == (0, 102400, 256000, 512000, 1024000, 2048000)
+    assert historical["checkpoints"] == (0, 102400, 256000, 512000)
     assert historical["validation_episodes_per_puzzle"] == 5
     assert historical["evaluation_batch_size"] == 64
     assert historical["fixed_validation_seeds"]
@@ -68,3 +68,22 @@ def test_phase5_geometry_benchmarks_are_matched_except_for_rollout_shape() -> No
     assert all(config["checkpoints"] == (0, 102400) for config in configs)
     assert all(config["evaluation_batch_size"] == 64 for config in configs)
     assert all(not config["run_final_test"] for config in configs)
+
+
+def test_phase5_allocation_rules_are_predeclared_and_conservative() -> None:
+    path = PROJECT_ROOT / "configs" / "phase5_allocation_rules.yaml"
+    rules = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert rules["schema_version"] == 1
+    assert rules["selection"]["require_disjoint_confidence_intervals"]
+    assert rules["selection"]["consistent_lead_checkpoints"] == 2
+    assert rules["selection"]["retain_all_on_ambiguity"]
+    assert rules["rungs"][512000]["promotion_checkpoints"] == [512000, 1024000, 2048000]
+    full = rules["rungs"][2048000]
+    assert full["promotion_checkpoints"][-1] == 10240000
+    assert full["plateau"] == {
+        "metric": "validation_stochastic_success_rate",
+        "minimum_timesteps": 4096000,
+        "patience_checkpoints": 3,
+        "minimum_delta": 0.01,
+    }

@@ -1,0 +1,29 @@
+# Prospective rules fixed before the Phase 5 A/B screens are inspected.
+schema_version: 1
+selection:
+  # Stochastic held-out validation is primary. Deterministic validation is the
+  # tie-break, and health checks are eligibility gates rather than rank inputs.
+  minimum_stochastic_margin: 0.01
+  require_disjoint_confidence_intervals: true
+  confidence_interval_field: success_rate_puzzle_bootstrap_95
+  consistent_lead_checkpoints: 2
+  deterministic_non_regression_tolerance: 0.02
+  multi_robot_non_regression_tolerance: 0.02
+  required_robot_bands: [2, 3]
+  require_zero_no_movement: true
+  require_zero_invalid_actions: true
+  # If uncertainty overlaps or the recent curves disagree, spend the extra
+  # compute instead of prematurely eliminating a potentially slower learner.
+  retain_all_on_ambiguity: true
+rungs:
+  512000:
+    target_survivors: 1
+    promotion_checkpoints: [512000, 1024000, 2048000]
+  2048000:
+    target_survivors: 1
+    promotion_checkpoints: [2048000, 3072000, 4096000, 5120000, 6144000, 7168000, 8192000, 9216000, 10240000]
+    plateau:
+      metric: validation_stochastic_success_rate
+      minimum_timesteps: 4096000
+      patience_checkpoints: 3
+      minimum_delta: 0.01
