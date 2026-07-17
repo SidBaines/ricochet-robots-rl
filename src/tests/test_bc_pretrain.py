@@ -3,7 +3,14 @@
 import numpy as np
 import pytest
 
-from src.benchmarking.phase2 import Phase2Config, _bc_dataset, _bc_pretrain, _build_model, _fixture_attempt
+from src.benchmarking.phase2 import (
+    Phase2Config,
+    _bc_dataset,
+    _bc_dataset_impl,
+    _bc_pretrain,
+    _build_model,
+    _fixture_attempt,
+)
 
 
 def _small_config(**overrides):
@@ -117,3 +124,50 @@ def test_masked_bc_tracks_validation_and_restores_best_epoch(bc_apply_action_mas
 def test_bc_action_mask_loss_requires_maskable_policy() -> None:
     with pytest.raises(ValueError, match="bc_apply_action_masks requires"):
         _small_config(bc_apply_action_masks=True)
+
+
+def test_bc_device_metric_accumulation_preserves_model_update() -> None:
+    """The synchronization optimization must not alter the supervised step."""
+    import copy
+
+    import torch
+    from stable_baselines3.common.env_util import make_vec_env
+
+    from src.env.ricochet_env import RicochetRobotsEnv
+
+    config = _small_config(
+        bc_pretrain_epochs=1,
+        bc_batch_size=4,
+        bc_reinitialize_action_head=False,
+    )
+    puzzles = _labelled_puzzles(config)
+    spec = config.environment_spec(0)
+    vec_env = make_vec_env(lambda: RicochetRobotsEnv(**spec.to_env_kwargs()), n_envs=1, seed=0)
+    reference = _build_model(vec_env, config, seed=0, device="cpu")
+    optimized = _build_model(vec_env, config, seed=1, device="cpu")
+    optimized.policy.load_state_dict(copy.deepcopy(reference.policy.state_dict()))
+
+    observations, actions, _ = _bc_dataset_impl(puzzles, config, seed=0, include_masks=False)
+    obs_tensor = torch.as_tensor(observations, dtype=torch.float32)
+    action_tensor = torch.as_tensor(actions)
+    optimizer = torch.optim.Adam(reference.policy.parameters(), lr=config.bc_learning_rate)
+    order = torch.randperm(len(action_tensor), generator=torch.Generator().manual_seed(0))
+    reference_loss = 0.0
+    reference_correct = 0
+    for start in range(0, len(order), config.bc_batch_size):
+        index = order[start : start + config.bc_batch_size]
+        distribution = reference.policy.get_distribution(obs_tensor[index])
+        loss = -distribution.log_prob(action_tensor[index]).mean()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        reference_loss += float(loss.detach()) * len(index)
+        predicted = distribution.distribution.probs.argmax(dim=-1)
+        reference_correct += int((predicted == action_tensor[index]).sum())
+
+    stats = _bc_pretrain(optimized, puzzles, config, seed=0, device="cpu")
+    assert stats["epochs"][0]["loss"] == pytest.approx(reference_loss / len(actions), abs=1e-6)
+    assert stats["epochs"][0]["accuracy"] == pytest.approx(reference_correct / len(actions))
+    for name, parameter in reference.policy.state_dict().items():
+        assert torch.equal(parameter, optimized.policy.state_dict()[name]), name
+    vec_env.close()

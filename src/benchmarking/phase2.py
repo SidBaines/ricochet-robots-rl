@@ -11,8 +11,7 @@ import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
-from contextlib import contextmanager, nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Sequence
@@ -109,6 +108,7 @@ class Phase2Config:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     validation_episodes_per_puzzle: int = 1
+    evaluation_batch_size: int = 64
     validation_bootstrap_samples: int = 0
     fixed_validation_seeds: bool = False
     final_stochastic_episodes_per_puzzle: int = 5
@@ -159,6 +159,8 @@ class Phase2Config:
             raise ValueError("bc_apply_action_masks requires use_action_masking")
         if self.validation_bootstrap_samples < 0:
             raise ValueError("validation_bootstrap_samples must be non-negative")
+        if self.evaluation_batch_size <= 0:
+            raise ValueError("evaluation_batch_size must be positive")
         if self.select_checkpoint_by_validation and not self.save_checkpoint_weights:
             raise ValueError("select_checkpoint_by_validation requires save_checkpoint_weights")
         if self.health_probe_puzzles <= 0:
@@ -880,27 +882,173 @@ def summarize_records(
     return summary
 
 
-@contextmanager
-def _isolated_model_rng(seed: int) -> Iterator[None]:
-    """Make stochastic evaluation repeatable without perturbing later training."""
+@dataclass
+class _BatchedModelEpisode:
+    """Mutable state for one independently seeded model-evaluation episode."""
+
+    index: int
+    puzzle: PuzzleMetadata
+    env: RicochetRobotsEnv
+    observation: np.ndarray
+    rng: np.random.Generator
+    terminated: bool = False
+    truncated: bool = False
+    stopped: bool = False
+    episode_return: float = 0.0
+    actions: List[int] = field(default_factory=list)
+    no_movement: int = 0
+    invalid_actions: int = 0
+
+    @property
+    def done(self) -> bool:
+        return self.terminated or self.truncated or self.stopped
+
+
+def _model_episode_rng(seed: int, puzzle: PuzzleMetadata, repeat: int) -> np.random.Generator:
+    """Give each episode a stable RNG stream independent of evaluation batching."""
+    payload = f"{seed}:{_puzzle_id(puzzle)}:{repeat}".encode("utf-8")
+    episode_seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
+    return np.random.default_rng(episode_seed)
+
+
+def _batched_model_actions(
+    model: Any,
+    observations: np.ndarray,
+    action_masks: np.ndarray | None,
+    *,
+    deterministic: bool,
+    episode_rngs: Sequence[np.random.Generator],
+) -> np.ndarray:
+    """Predict a discrete action batch without batch-coupled stochastic RNG."""
+    if deterministic:
+        predict_kwargs: Dict[str, Any] = {"deterministic": True}
+        if action_masks is not None:
+            predict_kwargs["action_masks"] = action_masks
+        actions, _ = model.predict(observations, **predict_kwargs)
+        return np.asarray(actions, dtype=np.int64).reshape(-1)
+
     import torch
 
-    cpu_state = torch.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    mps_state = torch.mps.get_rng_state() if torch.backends.mps.is_available() else None
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if torch.backends.mps.is_available():
-        torch.mps.manual_seed(seed)
-    try:
-        yield
-    finally:
-        torch.set_rng_state(cpu_state)
-        if cuda_states is not None:
-            torch.cuda.set_rng_state_all(cuda_states)
-        if mps_state is not None:
-            torch.mps.set_rng_state(mps_state)
+    policy = model.policy
+    policy.set_training_mode(False)
+    obs_tensor, _ = policy.obs_to_tensor(observations)
+    with torch.no_grad():
+        distribution = policy.get_distribution(obs_tensor)
+        if action_masks is not None:
+            if not hasattr(distribution, "apply_masking"):
+                raise TypeError("Action-masked evaluation requires a maskable policy distribution")
+            distribution.apply_masking(action_masks)
+        categorical = getattr(distribution, "distribution", None)
+        probabilities_tensor = getattr(categorical, "probs", None)
+        if probabilities_tensor is None:
+            raise TypeError("Batched evaluation requires a discrete categorical policy")
+        probabilities = probabilities_tensor.detach().cpu().numpy()
+
+    actions: List[int] = []
+    for probability, rng in zip(probabilities, episode_rngs, strict=True):
+        normalized = np.asarray(probability, dtype=np.float64)
+        total = float(normalized.sum())
+        if not np.isfinite(normalized).all() or total <= 0.0:
+            raise RuntimeError("Policy produced invalid action probabilities during evaluation")
+        normalized /= total
+        actions.append(int(rng.choice(len(normalized), p=normalized)))
+    return np.asarray(actions, dtype=np.int64)
+
+
+def _batched_episode_record(state: _BatchedModelEpisode) -> Dict[str, Any]:
+    success = bool(state.terminated and not state.truncated)
+    return {
+        "controller": "model",
+        "puzzle_id": _puzzle_id(state.puzzle),
+        "layout_id": _layout_id(state.puzzle),
+        "optimal_length": int(state.puzzle.optimal_length),
+        "robots_moved": int(state.puzzle.robots_moved),
+        "success": success,
+        "episode_length": len(state.actions),
+        "return": state.episode_return,
+        "optimality_gap": len(state.actions) - int(state.puzzle.optimal_length) if success else None,
+        "no_movement_actions": state.no_movement,
+        "invalid_actions": state.invalid_actions,
+        "actions": state.actions,
+    }
+
+
+def _evaluate_model_batched(
+    puzzles: Sequence[PuzzleMetadata],
+    environment_spec: EnvironmentSpec,
+    *,
+    repeats: int,
+    seed: int,
+    model: Any,
+    deterministic: bool,
+    action_masking: bool,
+    batch_size: int,
+) -> List[Dict[str, Any]]:
+    """Advance independent fixed-puzzle episodes in batched policy calls."""
+    jobs = [
+        (puzzle, repeat)
+        for puzzle in puzzles
+        for repeat in range(repeats)
+    ]
+    records: List[Dict[str, Any] | None] = [None] * len(jobs)
+    for chunk_start in range(0, len(jobs), batch_size):
+        states: List[_BatchedModelEpisode] = []
+        for offset, (puzzle, repeat) in enumerate(jobs[chunk_start : chunk_start + batch_size]):
+            layout = create_fixed_layout_from_seed(puzzle)
+            env = RicochetRobotsEnv(**environment_spec.to_env_kwargs(fixed_layout=layout))
+            observation, _ = env.reset()
+            states.append(
+                _BatchedModelEpisode(
+                    index=chunk_start + offset,
+                    puzzle=puzzle,
+                    env=env,
+                    observation=np.asarray(observation),
+                    rng=_model_episode_rng(seed, puzzle, repeat),
+                )
+            )
+        try:
+            while True:
+                active = [state for state in states if not state.done]
+                if not active:
+                    break
+                observations = np.stack([state.observation for state in active])
+                masks = (
+                    np.stack([state.env.action_masks() for state in active])
+                    if action_masking
+                    else None
+                )
+                actions = _batched_model_actions(
+                    model,
+                    observations,
+                    masks,
+                    deterministic=deterministic,
+                    episode_rngs=[state.rng for state in active],
+                )
+                for state, action_value in zip(active, actions, strict=True):
+                    action = int(action_value)
+                    before = dict(state.env.get_board().robot_positions)
+                    try:
+                        observation, reward, terminated, truncated, _ = state.env.step(action)
+                    except ValueError:
+                        state.invalid_actions += 1
+                        state.stopped = True
+                        continue
+                    after = state.env.get_board().robot_positions
+                    if before == after:
+                        state.no_movement += 1
+                    state.observation = np.asarray(observation)
+                    state.episode_return += float(reward)
+                    state.actions.append(action)
+                    state.terminated = bool(terminated)
+                    state.truncated = bool(truncated)
+        finally:
+            for state in states:
+                state.env.close()
+        for state in states:
+            records[state.index] = _batched_episode_record(state)
+    if any(record is None for record in records):
+        raise AssertionError("Batched evaluation failed to produce every episode record")
+    return [record for record in records if record is not None]
 
 
 def evaluate_controller(
@@ -914,13 +1062,32 @@ def evaluate_controller(
     deterministic: bool = True,
     bootstrap_samples: int = 0,
     action_masking: bool = False,
+    batch_size: int = 64,
 ) -> Dict[str, Any]:
+    if episodes_per_puzzle <= 0:
+        raise ValueError("episodes_per_puzzle must be positive")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     rng = np.random.default_rng(seed)
-    records: List[Dict[str, Any]] = []
     started = time.perf_counter()
-    repeats = 1 if controller == "oracle" else episodes_per_puzzle
-    rng_context = _isolated_model_rng(seed) if controller == "model" else nullcontext()
-    with rng_context:
+    # Repeating a deterministic policy on a fixed deterministic puzzle only
+    # duplicates the same trajectory and falsely inflates episode counts.
+    repeats = 1 if controller == "oracle" or (controller == "model" and deterministic) else episodes_per_puzzle
+    if controller == "model":
+        if model is None:
+            raise ValueError("Model evaluation requires a model")
+        records = _evaluate_model_batched(
+            puzzles,
+            environment_spec,
+            repeats=repeats,
+            seed=seed,
+            model=model,
+            deterministic=deterministic,
+            action_masking=action_masking,
+            batch_size=batch_size,
+        )
+    else:
+        records = []
         for puzzle in puzzles:
             for _ in range(repeats):
                 records.append(
@@ -1184,7 +1351,26 @@ def _bc_pretrain(
     )
     obs_tensor = torch.as_tensor(observations, dtype=torch.float32, device=device)
     action_tensor = torch.as_tensor(actions, device=device)
-    mask_tensor = torch.as_tensor(action_masks, device=device) if action_masks is not None else None
+    # The unmasked BC objective still builds masks so every stored expert
+    # action is validated, but it must not transfer or randomly gather masks
+    # that the loss will never consume.
+    mask_tensor = (
+        torch.as_tensor(action_masks, device=device)
+        if config.bc_apply_action_masks and action_masks is not None
+        else None
+    )
+    validation_tensors = None
+    if validation_data is not None:
+        val_observations, val_actions, val_masks = validation_data
+        validation_tensors = (
+            torch.as_tensor(val_observations, dtype=torch.float32, device=device),
+            torch.as_tensor(val_actions, device=device),
+            (
+                torch.as_tensor(val_masks, device=device)
+                if config.bc_apply_action_masks and val_masks is not None
+                else None
+            ),
+        )
     # PPO's action head ships with orthogonal gain 0.01, which scales all
     # upstream supervised gradients down ~100x and leaves cross-entropy stuck
     # on the uniform plateau. Structured BC runs explicitly opt into a larger
@@ -1207,31 +1393,30 @@ def _bc_pretrain(
         return distribution
 
     def validation_metrics() -> tuple[float, float] | None:
-        if validation_data is None:
+        if validation_tensors is None:
             return None
-        val_observations, val_actions, val_masks = validation_data
-        total_loss = 0.0
-        total_correct = 0
+        val_observations, val_actions, val_masks = validation_tensors
+        total_loss = torch.zeros((), dtype=torch.float32, device=device)
+        total_correct = torch.zeros((), dtype=torch.int64, device=device)
         with torch.no_grad():
             for start in range(0, len(val_actions), config.bc_batch_size):
                 stop = start + config.bc_batch_size
-                batch_obs = torch.as_tensor(val_observations[start:stop], dtype=torch.float32, device=device)
-                batch_actions = torch.as_tensor(val_actions[start:stop], device=device)
-                batch_masks = (
-                    torch.as_tensor(val_masks[start:stop], device=device) if val_masks is not None else None
-                )
+                batch_obs = val_observations[start:stop]
+                batch_actions = val_actions[start:stop]
+                batch_masks = val_masks[start:stop] if val_masks is not None else None
                 distribution = distribution_for(batch_obs, batch_masks)
                 loss = -distribution.log_prob(batch_actions).mean()
-                total_loss += float(loss) * len(batch_actions)
+                total_loss.add_(loss.detach() * len(batch_actions))
                 predicted = distribution.distribution.probs.argmax(dim=-1)
-                total_correct += int((predicted == batch_actions).sum())
-        return total_loss / len(val_actions), total_correct / len(val_actions)
+                total_correct.add_((predicted == batch_actions).sum())
+        totals = torch.stack((total_loss, total_correct.to(dtype=torch.float32))).cpu().numpy()
+        return float(totals[0] / len(val_actions)), float(totals[1] / len(val_actions))
 
     model.policy.train()
     for epoch in range(config.bc_pretrain_epochs):
         order = torch.randperm(len(action_tensor), generator=generator).to(device)
-        total_loss = 0.0
-        total_correct = 0
+        total_loss = torch.zeros((), dtype=torch.float32, device=device)
+        total_correct = torch.zeros((), dtype=torch.int64, device=device)
         for start in range(0, len(order), config.bc_batch_size):
             index = order[start : start + config.bc_batch_size]
             distribution = distribution_for(
@@ -1240,18 +1425,21 @@ def _bc_pretrain(
             )
             log_prob = distribution.log_prob(action_tensor[index])
             loss = -log_prob.mean()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-            total_loss += float(loss.detach()) * len(index)
+            total_loss.add_(loss.detach() * len(index))
             predicted = distribution.distribution.probs.argmax(dim=-1)
-            total_correct += int((predicted == action_tensor[index]).sum())
+            total_correct.add_((predicted == action_tensor[index]).sum())
+        totals = torch.stack((total_loss, total_correct.to(dtype=torch.float32))).cpu().numpy()
+        mean_loss = float(totals[0] / len(action_tensor))
+        mean_accuracy = float(totals[1] / len(action_tensor))
         val_metrics = validation_metrics()
         epoch_stats: Dict[str, float] = {
-            "loss": total_loss / len(action_tensor),
-            "accuracy": total_correct / len(action_tensor),
-            "train_loss": total_loss / len(action_tensor),
-            "train_accuracy": total_correct / len(action_tensor),
+            "loss": mean_loss,
+            "accuracy": mean_accuracy,
+            "train_loss": mean_loss,
+            "train_accuracy": mean_accuracy,
         }
         if val_metrics is not None:
             epoch_stats["validation_loss"] = val_metrics[0]
@@ -1636,6 +1824,7 @@ def train_overfit_milestone(
             model=model,
             deterministic=True,
             action_masking=config.use_action_masking,
+            batch_size=config.evaluation_batch_size,
         )
         stochastic_eval = evaluate_controller(
             "model",
@@ -1646,6 +1835,7 @@ def train_overfit_milestone(
             model=model,
             deterministic=False,
             action_masking=config.use_action_masking,
+            batch_size=config.evaluation_batch_size,
         )
         curve.append(
             {
@@ -1811,6 +2001,7 @@ def train_seed(
             deterministic=True,
             bootstrap_samples=config.validation_bootstrap_samples,
             action_masking=config.use_action_masking,
+            batch_size=config.evaluation_batch_size,
         )
         training_stochastic_eval = evaluate_controller(
             "model",
@@ -1822,6 +2013,7 @@ def train_seed(
             deterministic=False,
             bootstrap_samples=config.validation_bootstrap_samples,
             action_masking=config.use_action_masking,
+            batch_size=config.evaluation_batch_size,
         )
         deterministic_eval = evaluate_controller(
             "model",
@@ -1833,6 +2025,7 @@ def train_seed(
             deterministic=True,
             bootstrap_samples=config.validation_bootstrap_samples,
             action_masking=config.use_action_masking,
+            batch_size=config.evaluation_batch_size,
         )
         stochastic_eval = evaluate_controller(
             "model",
@@ -1844,6 +2037,7 @@ def train_seed(
             deterministic=False,
             bootstrap_samples=config.validation_bootstrap_samples,
             action_masking=config.use_action_masking,
+            batch_size=config.evaluation_batch_size,
         )
         counterfactual_unmasked = None
         if config.evaluate_both_mask_modes:
@@ -1858,6 +2052,7 @@ def train_seed(
                     deterministic=True,
                     bootstrap_samples=config.validation_bootstrap_samples,
                     action_masking=False,
+                    batch_size=config.evaluation_batch_size,
                 )["summary"],
                 "stochastic": evaluate_controller(
                     "model",
@@ -1869,6 +2064,7 @@ def train_seed(
                     deterministic=False,
                     bootstrap_samples=config.validation_bootstrap_samples,
                     action_masking=False,
+                    batch_size=config.evaluation_batch_size,
                 )["summary"],
             }
         point = {
@@ -1956,6 +2152,7 @@ def train_seed(
                 deterministic=True,
                 bootstrap_samples=config.validation_bootstrap_samples,
                 action_masking=config.use_action_masking,
+                batch_size=config.evaluation_batch_size,
             ),
             "stochastic": evaluate_controller(
                 "model",
@@ -1967,6 +2164,7 @@ def train_seed(
                 deterministic=False,
                 bootstrap_samples=config.validation_bootstrap_samples,
                 action_masking=config.use_action_masking,
+                batch_size=config.evaluation_batch_size,
             ),
         }
         if config.evaluate_both_mask_modes:
@@ -1981,6 +2179,7 @@ def train_seed(
                     deterministic=True,
                     bootstrap_samples=config.validation_bootstrap_samples,
                     action_masking=False,
+                    batch_size=config.evaluation_batch_size,
                 ),
                 "stochastic": evaluate_controller(
                     "model",
@@ -1992,6 +2191,7 @@ def train_seed(
                     deterministic=False,
                     bootstrap_samples=config.validation_bootstrap_samples,
                     action_masking=False,
+                    batch_size=config.evaluation_batch_size,
                 ),
             }
         return evaluation
