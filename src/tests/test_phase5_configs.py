@@ -42,6 +42,7 @@ def test_phase5_screens_are_matched_except_for_declared_optimizer_bundle() -> No
     assert historical["initial_checkpoint_path"] == stable["initial_checkpoint_path"]
     assert historical["checkpoints"] == (0, 102400, 256000, 512000, 1024000, 2048000)
     assert historical["validation_episodes_per_puzzle"] == 5
+    assert historical["evaluation_batch_size"] == 64
     assert historical["fixed_validation_seeds"]
     assert historical["use_action_masking"]
     assert not historical["run_final_test"]
