@@ -6,13 +6,14 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 19:12 EDT
+- Updated: 2026-07-17 19:14 EDT
 - Branch: `sid-learnable-agent`
 - Phase: acceleration steps 2–8 complete; canonical 512k A/B rung next
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: none; the BC training-lever screen completed normally
+- Active experiment: launching `phase5_screen_a_rung1` to the predeclared 512k
+  boundary; recipe B will follow on the same machine
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -532,3 +533,12 @@ state changes. Append chronological entries; never rewrite historical entries.
   The 128×4 full comparison is retained as follow-up work if the canonical PPO
   recipe plateaus or after the first trustworthy promoted model exists. The
   sealed final test remains untouched.
+
+### 2026-07-17 19:14 EDT — canonical A/B rung launched
+
+- Start recipe A first, using `configs/phase5_screen_a_historical.yaml` and
+  output `artifacts/phase2_experiments/phase5_screen_a_rung1`. It begins from
+  the immutable canonical BC checkpoint and stops at 512k by configuration.
+- Recipe B will run sequentially after A so the single saturated MPS device is
+  not contended. Adjudication will consume both completed results and the
+  already-committed prospective rules; the sealed final test remains disabled.
