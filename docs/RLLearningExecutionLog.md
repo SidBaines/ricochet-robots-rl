@@ -6,7 +6,7 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 16:35 EDT
+- Updated: 2026-07-17 17:10 EDT
 - Branch: `sid-learnable-agent`
 - Phase: canonical BC retry 1 active
 - Latest completed commit: `baecf88 fix: preserve full contrast in BC loss`
@@ -22,8 +22,9 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: verify retry epoch 1 reproduces the 15% unmasked reference,
-  then monitor held-out BC loss until best-epoch selection and step-0 rollout
+- Current action: leave the canonical BC retry undisturbed while implementing
+  BC/evaluation throughput improvements; then audit best-epoch selection and
+  step-0 rollout when the active run finishes
 - Exact monitor command: `tail -n 50 artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1.log`
 
 ## Locked decisions
@@ -301,3 +302,27 @@ state changes. Append chronological entries; never rewrite historical entries.
   existing checkpoints incompatible. Resume only after the current
   structured-plane recipe is frozen and reproduced; the active canonical BC
   retry was not changed or interrupted.
+
+### 2026-07-17 17:10 EDT — training-acceleration implementation authorized
+
+- User authorized implementation, while the canonical BC retry continues, of:
+  1. low-risk BC synchronization and tensor-caching fixes;
+  2. deterministic-evaluation deduplication; and
+  3. batched evaluation.
+- The active `phase5_canonical_bc_seed11_retry1` process and its artifacts must
+  not be modified or interrupted. The completed run remains the unchanged
+  reference for parity and timing comparisons.
+- After those changes are implemented and verified, continue in this explicit
+  order:
+  1. benchmark PPO rollout geometry at `16×128`, `32×64`, and `64×32` for a
+     bounded 100–200k steps per candidate;
+  2. implement true resumable promotion, restoring optimizer, timestep,
+     schedule, RNG, and curriculum state;
+  3. add predeclared successive-halving and plateau-stopping rules; and
+  4. only then test larger BC batches, mixed precision, and smaller models.
+- Acceptance gates for the current work package: BC model-update and metric
+  parity within declared numerical tolerances; one deterministic episode per
+  fixed puzzle with unchanged aggregate meaning; batched evaluator record and
+  aggregation parity, deterministic reproducibility, batch-width-invariant
+  stochastic RNG behavior, action-mask parity, and materially improved
+  measured evaluation throughput.
