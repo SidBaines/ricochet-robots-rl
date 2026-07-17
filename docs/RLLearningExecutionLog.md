@@ -6,23 +6,24 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 18:28 EDT
+- Updated: 2026-07-17 18:30 EDT
 - Branch: `sid-learnable-agent`
-- Phase: acceleration steps 2–7 complete; controlled batch/precision/model tests next
-- Latest completed commit: `ba36356 feat: predeclare Phase 5 allocation rules`
+- Phase: acceleration steps 2–7 complete; bounded batch/precision/model quality screen active
+- Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: none
-- Last test gate: 126 passed, 9 intentionally skipped, 3 benign checkpoint or
-  small-rollout warnings in 15.65s
+- Active experiment: `phase5_bc_training_lever_screen`, PID 51569; batch 2,048
+  complete and batch 4,096 training
+- Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
+  small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: benchmark larger BC batches, mixed precision, and smaller
-  models as separate controlled factors; do not silently change the recipe
+- Current action: finish the five-epoch batch 4,096, FP16, 128×4, and 96×4
+  comparisons; do not silently change the canonical recipe
 - Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
   SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
@@ -462,3 +463,34 @@ state changes. Append chronological entries; never rewrite historical entries.
   plateau recovery/reset semantics. Full gate: 126 passed, 9 intentionally
   skipped. No A/B learning results have yet been inspected and the final test
   remains sealed.
+
+### 2026-07-17 18:30 EDT — bounded training-lever screen in progress
+
+- Commit `476af90` adds guarded MPS/CUDA FP16 autocast plus gradient scaling to
+  BC, a real-policy forward/backward throughput benchmark, and a restartable
+  five-epoch held-out screen. Default BC remains FP32 and the canonical config
+  is unchanged. Full gate before launch: 129 passed, 9 intentionally skipped.
+- MPS kernel results for the real 6.15M-parameter policy:
+  - batch 1,024 / 2,048 / 4,096 FP32: 1,856 / 1,867 / 1,868 examples/s, so
+    larger batches provide effectively no throughput benefit while using up to
+    9.19GB driver-allocated memory;
+  - batch-1,024 FP16 autocast: 4,215 examples/s (**2.27×**), with finite
+    losses, gradients, and parameters in the bounded update test;
+  - 128×4 and 96×4 FP32: 2,721 and 3,041 examples/s (**1.47×** and
+    **1.64×**), with 5.56M and 5.04M parameters respectively.
+- The microbenchmark is throughput/numerical-health evidence only. The active
+  quality screen uses the exact Phase 4 fixture/split, seed, data, learning
+  rate, and five epochs, changing one declared factor at a time. It reuses the
+  original canonical run's first five epochs as the 1,024/128×6 FP32 reference.
+- Batch 2,048 completed in 993.7s and selected epoch 3: validation loss 2.189,
+  accuracy 25.13%, deterministic rollout 3.31%, stochastic rollout 8.76%.
+  Canonical equal-epoch reference reached loss 1.535 and accuracy 56.97% at
+  epoch 5, while the final canonical selected model reached 30.6% / 35.5%
+  deterministic/stochastic validation. Batch 2,048 is rejected as an
+  unretuned drop-in change; this does not rule out a separately retuned
+  learning-rate/update-budget recipe.
+- Batch 4,096 is currently training under PID 51569. Remaining variants, in
+  fixed order, are FP16 128×6, FP32 128×4, and FP32 96×4. Results persist per
+  variant under `artifacts/phase2_experiments/phase5_bc_training_lever_screen`,
+  so restarting the runner skips completed variants. The sealed final test
+  remains untouched.
