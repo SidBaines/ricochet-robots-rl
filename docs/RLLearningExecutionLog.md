@@ -6,23 +6,23 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 17:34 EDT
+- Updated: 2026-07-17 18:02 EDT
 - Branch: `sid-learnable-agent`
-- Phase: PPO rollout geometry selected; resumable promotion implementation next
-- Latest completed commit: `02cd3c6 exp: define PPO rollout geometry benchmark`
+- Phase: exact resumable promotion implemented; prospective allocation/stopping rules next
+- Latest completed commit: `0ff548d feat: add exact resumable PPO checkpoints`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
-- Last test gate: 114 passed, 9 intentionally skipped, 2 benign small-rollout
-  batch-size warnings in 13.79s
+- Last test gate: 118 passed, 9 intentionally skipped, 3 benign checkpoint or
+  small-rollout warnings in 16.76s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: implement exact resumable promotion state, retaining the
-  selected `16×128` rollout geometry
+- Current action: implement predeclared successive-halving and plateau-stopping
+  rules, retaining the selected `16×128` rollout geometry
 - Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
   SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
@@ -403,3 +403,32 @@ state changes. Append chronological entries; never rewrite historical entries.
 - The three bounded results are stored under
   `artifacts/phase2_experiments/phase5_geometry_{16x128,32x64,64x32}`. No final
   test was run.
+
+### 2026-07-17 18:02 EDT — exact resumable promotion implemented
+
+- Commit `0ff548d` adds a versioned `training_state.pkl` beside every saved PPO
+  checkpoint. It binds the sidecar to the model SHA-256 and records the
+  optimizer/model state already present in the SB3 archive plus the timestep,
+  update counters, training-critical config contract, schedule horizon,
+  curriculum level and rolling windows, per-worker puzzle-sampler streams,
+  vector-environment pending seeds/options, and Python/NumPy/Torch RNG state.
+- `resume_checkpoint_path` and `resume_state_path` are now distinct from a
+  weights-only `initial_checkpoint_path`. Resume rejects mismatched seeds,
+  worker geometry, devices, schedules, model hashes, timestep boundaries, or
+  training-critical configuration instead of silently starting a different
+  trajectory.
+- Checkpoints are canonical clean reset boundaries: all workers are reset and
+  the policy's last observations/episode-start flags are updated before the
+  archive is saved. Uninterrupted training follows that same boundary, while a
+  restored job reconstructs and hashes the identical reset observations. This
+  deliberately discards any uncounted partial episodes at checkpoint time but
+  makes promotion reproducible without serializing arbitrary nested Gym state.
+- The exact-resume regression interrupts a tiny PPO run, reconstructs fresh
+  model/env objects, and verifies that its next update matches uninterrupted
+  training in policy tensors, Adam state, last observations, timesteps,
+  curriculum, sampler streams, and global RNG. The full gate is 118 passed and
+  9 intentionally skipped.
+- Existing geometry artifacts predate this feature and are timing evidence,
+  not resumable promotion sources. Future Phase 5 checkpoint directories will
+  contain both `model.zip` and `training_state.pkl`; the canonical BC model
+  remains a valid weights-only initializer.
