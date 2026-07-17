@@ -6,27 +6,26 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 17:16 EDT
+- Updated: 2026-07-17 17:21 EDT
 - Branch: `sid-learnable-agent`
-- Phase: canonical BC retry 1 step-0 evaluation active; acceleration changes
-  implemented and under verification
-- Latest completed commit: `d4ec33e perf: batch evaluation and reduce BC syncs`
+- Phase: canonical BC complete; acceleration changes verified; PPO rollout
+  geometry benchmark next
+- Latest completed commit: `637f5d2 config: enable batched Phase 5 evaluation`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: `phase5_canonical_bc_seed11_retry1`, detached screen
-  session `phase5_bc_retry1` (screen PID 31858; launch-time Python PID 31861)
-- Last test gate: 110 passed, 9 intentionally skipped, 1 benign small-rollout
-  batch-size warning in 13.14s
+- Active experiment: none
+- Last test gate: 114 passed, 9 intentionally skipped, 2 benign small-rollout
+  batch-size warnings in 13.79s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: leave the canonical retry's launch-time serial evaluator
-  undisturbed; finish parity/throughput verification of the newly committed
-  BC and batched-evaluation implementation, then audit the step-0 artifacts
-- Exact monitor command: `tail -n 50 artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1.log`
+- Current action: define and run the bounded `16×128` / `32×64` / `64×32`
+  PPO rollout-geometry benchmark from the canonical step-0 checkpoint
+- Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
+  SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
 ## Locked decisions
 
@@ -350,3 +349,32 @@ state changes. Append chronological entries; never rewrite historical entries.
 - The active canonical process had already imported the launch-time code. It
   completed all 25 original BC epochs unchanged and is now running the old
   serial step-0 evaluator; its timing/result remains the intended reference.
+
+### 2026-07-17 17:21 EDT — canonical BC complete; acceleration gate passed
+
+- The unchanged canonical retry completed normally. BC built 210,947 training
+  and 35,091 validation pairs, took 6,026.2 seconds total (26.4 seconds for
+  dataset construction), and restored epoch 12: validation loss 1.3477 and
+  action accuracy 61.05%. Epoch 25 had overfit to 86.0% train accuracy but
+  validation loss 2.9709, confirming best-epoch restoration was necessary.
+- The saved step-0 checkpoint is
+  `phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
+  SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`.
+  Masked validation was 30.6% deterministic / 35.5% stochastic with zero
+  no-movement actions. The old serial unmasked counterfactual was 26.4% / 30.4%
+  with 41.1% / 22.9% no-movement rates. The final test remained sealed.
+- Full post-change gate: 114 passed, 9 intentionally skipped, two benign
+  tiny-rollout warnings. Commit `637f5d2` makes batch size 64 explicit in the
+  canonical and both matched screen configs.
+- Production MPS benchmark on the exact 121-puzzle validation suite and the
+  canonical checkpoint:
+  - deterministic batch 1: 1,878 steps in 4.2520s; batch 64: the exact same
+    records in 0.7425s (**5.73× faster**);
+  - stochastic batch 1: 9,610 steps in 21.9648s; batch 64: 9,610 steps in
+    2.1611s (**10.16× faster**), with identical record SHA-256
+    `dfbd5514bf6689526f61fa5651e2bb550609009c41d03b8f387c35666480f97b`.
+- Deterministic deduplication additionally changes five identical fixed-puzzle
+  repetitions to one, making that part of the Phase 5 evaluation approximately
+  29× cheaper than the previous serial five-repeat protocol. The current work
+  package's parity, reproducibility, masking, full-test, and measured-throughput
+  gates are satisfied.

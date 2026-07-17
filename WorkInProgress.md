@@ -368,3 +368,17 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - The old padded single-pixel `rgb_cell_image` + NatureCNN result remains a
   documented encoder mismatch, not a conclusion that RGB cannot work. Full
   rationale and resumption gates are in `docs/RLLearningExecutionLog.md`.
+
+### BC/evaluation acceleration and canonical checkpoint (2026-07-17 17:21 EDT)
+
+- Canonical retry completed and restored best BC epoch 12. Its step-0 masked
+  validation is 30.6% deterministic / 35.5% stochastic; checkpoint SHA-256 is
+  `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`.
+- BC now caches validation tensors on-device and removes per-minibatch metric
+  synchronizations and unused mask gathers. Evaluation runs one deterministic
+  episode per fixed puzzle and batches model calls with per-episode stochastic
+  RNG streams that are invariant to batch width.
+- Exact-suite MPS measurement: 5.73× deterministic evaluator speedup and
+  10.16× stochastic speedup at batch 64, with record-level parity. Full gate:
+  114 passed, 9 intentionally skipped. Next: bounded PPO rollout-geometry
+  comparison at `16×128`, `32×64`, and `64×32`.
