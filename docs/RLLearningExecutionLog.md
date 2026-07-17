@@ -6,14 +6,13 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 18:30 EDT
+- Updated: 2026-07-17 19:12 EDT
 - Branch: `sid-learnable-agent`
-- Phase: acceleration steps 2–7 complete; bounded batch/precision/model quality screen active
+- Phase: acceleration steps 2–8 complete; canonical 512k A/B rung next
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: `phase5_bc_training_lever_screen`, PID 51569; batch 2,048
-  complete and batch 4,096 training
+- Active experiment: none; the BC training-lever screen completed normally
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -22,8 +21,9 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: finish the five-epoch batch 4,096, FP16, 128×4, and 96×4
-  comparisons; do not silently change the canonical recipe
+- Current action: launch the matched canonical 512k A/B rung; retain 128×4 as
+  a separate promising architecture candidate rather than silently changing
+  the already-trained canonical initialization
 - Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
   SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
@@ -494,3 +494,41 @@ state changes. Append chronological entries; never rewrite historical entries.
   variant under `artifacts/phase2_experiments/phase5_bc_training_lever_screen`,
   so restarting the runner skips completed variants. The sealed final test
   remains untouched.
+
+### 2026-07-17 19:12 EDT — bounded training-lever screen complete
+
+- All five variants completed normally on the exact Phase 4 fixture/split and
+  the process exited. Results are persisted under
+  `artifacts/phase2_experiments/phase5_bc_training_lever_screen`.
+
+  | Variant | BC seconds | Best val loss / accuracy | Val det / stoch |
+  |---|---:|---:|---:|
+  | batch 2,048 | 993.7 | 2.189 / 25.13% | 3.31% / 8.76% |
+  | batch 4,096 | 998.5 | 1.854 / 42.97% | 9.09% / 12.89% |
+  | FP16 128×6 | 953.6 | 1.463 / 56.77% | 22.31% / **26.61%** |
+  | FP32 128×4 | 687.6 | **1.460 / 58.68%** | **23.14%** / 24.63% |
+  | FP32 96×4 | **491.6** | 1.504 / 57.92% | 18.18% / 24.79% |
+
+- The equal-five-epoch canonical reference was validation loss 1.535 and
+  accuracy 56.97%. Its launch-time run did not save an epoch-5 rollout model,
+  so only supervised metrics are directly equal-epoch comparable; the final
+  restored epoch-12 canonical model achieved 30.6% / 35.5% validation rollout
+  success and must not be compared as though it had only five epochs.
+- Decision on larger batches: reject 2,048 and 4,096 as unretuned drop-in
+  changes. They did not improve kernel throughput and substantially reduced
+  supervised and rollout quality by cutting optimizer updates per epoch.
+- Decision on FP16: numerical and learning quality passed the bounded screen,
+  but end-to-end BC time improved only 4.5% relative to the similarly sized
+  FP32 lever runs despite a 2.27× isolated-kernel result. Keep it experimental
+  until profiler-guided scaler/indexing work and a full validation run; do not
+  alter PPO precision or the canonical recipe yet.
+- Decision on smaller models: 128×4 is the best bounded speed/quality tradeoff
+  (30.8% less BC time than the full network, better equal-epoch validation
+  loss/accuracy, and the best deterministic rollout of the smaller models).
+  96×4 is fastest but loses deterministic rollout quality. Neither replaces
+  the canonical checkpoint without a longer BC and PPO quality comparison.
+- The performance-first critical path now returns to the already-trained
+  canonical 128×6 initialization and the predeclared 512k A/B optimizer rung.
+  The 128×4 full comparison is retained as follow-up work if the canonical PPO
+  recipe plateaus or after the first trustworthy promoted model exists. The
+  sealed final test remains untouched.
