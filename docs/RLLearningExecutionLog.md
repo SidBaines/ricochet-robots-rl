@@ -6,7 +6,7 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 15:35 EDT
+- Updated: 2026-07-17 16:35 EDT
 - Branch: `sid-learnable-agent`
 - Phase: canonical BC retry 1 active
 - Latest completed commit: `baecf88 fix: preserve full contrast in BC loss`
@@ -52,6 +52,7 @@ state changes. Append chronological entries; never rewrite historical entries.
 | Relational action head | High-cost architecture change | Data interventions leave a material train/validation blocker gap |
 | Horizon/termination ablation | Must not be confounded with masking | Masked recipe frozen and timeout/terminal-value telemetry available |
 | DRC/recurrent comparison | Feed-forward baseline must be trustworthy first | Final feed-forward three-seed result complete |
+| Grid-aligned RGB-sprite observation comparison | Performance-first work currently uses the lossless structured planes; the old 40×40 RGB-cell result was confounded by a 17×17 single-pixel board, black padding, and NatureCNN's aggressive strides | Freeze and reproduce the structured-plane recipe; add renderer/encoder contract tests; regenerate BC data; compare observations before adding recurrence/DRC |
 
 ## Chronological log
 
@@ -269,3 +270,34 @@ state changes. Append chronological entries; never rewrite historical entries.
   4.4%/8.5% baselines, MPS selection, and seed-11 startup. Epoch-1 acceptance
   reference is the exact audit/historical 15.0% training accuracy; a return to
   ~9% would stop the run for further diagnosis.
+
+### 2026-07-17 16:35 EDT — Sokoban-style RGB observations added to future work
+
+- Checked the primary source for the Sokoban work this repository builds on:
+  Guez et al., _An Investigation of Model-Free Planning_ ([paper](https://proceedings.mlr.press/v97/guez19a.html),
+  [official supplement](https://proceedings.mlr.press/v97/guez19a/guez19a-supp.pdf)).
+  Its visual input was not an uncontrolled natural screenshot. Each cell of a
+  fixed 10×10 Sokoban board was rendered as an 8×8 RGB sprite, giving an
+  80×80×3 observation. A two-layer encoder (32/32 channels, 8/4 kernels, 4/2
+  strides) deliberately recovered a 10×10×32 spatial tensor for the planning
+  core.
+- Deferred a controlled Ricochet observation ablation: current native-grid
+  structured planes versus a deterministic, cell-aligned RGB-sprite render.
+  Action masks remain a separate policy input/constraint. The comparison must
+  hold fixture, split, expert actions, rewards, masking, BC/PPO protocol,
+  evaluation seeds, budget, and selection rules fixed, and should match model
+  capacity closely enough for the observation encoding to be the main change.
+- Do not combine this first RGB comparison with DRC/recurrent changes. Start
+  with a spatial feed-forward encoder, then test DRC separately if RGB is
+  viable; otherwise observation encoding and internal planning depth would be
+  confounded.
+- The earlier `rgb_cell_image` failure does not settle this question. That run
+  centered a 17×17 single-pixel board in a 40×40 black canvas and fed it to
+  NatureCNN, whose stride-4 first layer aliased fine board geometry. A future
+  RGB encoder must have an explicit renderer-to-feature-map contract (ideally
+  one stable feature location per board cell), deterministic pixel/cache tests,
+  lossiness/injectivity checks, and throughput/memory measurements.
+- Changing observation tensors requires regenerating BC artifacts and makes
+  existing checkpoints incompatible. Resume only after the current
+  structured-plane recipe is frozen and reproduced; the active canonical BC
+  retry was not changed or interrupted.

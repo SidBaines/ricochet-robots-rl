@@ -352,3 +352,19 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - It retains mask validation and masked rollout/evaluation but uses the
   empirically restored full-contrast BC loss. Epoch 1 should reproduce the
   exact 15.0% audit reference before the remaining epochs are allowed to run.
+
+### Future RGB-sprite observation comparison (2026-07-17 16:35 EDT)
+
+- Verified the original Sokoban setup in Guez et al.'s _An Investigation of
+  Model-Free Planning_: 10×10 symbolic states were rendered with 8×8 RGB
+  sprites into 80×80×3 images, then encoded back to a 10×10 spatial feature
+  grid. This was a grid-aligned visual representation, not uncontrolled raw
+  screen capture.
+- Added a deferred, controlled comparison of current structured planes against
+  a Sokoban-style RGB-sprite renderer. It will reuse the frozen data split,
+  actions, rewards, masks, training/evaluation protocol, and budget; BC data
+  must be regenerated for the new tensors. The first comparison will keep a
+  feed-forward spatial encoder so RGB and DRC are not changed simultaneously.
+- The old padded single-pixel `rgb_cell_image` + NatureCNN result remains a
+  documented encoder mismatch, not a conclusion that RGB cannot work. Full
+  rationale and resumption gates are in `docs/RLLearningExecutionLog.md`.

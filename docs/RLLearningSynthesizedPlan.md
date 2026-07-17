@@ -81,5 +81,8 @@ green.
   augmentation, DAgger recovery states, and a relational action head.
 - Horizon/termination semantics ablation.
 - DRC/recurrent comparison.
+- Controlled structured-plane versus grid-aligned RGB-sprite observation
+  comparison, following the Sokoban setup in Guez et al. The observation
+  change and the DRC/recurrent architecture change must be tested separately.
 
 The execution log records prerequisites and resumption criteria for each item.
