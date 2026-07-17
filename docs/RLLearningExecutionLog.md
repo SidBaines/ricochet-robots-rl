@@ -6,24 +6,24 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 15:30 EDT
+- Updated: 2026-07-17 14:44 EDT
 - Branch: `sid-learnable-agent`
-- Phase: reverse-curriculum implementation complete; smoke pending
-- Latest completed commit: `915b87e feat: add calibrated reverse curriculum infrastructure`
+- Phase: reverse-curriculum smoke passed; preparing bounded 16×16 dry run
+- Latest completed commit: `661cadf fix: use supported wandb metric globs`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none
-- Last test gate: 104 passed, 9 intentionally skipped, 1 warning in 11.50s
+- Last test gate: 106 passed, 9 intentionally skipped, 1 benign small-rollout
+  batch-size warning in 11.21s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
   `3579113b230a04406ad8f17e5695c3a1fa0ea2145c0262f9da42b16b2162e130`
 - Immutable split: `c0e97329b1096f0531de49f3c0694162a811402fea54c7e2866553711d9dab79`
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: commit the W&B compatibility fix, then rerun the 8×8 smoke
-  in a fresh output directory
-- Exact next command: `.venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_reverse_smoke_8x8.yaml --bank-dir artifacts/phase2b_bank --output-dir artifacts/phase2_experiments/phase5_reverse_smoke_8x8_retry1`
-- Exact next command after handoff: `.venv-phase2/bin/python -m pytest src/tests/ -q`
+- Current action: commit the smoke result and validation-only CLI reporting
+  fix, then launch the bounded 16×16 reverse dry run
+- Exact next command: `.venv-phase2/bin/python src/scripts/run_phase2_benchmark.py --config configs/phase5_reverse_dryrun_16x16.yaml --bank-dir artifacts/phase4_bank --output-dir artifacts/phase2_experiments/phase5_reverse_dryrun_16x16`
 
 ## Locked decisions
 
@@ -74,7 +74,7 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Decision: full reverse training is deferred because the existing BC dataset
   already includes every on-plan state used by reverse resets.
 
-### 2026-07-17 14:05 EDT — observability and evaluation foundation complete
+### 2026-07-17 13:55 EDT — observability and evaluation foundation complete
 
 - Made requested/effective policy activation, orthogonal initialization, and
   BC action-head initialization explicit and persisted.
@@ -92,7 +92,7 @@ state changes. Append chronological entries; never rewrite historical entries.
   the exposed development-test suite. No model was evaluated.
 - Test gate: 92 passed, 9 legacy recurrent tests skipped.
 
-### 2026-07-17 14:45 EDT — movement masking and BC→PPO stability complete
+### 2026-07-17 14:12 EDT — movement masking and BC→PPO stability complete
 
 - Added exact, non-mutating movement masks to the base environment and both
   bank/curriculum wrapper paths. MaskablePPO now uses them during collection
@@ -116,7 +116,7 @@ state changes. Append chronological entries; never rewrite historical entries.
   isolated env probe), satisfying the <10% gate.
 - Test gate: 99 passed, 9 legacy recurrent tests skipped.
 
-### 2026-07-17 15:15 EDT — reverse infrastructure implemented; smoke queued
+### 2026-07-17 14:25 EDT — reverse infrastructure implemented; smoke queued
 
 - Added exact stored-plan prefix replay without bank mutation; every tested
   suffix reaches the goal in exactly its declared remaining distance.
@@ -133,7 +133,7 @@ state changes. Append chronological entries; never rewrite historical entries.
   `3579113b230a…`, split `c0e97329b109…`, unchanged.
 - Test gate: 103 passed, 9 legacy recurrent tests skipped.
 
-### 2026-07-17 15:30 EDT — smoke attempt 1 stopped before training
+### 2026-07-17 14:27 EDT — smoke attempt 1 stopped before training
 
 - Command used output `artifacts/phase2_experiments/phase5_reverse_smoke_8x8`.
 - W&B run `o5tjfizz` failed during initialization before step 0 because W&B
@@ -142,3 +142,28 @@ state changes. Append chronological entries; never rewrite historical entries.
   added a fake-W&B regression test enforcing the installed API contract.
 - No training steps ran, no checkpoint was produced, and no bank data changed.
 - Full gate after the fix: 104 passed, 9 legacy recurrent tests skipped.
+
+### 2026-07-17 14:44 EDT — 8×8 reverse smoke passed
+
+- Retry output: `artifacts/phase2_experiments/phase5_reverse_smoke_8x8_retry1`;
+  W&B run `vrzh40da`; split fingerprint `d22582f1d4cc…`.
+- The curriculum made all three required transitions by mastery and made zero
+  forced transitions: d1 at 3,100 episodes (frontier 74.5%), d2 at 6,700
+  cumulative episodes (71.0%), and d3 at 14,700 (70.0%). It reached the final
+  original-start stage with 286k+ training timesteps remaining.
+- Validation improved monotonically from 10.9% deterministic / 21.2%
+  stochastic at step 0, through 43.6% / 44.8% at 100,352 steps, to **65.5% /
+  67.9%** at 301,056. Final stochastic success by optimal length was
+  100%/68.9%/62.5%/56.3% for lengths 1/2/3/4. Masked invalid/no-movement rates
+  were zero. Throughput was 2,130 training steps/s.
+- Acceptance decision: pass. The reset construction, calibrated frontier
+  gating, transition bookkeeping, checkpointing, and W&B telemetry all worked
+  together in a real training run.
+- Found a presentation-only defect after success: validation-only runs printed
+  an aggregate “held-out 0%” because their sealed test aggregate is empty. The
+  report itself was correct. The CLI now explicitly prints selected validation
+  performance when the final test is sealed, with two regression tests; 11
+  targeted tests pass. Full gate: 106 passed, 9 intentionally skipped.
+- Next bounded check: run the 16×16 no-BC dry run for reset correctness,
+  throughput, and early curriculum behavior. It is not a model-quality result
+  and does not authorize the deferred full RL-only run.

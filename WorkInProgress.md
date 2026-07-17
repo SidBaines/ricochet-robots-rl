@@ -282,7 +282,7 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - Gate: 92 passed, 9 intentionally skipped. Detailed handoff remains in
   `docs/RLLearningExecutionLog.md`.
 
-### Training-time movement masking and BC stability (2026-07-17 14:45 EDT)
+### Training-time movement masking and BC stability (2026-07-17 14:12 EDT)
 
 - Implemented end-to-end MaskablePPO movement masking, wrapper forwarding,
   mask-aware BC/evaluation, held-out BC best-epoch selection, exact shared BC
@@ -294,3 +294,16 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   between-state logit variance) and healthy state dependence in Phase 4b.
 - Gate: 99 passed, 9 intentionally skipped. Next: reverse-curriculum machinery
   and its calibrated smoke tests; see `docs/RLLearningExecutionLog.md`.
+
+### Calibrated reverse-curriculum smoke passed (2026-07-17 14:44 EDT)
+
+- Implemented exact stored-plan suffix resets, deterministic weighted reverse
+  bands, frontier-only mastery windows, baseline-calibrated thresholds, and
+  explicit mastery-versus-forced transition telemetry.
+- The 8×8 301k-step smoke passed all three stages via mastery with zero forced
+  transitions. Validation improved from 10.9% deterministic / 21.2% stochastic
+  at step 0 to 65.5% / 67.9%; final masked invalid/no-movement rates were zero.
+- A bounded 16×16 no-BC dry run is next. The full 16×16 RL-only reverse run and
+  formal RL-only/BC-only/BC→RL comparison remain explicitly deferred; details,
+  commands, fingerprints, and the full deferred register are in
+  `docs/RLLearningExecutionLog.md`.
