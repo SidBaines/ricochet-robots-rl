@@ -89,6 +89,20 @@ def test_bc_requires_plane_observations() -> None:
         Phase2Config(bc_pretrain_epochs=1, obs_mode="rgb_cell_image", policy="stock_cnn")
 
 
+def test_bc_fp16_rejects_cpu_runtime() -> None:
+    from stable_baselines3.common.env_util import make_vec_env
+
+    from src.env.ricochet_env import RicochetRobotsEnv
+
+    config = _small_config(bc_precision="autocast_fp16")
+    spec = config.environment_spec(0)
+    vec_env = make_vec_env(lambda: RicochetRobotsEnv(**spec.to_env_kwargs()), n_envs=1, seed=0)
+    model = _build_model(vec_env, config, seed=0, device="cpu")
+    with pytest.raises(ValueError, match="MPS or CUDA"):
+        _bc_pretrain(model, [], config, seed=0, device="cpu")
+    vec_env.close()
+
+
 @pytest.mark.parametrize("bc_apply_action_masks", [False, True])
 def test_masked_bc_tracks_validation_and_restores_best_epoch(bc_apply_action_masks) -> None:
     from stable_baselines3.common.env_util import make_vec_env

@@ -89,6 +89,7 @@ class Phase2Config:
     bc_pretrain_epochs: int = 0
     bc_batch_size: int = 1024
     bc_learning_rate: float = 3e-4
+    bc_precision: str = "fp32"
     bc_max_puzzles: int | None = None
     bc_select_best_by_validation: bool = False
     initial_checkpoint_path: str | None = None
@@ -160,6 +161,8 @@ class Phase2Config:
             raise ValueError("bc_pretrain_epochs must be non-negative")
         if self.bc_pretrain_epochs > 0 and self.obs_mode != "image":
             raise ValueError("BC pretraining requires the structured-plane 'image' observation mode")
+        if self.bc_precision not in {"fp32", "autocast_fp16"}:
+            raise ValueError("bc_precision must be one of: fp32, autocast_fp16")
         if self.initial_checkpoint_path is not None and self.bc_pretrain_epochs > 0:
             raise ValueError("initial_checkpoint_path and BC pretraining are mutually exclusive")
         if self.resume_checkpoint_path is not None and self.bc_pretrain_epochs > 0:
@@ -1390,6 +1393,9 @@ def _bc_pretrain(
     """Behaviour-clone the policy on optimal plans before PPO fine-tuning."""
     import torch
 
+    use_mixed_precision = config.bc_precision == "autocast_fp16"
+    if use_mixed_precision and device not in {"mps", "cuda"}:
+        raise ValueError("autocast_fp16 BC requires an MPS or CUDA device")
     started = time.perf_counter()
     observations, actions, action_masks = _bc_dataset_impl(
         puzzles,
@@ -1441,6 +1447,7 @@ def _bc_pretrain(
         torch.nn.init.orthogonal_(model.policy.action_net.weight, gain=config.bc_action_head_gain)
         torch.nn.init.zeros_(model.policy.action_net.bias)
     optimizer = torch.optim.Adam(model.policy.parameters(), lr=config.bc_learning_rate)
+    scaler = torch.amp.GradScaler(device, enabled=use_mixed_precision)
     generator = torch.Generator().manual_seed(seed)
     history: List[Dict[str, float]] = []
     best_epoch: int | None = None
@@ -1466,8 +1473,13 @@ def _bc_pretrain(
                 batch_obs = val_observations[start:stop]
                 batch_actions = val_actions[start:stop]
                 batch_masks = val_masks[start:stop] if val_masks is not None else None
-                distribution = distribution_for(batch_obs, batch_masks)
-                loss = -distribution.log_prob(batch_actions).mean()
+                with torch.autocast(
+                    device_type=device,
+                    dtype=torch.float16,
+                    enabled=use_mixed_precision,
+                ):
+                    distribution = distribution_for(batch_obs, batch_masks)
+                    loss = -distribution.log_prob(batch_actions).mean()
                 total_loss.add_(loss.detach() * len(batch_actions))
                 predicted = distribution.distribution.probs.argmax(dim=-1)
                 total_correct.add_((predicted == batch_actions).sum())
@@ -1481,15 +1493,21 @@ def _bc_pretrain(
         total_correct = torch.zeros((), dtype=torch.int64, device=device)
         for start in range(0, len(order), config.bc_batch_size):
             index = order[start : start + config.bc_batch_size]
-            distribution = distribution_for(
-                obs_tensor[index],
-                mask_tensor[index] if mask_tensor is not None else None,
-            )
-            log_prob = distribution.log_prob(action_tensor[index])
-            loss = -log_prob.mean()
+            with torch.autocast(
+                device_type=device,
+                dtype=torch.float16,
+                enabled=use_mixed_precision,
+            ):
+                distribution = distribution_for(
+                    obs_tensor[index],
+                    mask_tensor[index] if mask_tensor is not None else None,
+                )
+                log_prob = distribution.log_prob(action_tensor[index])
+                loss = -log_prob.mean()
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total_loss.add_(loss.detach() * len(index))
             predicted = distribution.distribution.probs.argmax(dim=-1)
             total_correct.add_((predicted == action_tensor[index]).sum())
@@ -1551,6 +1569,7 @@ def _bc_pretrain(
         "action_head_reinitialized": config.bc_reinitialize_action_head,
         "action_head_gain": config.bc_action_head_gain,
         "loss_action_masking": config.bc_apply_action_masks,
+        "precision": config.bc_precision,
         "total_seconds": time.perf_counter() - started,
     }
 
@@ -2018,6 +2037,7 @@ _RESUME_CONTRACT_EXCLUDED_FIELDS = {
     "bc_batch_size",
     "bc_learning_rate",
     "bc_max_puzzles",
+    "bc_precision",
     "bc_pretrain_epochs",
     "bc_reinitialize_action_head",
     "bc_select_best_by_validation",

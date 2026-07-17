@@ -1,0 +1,24 @@
+# Bounded five-epoch BC quality screen. Each factor changes exactly one model
+# or training lever from the canonical seed-11 recipe; the sealed final test is
+# never run. The original canonical run supplies the FP32 1024/128x6 reference.
+schema_version: 1
+base_config: configs/phase5_canonical_bc_seed11_retry1.yaml
+reference_result: artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/results.json
+common_overrides:
+  bc_pretrain_epochs: 5
+  bc_precision: fp32
+  run_final_test: false
+  wandb_project: null
+  wandb_run_name: null
+variants:
+  batch2048:
+    bc_batch_size: 2048
+  batch4096:
+    bc_batch_size: 4096
+  autocast_fp16:
+    bc_precision: autocast_fp16
+  resnet128x4:
+    n_conv_layers: 4
+  resnet96x4:
+    conv_channels: 96
+    n_conv_layers: 4

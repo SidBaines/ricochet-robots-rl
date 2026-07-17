@@ -57,6 +57,8 @@ def test_phase2_config_validates_explicit_policy_and_checkpoint_controls() -> No
         Phase2Config(select_checkpoint_by_validation=True)
     with pytest.raises(ValueError, match="evaluation_batch_size"):
         Phase2Config(evaluation_batch_size=0)
+    with pytest.raises(ValueError, match="bc_precision"):
+        Phase2Config(bc_precision="tf32")
 
 
 def test_puzzle_bootstrap_clusters_repeated_episodes() -> None:
