@@ -12,8 +12,8 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: launching recipe A exact continuation from 2.048M toward
-  10.24M with prospective plateau stopping enabled
+- Active experiment: promoted recipe A seed 11, PID 42352, exactly resumed at
+  2.048M and training toward at most 10.24M with plateau stopping enabled
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
