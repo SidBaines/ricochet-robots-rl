@@ -18,3 +18,8 @@ final_eval_episodes: 3
 channels: 64
 n_blocks: 6
 device: auto
+policy_head: spatial
+stop_planes: true
+distance_plane: true
+wandb_project: ricochet-robots-rl
+wandb_run_name: groundup-e4-noshaping

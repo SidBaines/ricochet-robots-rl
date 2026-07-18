@@ -478,3 +478,21 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   99.7% stoch with 314k params (half of v2). ~3,500 steps/s.
 - E3 relaunched as v3 (16×16, spatial head), W&B run
   groundup-e3-16x16-scratch-v3.
+
+### E3 v3 COMPLETE: 16×16 from scratch, 78% on the sealed test split (2026-07-18)
+
+- Full run: 10M steps, 2.5 h wall-clock, 468k params, seed 11, no BC.
+- Validation (400 puzzles): **78.3% det / 79.6% stoch**. By length (det):
+  100/98/96/88/76/62/48/58% for L1–L8. By robots-moved: 90/68/60%.
+- **Sealed test split (480 puzzles, never used for any decision): 78.1% det /
+  80.9% stoch** — matches validation, no selection inflation. Baselines under
+  the identical masked protocol: random 12.2%, target-only 23.1%.
+- Reference: legacy from-scratch 3–7%; legacy BC→masked-PPO champion 39.7%
+  det on a reused 121-puzzle val suite (sealed confirmation never run).
+  Caveat: v3's observation is richer (stop/distance planes) — see the
+  helper-removal ladder in docs/GroundUpRLRedesign.md §4.
+- Curriculum frontier reached d=6 of 8; lengths 7–8 remain the gap (~50%).
+  Still climbing at budget end — a longer run would likely add points.
+- E4 ablation chain launched (2M steps each, sequential): no-shaping,
+  no-reverse, no-planes (flat head), all else matched to v3. Reference:
+  v3 curve was at ~63% @ 2.25M.

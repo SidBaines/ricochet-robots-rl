@@ -39,6 +39,8 @@ def main() -> None:
         gamma=train_config["gamma"],
         time_channel=train_config["time_channel"],
         canonical_identity=train_config["canonical_identity"],
+        stop_planes=train_config.get("stop_planes", False),
+        distance_plane=train_config.get("distance_plane", False),
     )
     puzzles = load_puzzles(
         train_config["bank_path"],

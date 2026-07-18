@@ -1,0 +1,25 @@
+# E4a: E3 recipe minus reward shaping, matched 2M budget (causal attribution).
+bank_path: artifacts/phase4_bank/size-16x16_numR4_ET2_CL2_gen10.parquet
+out_dir: artifacts/groundup
+run_name: e4_noplanes
+curriculum: reverse
+horizon: 32
+shaping_coef: 0.1
+seed: 11
+num_envs: 32
+n_steps: 128
+batch_size: 1024
+n_epochs: 4
+total_steps: 2000000
+eval_every: 250000
+eval_per_length: 25
+final_eval_per_length: 50
+final_eval_episodes: 3
+channels: 64
+n_blocks: 6
+device: auto
+policy_head: flat
+stop_planes: false
+distance_plane: false
+wandb_project: ricochet-robots-rl
+wandb_run_name: groundup-e4-noplanes
