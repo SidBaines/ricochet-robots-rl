@@ -6,14 +6,13 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-18 00:24 EDT
+- Updated: 2026-07-18 11:21 EDT
 - Branch: `sid-learnable-agent`
-- Phase: recipe A won at 2.048M; full promotion to at most 10.24M next
+- Phase: promoted seed-11 run complete; seed-expansion gates passed
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: promoted recipe A seed 11, PID 42352, exactly resumed at
-  2.048M and training toward at most 10.24M with plateau stopping enabled
+- Active experiment: none; promoted recipe A stopped prospectively at 6.144M
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -22,8 +21,8 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: run the promoted recipe A seed-11 trajectory, select its best
-  validation checkpoint, and apply the seed-expansion gates
+- Current action: freeze the recipe and prepare independent seeds 29 and 47;
+  keep the sealed confirmation untouched until those runs select checkpoints
 - Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
   SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
@@ -608,3 +607,30 @@ state changes. Append chronological entries; never rewrite historical entries.
   10.24M. Prospective plateau stopping begins no earlier than 4.096M, requires
   three non-improving eligible checkpoints, and defines material improvement
   as one stochastic-validation percentage point. Final test remains sealed.
+
+### 2026-07-18 11:21 EDT — promoted seed 11 complete; plateau and gates pass
+
+- The promoted continuation completed normally and stopped prospectively at
+  6.144M, rather than spending the full 10.24M budget. After the 2.048M best,
+  the three eligible checkpoints at 4.096M, 5.120M, and 6.144M failed to improve
+  stochastic validation by the declared one-point minimum, satisfying patience
+  three. The stopping boundary contains complete exact-resume files.
+- Validation curve (deterministic/stochastic): `39.67%/41.82%` at 2.048M,
+  `38.02%/40.17%` at 3.072M, `34.71%/35.70%` at 4.096M,
+  `33.88%/38.84%` at 5.120M, and `37.19%/38.68%` at 6.144M. Best-checkpoint
+  selection correctly retained 2.048M; later training never produced a
+  material validation improvement.
+- The promoted segment trained 4.096M new transitions in 6,170.4 seconds at
+  663.8 steps/s. Across A's three exact segments, PPO training consumed about
+  9,286 seconds (2h35m) for 6.144M total transitions. Plateau stopping saved
+  4.096M transitions, approximately another 1h43m at observed throughput.
+- The selected 2.048M checkpoint passes every seed-expansion gate: stochastic
+  validation 41.82% ≥ 36%, deterministic 39.67% ≥ 25%, two-robot
+  stochastic 42.86% versus BC-only 26.19%, three-robot 19.35% versus BC-only
+  12.26%, and exactly zero masked no-movement/invalid actions. Its clustered
+  stochastic 95% interval is 34.05%–49.75%.
+- Selected model:
+  `artifacts/phase2_experiments/phase5_screen_a_promoted_seed11/seed_11/checkpoints/step_2048000/model.zip`.
+  The run's final-test status is still `sealed_not_run`; no confirmation puzzle
+  has been evaluated. The next plan stage is independent seeds 29 and 47 under
+  the frozen recipe, followed by the single sealed confirmation evaluation.
