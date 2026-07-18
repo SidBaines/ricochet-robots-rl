@@ -133,6 +133,7 @@ def _resolve_device(requested: str) -> str:
 
 
 def build_and_train(config: TrainConfig) -> dict:
+    import torch.nn as nn
     from sb3_contrib import MaskablePPO
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
@@ -232,6 +233,10 @@ def build_and_train(config: TrainConfig) -> dict:
                 reduce_channels=config.reduce_channels,
             ),
             net_arch=dict(pi=[config.pi_head], vf=[config.vf_head]),
+            # SB3's default Tanh heads saturate on CNN features (constant
+            # value function; see E3 v1 diagnosis and the legacy Phase 5
+            # provenance which hit the identical failure).
+            activation_fn=nn.ReLU,
         ),
     )
     n_params = sum(p.numel() for p in model.policy.parameters())

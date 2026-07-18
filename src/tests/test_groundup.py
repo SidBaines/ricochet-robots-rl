@@ -235,3 +235,41 @@ def test_8x8_bank_loads():
     assert all(p.height == 8 and p.num_robots == 2 for p in puzzles)
     subset = stratified_subset(puzzles, 10, seed=0)
     assert len(subset) == 40  # 4 lengths x 10
+
+
+@needs_bank16
+def test_policy_heads_relu_and_bounded_features(puzzles16):
+    """Regression guard for the E3 v1 collapse: Tanh heads + unbounded features
+    saturated the value net into a constant. Heads must be ReLU and the
+    extractor must bound feature scale."""
+    import torch
+    import torch.nn as nn
+    from sb3_contrib import MaskablePPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from src.groundup.model import GridTrunk
+
+    config = EnvConfig()
+    env = DummyVecEnv([lambda: RicochetEnv(puzzles16[:20], config, seed=0)])
+    model = MaskablePPO(
+        "MlpPolicy",
+        env,
+        n_steps=8,
+        batch_size=8,
+        device="cpu",
+        policy_kwargs=dict(
+            features_extractor_class=GridTrunk,
+            features_extractor_kwargs=dict(features_dim=64, channels=16, n_blocks=1),
+            net_arch=dict(pi=[32], vf=[32]),
+            activation_fn=nn.ReLU,
+        ),
+    )
+    activations = [type(m) for m in model.policy.mlp_extractor.value_net]
+    assert nn.Tanh not in activations
+    assert nn.ReLU in activations
+    obs = env.reset()
+    with torch.no_grad():
+        feats = model.policy.extract_features(torch.as_tensor(obs))
+        if isinstance(feats, tuple):
+            feats = feats[0]
+    assert float(feats.abs().max()) < 50.0  # LayerNorm keeps features bounded

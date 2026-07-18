@@ -40,6 +40,15 @@ SB3 PPO on MPS. Reference environment: `.venv-phase2` (see README for setup).
   curriculum (`curriculum_stage_max_lengths`) with the stall safety-valve
   (`curriculum_max_episodes_per_stage`) rather than training on lengths 1–8
   uniformly.
+- **SB3's default Tanh MLP heads saturate on CNN features.** Unbounded ReLU
+  features (observed O(1000) at 16×16) drive every Tanh pre-activation past
+  ±2 → the value head collapses to a literally constant output and learning
+  stalls. Hit twice independently (legacy Phase 4 audit; groundup E3 v1).
+  Always pass `activation_fn=nn.ReLU` and bound feature scale (LayerNorm on
+  the extractor output). Regression test:
+  `src/tests/test_groundup.py::test_policy_heads_relu_and_bounded_features`.
+  Diagnostic signature: `V(s)` identical across states ⇒ check head
+  saturation before blaming exploration or curriculum.
 
 ## Conventions
 

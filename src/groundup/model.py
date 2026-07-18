@@ -43,11 +43,15 @@ class GridTrunk(BaseFeaturesExtractor):
             nn.ReLU(inplace=True),
         )
         self.blocks = nn.Sequential(*[_ResidualBlock(channels) for _ in range(n_blocks)])
+        # LayerNorm keeps the feature scale bounded: without it the residual
+        # trunk's features grew to O(1000) at 16x16 and saturated downstream
+        # Tanh heads into a constant value function (E3 v1 failure, 2026-07-18).
         self.readout = nn.Sequential(
             nn.Conv2d(channels, reduce_channels, kernel_size=1),
             nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(reduce_channels * height * width, features_dim),
+            nn.LayerNorm(features_dim),
             nn.ReLU(inplace=True),
         )
 

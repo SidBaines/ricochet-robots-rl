@@ -435,3 +435,19 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - Baselines under identical protocol: masked-random 28.4%, target-only 42.4%.
 - Curriculum frontier reached the final band (d=4) at ~150k steps; all band
   EMAs ≥0.98 at end. Artifacts: `artifacts/groundup/e2_8x8_scratch/`.
+
+### E3 v1 stall diagnosed: Tanh head saturation (2026-07-18)
+
+- E3 16×16 v1 (10M budget) stalled by 1.25M steps: frontier thrashing d1↔d2,
+  d1 band EMA plateaued ~0.75 (masked-random is 0.51), val det 5%.
+- Behavioral probe of the checkpoint: argmax matched the known optimal final
+  move on only 38% of d=1 states, and **V(s) was constant (+0.3130, std
+  0.000000) across 64 diverse states** — a dead value function.
+- Mechanism confirmed directly: extractor features had exploded (mean 74,
+  max 1139); 100% of value-head Tanh pre-activations were saturated. Cause:
+  SB3 `MlpPolicy` heads default to Tanh; the legacy Phase 5 provenance hit the
+  identical failure (their fix: `policy_activation: relu`).
+- Fix: `activation_fn=nn.ReLU` heads + LayerNorm on the extractor output;
+  regression test added (12 tests green). Lesson recorded in CLAUDE.md.
+- E2 8×8 rerun with the fixed architecture (`e2_8x8_scratch_v2`) to confirm
+  no regression, then E3 relaunch as v2.
