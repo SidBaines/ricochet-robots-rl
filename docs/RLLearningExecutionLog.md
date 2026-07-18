@@ -6,14 +6,14 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 19:55 EDT
+- Updated: 2026-07-17 22:44 EDT
 - Branch: `sid-learnable-agent`
-- Phase: acceleration steps 2–8 complete; canonical 512k A/B rung next
+- Phase: 512k A/B rung complete; both recipes retained to 2.048M
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: `phase5_screen_b_rung1`, PID 59686, training from the
-  reproduced step-0 boundary toward the same predeclared 512k boundary
+- Active experiment: launching recipe B exact continuation from 512k to 2.048M;
+  recipe A continuation follows sequentially
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -22,9 +22,8 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: launch the matched canonical 512k A/B rung; retain 128×4 as
-  a separate promising architecture candidate rather than silently changing
-  the already-trained canonical initialization
+- Current action: complete both retained second-rung continuations, then apply
+  the predeclared 2.048M adjudication; retain 128×4 as a separate candidate
 - Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
   SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
@@ -557,3 +556,20 @@ state changes. Append chronological entries; never rewrite historical entries.
   so it is exactly promotable. Recipe B now starts from the byte-identical
   canonical BC checkpoint under the matched first-rung protocol. Final test
   remains sealed.
+
+### 2026-07-17 22:44 EDT — recipe B rung complete; both retained
+
+- Recipe B completed 512k in 762.1 training seconds at 671.9 steps/s.
+  Validation deterministic/stochastic success progressed `30.58%/33.88%` at
+  step 0, `34.71%/39.50%` at 102.4k, `32.23%/38.51%` at 256k, and
+  `31.40%/40.50%` at 512k. Its selected rung checkpoint is 512k and contains
+  exact model/training-state sidecars.
+- The committed adjudicator compared A and B without changing its rules. Both
+  are healthy. B leads stochastic validation 40.50% to 39.01% and led at the
+  two most recent common checkpoints; A leads deterministic validation 33.88%
+  to 31.40%. Their puzzle-clustered stochastic 95% intervals overlap
+  (`33.38%–48.26%` for B and `31.73%–45.79%` for A), so the prospective
+  ambiguity rule retained both rather than forcing an unsupported elimination.
+- Decision and validated exact-resume configs are under
+  `artifacts/phase2_experiments/phase5_rung1_decision`. Continue B first, then
+  A, through checkpoints 1.024M and 2.048M. The final test remains sealed.
