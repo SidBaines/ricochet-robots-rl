@@ -1,0 +1,19 @@
+# E2: 8x8 from scratch (phase2b bank: 2 robots, ET1/CL1, lengths 1-4).
+# Full recipe: masked PPO + shaping + reverse-frontier curriculum + canonical identity.
+bank_path: artifacts/phase2b_bank/size-8x8_numR2_ET1_CL1_gen10.parquet
+out_dir: artifacts/groundup
+run_name: e2_8x8_scratch
+curriculum: reverse
+horizon: 16
+shaping_coef: 0.1
+seed: 11
+num_envs: 32
+n_steps: 128
+batch_size: 1024
+n_epochs: 4
+total_steps: 1000000
+eval_every: 50000
+eval_per_length: 25
+final_eval_per_length: 60
+final_eval_episodes: 3
+device: auto

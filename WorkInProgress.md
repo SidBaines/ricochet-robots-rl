@@ -391,3 +391,33 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - Retain `16×128`: wider batches were slower on the serial `DummyVecEnv` and
   did not improve short-run validation. Next work package is exact resumable
   promotion, including optimizer, timesteps/schedules, RNG, and curriculum.
+
+## Ground-up RL rebuild (branch `rl-ground-up`, 2026-07-18)
+
+### Red-team + redesign (2026-07-18)
+
+- Independent audit of the RL stack treating the game env as given; full
+  rationale and change list in `docs/GroundUpRLRedesign.md`.
+- Environment verified clean: 200/200 stored bank plans replay to the goal,
+  50/50 BFS lengths re-derive, obs planes lossless, goal always an L (2 walls).
+- Root cause of every from-scratch 16×16 failure quantified: masked-random
+  success within horizon 20 by optimal length = 40/18/10/3/1/0.2/0.2/0.0%
+  (L1–L8). Sparse terminal reward + a length curriculum that jumps over the
+  cliff at L≥4 leaves PPO no learning signal. Not an environment bug.
+- Two levers validated empirically before building: (a) potential-based
+  shaping on the relaxed slide distance (admissible 0/300, mean d0/optimal
+  0.52, 0.5 ms/layout; half-greedy walk lifts L5 success 4→33/250); (b)
+  reverse starts along stored plans (masked-random success 51% at d=1).
+- New pipeline in `src/groundup/`: lean fixed-layout env (canonical target-
+  first identity, action masks, shaping, reverse starts, time channel),
+  reverse-frontier curriculum, small residual trunk (1.4M params vs 6.1M),
+  MaskablePPO, batched masked eval with baselines under the identical
+  protocol. 11 correctness tests in `src/tests/test_groundup.py` including a
+  differential test of the reimplemented dynamics against `ricochet_core`.
+
+### E1 overfit gate PASSED (2026-07-18)
+
+- 8 fixed 16×16 puzzles (lengths 1–4), uniform sampler, 150k steps, seed 11.
+- 100% deterministic on all 8 by 60k steps (gate ≥95%); stochastic 100%.
+- Throughput ~1,140 steps/s at 8 envs, ~1,700 at 32 envs (legacy: ~700).
+- Artifacts: `artifacts/groundup/e1_overfit/`.

@@ -1,0 +1,19 @@
+# E1: overfit sanity gate - 8 fixed 16x16 puzzles, no curriculum.
+bank_path: artifacts/phase4_bank/size-16x16_numR4_ET2_CL2_gen10.parquet
+out_dir: artifacts/groundup
+run_name: e1_overfit
+overfit_n: 8
+curriculum: uniform
+horizon: 32
+shaping_coef: 0.1
+seed: 11
+num_envs: 8
+n_steps: 128
+batch_size: 256
+n_epochs: 4
+total_steps: 150000
+eval_every: 15000
+eval_per_length: 8
+final_eval_per_length: 8
+final_eval_episodes: 5
+device: auto
