@@ -1,6 +1,15 @@
 # Documentation
 This folder contains detailed specifications for (in `ComponentSpecifications`) and a summary of the progress made (in `ProgressNotes`) for various components in the Ricochet Robots (RR) Reinforcement Learning (RL) project.
 
+## Current RL learning work
+
+- `RLLearningRemediationReport.md`: consolidated performance-first BC→PPO
+  implementation, experiments, selected seed-11 model, limitations, and next
+  work.
+- `RLLearningExecutionLog.md`: detailed chronological handoff and artifact log.
+- `RLLearningSynthesizedPlan.md`: the merged investigation/reverse-curriculum
+  execution plan.
+
 
 ## Progress Notes Overview
 The folder ProgressNotes now organizes progress by concrete tasks, each with an implementation summary. Reviews are added separately as `<TASK>_Review.md` files.

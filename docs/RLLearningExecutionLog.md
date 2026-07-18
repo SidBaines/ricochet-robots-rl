@@ -1,7 +1,8 @@
 # RL Learning Remediation Execution Log
 
 This is the live, detailed handoff document for
-`docs/RLLearningSynthesizedPlan.md`. Update the snapshot whenever execution
+`docs/RLLearningSynthesizedPlan.md`. The consolidated outcome is in
+`docs/RLLearningRemediationReport.md`. Update the snapshot whenever execution
 state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
@@ -9,7 +10,8 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Updated: 2026-07-18 11:21 EDT
 - Branch: `sid-learnable-agent`
 - Phase: promoted seed-11 run complete; seed-expansion gates passed
-- Latest completed commit: `476af90 exp: add BC training lever screens`
+- Latest implementation commit: `476af90 exp: add BC training lever screens`
+- Latest recorded result commit: `18c23d9 docs: record promoted seed 11 result`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
 - Active experiment: none; promoted recipe A stopped prospectively at 6.144M
