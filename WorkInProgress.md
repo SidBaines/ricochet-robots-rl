@@ -470,3 +470,11 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   that action's landing cell (1×1 conv score maps contracted against stop
   planes), critic on pooled trunk features. No flatten anywhere; no
   location-specific parameters. 14 tests green.
+
+### E2 v3 gate PASSED — spatial pointer head (2026-07-18)
+
+- 8×8 with stop planes + distance plane + SpatialPolicy: 68% val det at 53k
+  steps, 99% by 152k (v2 flat-head needed ~400k for 96%). Final 98.8% det /
+  99.7% stoch with 314k params (half of v2). ~3,500 steps/s.
+- E3 relaunched as v3 (16×16, spatial head), W&B run
+  groundup-e3-16x16-scratch-v3.
