@@ -19,3 +19,5 @@ final_eval_episodes: 3
 channels: 64
 n_blocks: 6
 device: auto
+wandb_project: ricochet-robots-rl
+wandb_run_name: groundup-e3-16x16-scratch

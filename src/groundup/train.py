@@ -76,6 +76,9 @@ class TrainConfig:
     final_eval_per_length: int = 50
     final_eval_episodes: int = 3
     device: str = "auto"
+    # W&B (opt-in, mirrors the legacy harness convention)
+    wandb_project: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainConfig":
@@ -84,6 +87,41 @@ class TrainConfig:
         if unknown:
             raise ValueError(f"Unknown config keys: {sorted(unknown)}")
         return cls(**values)
+
+
+def _flatten_eval(prefix: str, summary: dict) -> dict:
+    out = {f"{prefix}/success_rate": summary["success_rate"]}
+    for length, v in summary.get("by_length", {}).items():
+        out[f"{prefix}/len_{length}"] = v["success_rate"]
+    for robots, v in summary.get("by_robots_moved", {}).items():
+        out[f"{prefix}/robots_{robots}"] = v["success_rate"]
+    return out
+
+
+def _flatten_sampler(stats: dict) -> dict:
+    out = {}
+    if "frontier" in stats:
+        out["curriculum/frontier"] = stats["frontier"]
+        for d, value in stats.get("ema", {}).items():
+            out[f"curriculum/ema_d{d}"] = value
+    return out
+
+
+def _maybe_init_wandb(config: "TrainConfig", out_dir: Path):
+    if config.wandb_project is None:
+        return None
+    import wandb
+
+    run = wandb.init(
+        project=config.wandb_project,
+        name=config.wandb_run_name or config.run_name,
+        config=dataclasses.asdict(config),
+        dir=str(out_dir),
+    )
+    run.define_metric("train/timesteps")
+    for pattern in ("train/*", "curriculum/*", "val_det/*", "final/*"):
+        run.define_metric(pattern, step_metric="train/timesteps")
+    return run
 
 
 def _resolve_device(requested: str) -> str:
@@ -108,6 +146,7 @@ def build_and_train(config: TrainConfig) -> dict:
     out = Path(config.out_dir) / config.run_name
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(dataclasses.asdict(config), indent=2))
+    wandb_run = _maybe_init_wandb(config, out)
 
     env_config = EnvConfig(
         horizon=config.horizon,
@@ -225,6 +264,14 @@ def build_and_train(config: TrainConfig) -> dict:
             }
             with curve_path.open("a") as fh:
                 fh.write(json.dumps(entry) + "\n")
+            if wandb_run is not None:
+                payload = {
+                    "train/timesteps": int(self.num_timesteps),
+                    "train/steps_per_s": entry["steps_per_s"],
+                    **_flatten_eval("val_det", det),
+                    **_flatten_sampler(sampler.stats()),
+                }
+                wandb_run.log(payload, step=int(self.num_timesteps))
             print(
                 f"[groundup] t={entry['timesteps']:>9,} ({entry['steps_per_s']:.0f} st/s) "
                 f"val_det={det['success_rate']:.3f} "
@@ -261,6 +308,18 @@ def build_and_train(config: TrainConfig) -> dict:
     }
     (out / "report.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({k: report[k] for k in ("final_val_det", "final_val_stoch", "baseline_random", "baseline_target_only")}, indent=2), flush=True)
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "train/timesteps": int(config.total_steps),
+                **_flatten_eval("final/val_det", report["final_val_det"]),
+                **_flatten_eval("final/val_stoch", report["final_val_stoch"]),
+                **_flatten_eval("final/baseline_random", report["baseline_random"]),
+                **_flatten_eval("final/baseline_target_only", report["baseline_target_only"]),
+            },
+            step=int(config.total_steps),
+        )
+        wandb_run.finish()
     return report
 
 
