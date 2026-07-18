@@ -6,14 +6,14 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 22:44 EDT
+- Updated: 2026-07-17 23:43 EDT
 - Branch: `sid-learnable-agent`
 - Phase: 512k A/B rung complete; both recipes retained to 2.048M
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: recipe B exact continuation, PID 63649, from the verified
-  512k boundary toward 2.048M; recipe A continuation follows sequentially
+- Active experiment: recipe B continuation complete; launching recipe A exact
+  continuation from its verified 512k boundary toward 2.048M
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -573,3 +573,18 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Decision and validated exact-resume configs are under
   `artifacts/phase2_experiments/phase5_rung1_decision`. Continue B first, then
   A, through checkpoints 1.024M and 2.048M. The final test remains sealed.
+
+### 2026-07-17 23:43 EDT — recipe B second rung complete; recipe A starting
+
+- B resumed exactly at 512k and trained the remaining 1.536M transitions in
+  2,275.1 seconds at 675.1 steps/s. Validation deterministic/stochastic success
+  was `31.40%/40.50%` at 512k, `33.06%/40.99%` at 1.024M, and
+  `35.54%/38.35%` at 2.048M.
+- Ordinary validation checkpoint selection correctly retained B's 1.024M
+  checkpoint rather than its faded 2.048M endpoint. The successive-halving
+  comparison still uses the predeclared 2.048M rung endpoint, so it cannot
+  cherry-pick unequal training ages; the selected 1.024M model remains
+  available for final recipe/checkpoint selection if B is promoted.
+- Launch A from its own bound 512k `model.zip` and `training_state.pkl` under
+  the generated `promote_a.yaml`. After A reaches 2.048M, apply the unchanged
+  second-rung adjudication. Final test remains sealed.
