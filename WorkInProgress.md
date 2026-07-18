@@ -421,3 +421,17 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - 100% deterministic on all 8 by 60k steps (gate ≥95%); stochastic 100%.
 - Throughput ~1,140 steps/s at 8 envs, ~1,700 at 32 envs (legacy: ~700).
 - Artifacts: `artifacts/groundup/e1_overfit/`.
+
+### E2 8×8 from-scratch PASSED, decisively (2026-07-18)
+
+- phase2b bank (8×8, 2 robots, ET1/CL1, lengths 1–4), full new recipe, no BC:
+  masked PPO + relaxed-distance shaping + reverse-frontier curriculum +
+  canonical identity. Seed 11, 1M steps, 243 s wall-clock (~4k steps/s).
+- Held-out val: 97.5% det / 96.8% stoch. Sealed test split (240 puzzles,
+  never used for any decision): **99.6% det / 99.2% stoch; two-robot 100%**.
+- Reference: legacy best on this bank was 87.0% det / 84.8% stoch at 819k
+  steps with band reweighting (two-robot 68%). New recipe exceeds it on 3×
+  less compute with a 2.25× smaller model (630k params).
+- Baselines under identical protocol: masked-random 28.4%, target-only 42.4%.
+- Curriculum frontier reached the final band (d=4) at ~150k steps; all band
+  EMAs ≥0.98 at end. Artifacts: `artifacts/groundup/e2_8x8_scratch/`.
