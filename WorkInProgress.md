@@ -496,3 +496,20 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - E4 ablation chain launched (2M steps each, sequential): no-shaping,
   no-reverse, no-planes (flat head), all else matched to v3. Reference:
   v3 curve was at ~63% @ 2.25M.
+
+### E4 ablations complete: the spatial head + stop planes are the decisive lever (2026-07-18)
+
+- Matched 2M-step arms, 16×16, seed 11, everything else fixed to the v3
+  recipe. Validation det (v3 reference ≈63% at 2.25M from its curve):
+  - no shaping:            60.3% (−3)
+  - no reverse curriculum: 58.8% (−4)
+  - no stop/distance planes + flat head (v2 recipe): **12.0% (−51)**
+- Read: at this budget the levers are partially redundant — shaping and the
+  reverse curriculum each add a few points when the planes/pointer head are
+  present, but the spatially-grounded perception+readout is what makes 16×16
+  learnable at all. For the helper-removal ladder (design doc §4) this
+  quantifies what must be re-earned at step 2 (removing stop planes): expect
+  to lean much harder on shaping, curriculum, deeper trunks, and compute.
+- Experiment ladder closed: E1 overfit ✓, E2 8×8 (99.6% sealed test) ✓,
+  E3 16×16 (78.1% sealed test, from scratch) ✓, E4 causal ablations ✓.
+  Multi-seed confirmation of E3 remains open (single seed 11 so far).
