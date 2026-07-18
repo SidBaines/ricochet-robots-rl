@@ -120,7 +120,47 @@ Explicitly reused from the existing repo (vetted): `ricochet_core.py` rules,
 stored optimal plans, layout-hash split convention, and the
 detached-long-run/logging conventions from CLAUDE.md.
 
-## 4. Experiment ladder (sequential, each gates the next)
+## 4. End goal and the helper-removal ladder
+
+The v3 recipe deliberately runs "with all the helpers on" to first prove the
+game is learnable and get a strong reference agent. The agreed end goal
+(2026-07-18) is an agent trained under progressively *fewer* helpers, ending
+at:
+
+- **RGB image observations** (rendered board, not structured planes);
+- **variable board grid dimensions** (one network across sizes);
+- **coloured robots with no canonical target slot** — the network must
+  identify the target robot by matching its colour to the goal marker, so we
+  can study generalisation to unseen colours and the training conditions that
+  produce it;
+- **no action mask** (for at least some planned experiments);
+- **no stop planes / no distance plane** (both are eval-time input
+  enrichments and must be gone in the target setting).
+
+Strategy: get it working with all helpers, then remove them **one at a time**,
+confirming learning survives each removal before the next. Proposed order
+(easiest→hardest, each step keeps everything else fixed):
+
+1. Remove the distance plane (heuristic field; most "helpful" input).
+2. Remove the stop planes (net must learn one-step slide dynamics; the
+   pointer head must be replaced by a flat/spatial head that does not index
+   landing cells — expect to need a deeper trunk for ray-tracing receptive
+   field).
+3. Remove canonical target-first identity (target robot identified via an
+   explicit target-mask channel first, then via colour matching in RGB).
+4. Remove the action mask.
+5. Structured planes → RGB rendering (sprite renderer; conv stem over
+   pixels).
+6. Fixed 16×16 → variable board dimensions. Note the SpatialPolicy trunk and
+   pooled value head are already size-agnostic; flatten-based heads are not.
+
+Training-time-only helpers (reward shaping, reverse-start curriculum, the
+solver-labelled banks) do not appear in the deployed observation and may be
+kept throughout, subject to the E4 ablations. Comparisons of v3 numbers
+against legacy results must carry the caveat that v3's observation space is
+richer (stop/distance planes) until ladder steps 1–2 land.
+
+## 5. Experiment ladder (sequential, each gates the next)
 
 - **E0 — unit tests**: obs/mask/shaping/canonicalization correctness; shaping
   telescopes to a constant per episode; reverse starts reproduce plan states.
