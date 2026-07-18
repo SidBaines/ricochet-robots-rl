@@ -6,14 +6,14 @@ state changes. Append chronological entries; never rewrite historical entries.
 
 ## Current handoff snapshot
 
-- Updated: 2026-07-17 23:43 EDT
+- Updated: 2026-07-18 00:24 EDT
 - Branch: `sid-learnable-agent`
-- Phase: 512k A/B rung complete; both recipes retained to 2.048M
+- Phase: recipe A won at 2.048M; full promotion to at most 10.24M next
 - Latest completed commit: `476af90 exp: add BC training lever screens`
 - Working tree at start: the two independent source plans were untracked; no
   other changes were present
-- Active experiment: recipe A exact continuation, PID 95010, from its verified
-  512k boundary toward 2.048M
+- Active experiment: launching recipe A exact continuation from 2.048M toward
+  10.24M with prospective plateau stopping enabled
 - Last test gate: 129 passed, 9 intentionally skipped, 4 benign checkpoint or
   small-rollout warnings in 15.72s
 - Immutable fixture: `artifacts/phase4_bank`, fingerprint
@@ -22,8 +22,8 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Sealed confirmation: 375 unique puzzles/layouts, fingerprint
   `816d8583c7cdb75deaf978f0e5b275d30f6a7d506e644df1c04d15994d42776b`;
   no learning model has been evaluated on it
-- Current action: complete both retained second-rung continuations, then apply
-  the predeclared 2.048M adjudication; retain 128×4 as a separate candidate
+- Current action: run the promoted recipe A seed-11 trajectory, select its best
+  validation checkpoint, and apply the seed-expansion gates
 - Canonical initialization: `artifacts/phase2_experiments/phase5_canonical_bc_seed11_retry1/seed_11/checkpoints/step_0/model.zip`,
   SHA-256 `d64eed2dcde7f3c84df0d56ece3d0d9392c92ba1939837439a402bee9f056181`
 
@@ -588,3 +588,23 @@ state changes. Append chronological entries; never rewrite historical entries.
 - Launch A from its own bound 512k `model.zip` and `training_state.pkl` under
   the generated `promote_a.yaml`. After A reaches 2.048M, apply the unchanged
   second-rung adjudication. Final test remains sealed.
+
+### 2026-07-18 00:24 EDT — recipe A wins second rung
+
+- A resumed exactly and trained the remaining 1.536M transitions in 2,359.5
+  seconds at 651.0 steps/s. Validation deterministic/stochastic success was
+  `33.88%/39.01%` at 512k, `28.93%/37.36%` at 1.024M, and a new best
+  `39.67%/41.82%` at 2.048M; checkpoint selection therefore chose 2.048M.
+- A remained healthy from its 512k boundary: two-robot stochastic success rose
+  31.90%→42.86%, three-robot success changed 21.29%→19.35% (within the
+  predeclared two-point tolerance), and no-movement stayed zero. It advanced by
+  mastery to curriculum level 3 of 4, the final stage.
+- The unchanged adjudicator promoted A alone. B was ineligible at the rung
+  endpoint because two-robot success regressed 3.81 points and three-robot
+  success regressed 8.39 points from its own 512k boundary, exceeding the
+  predeclared two-point tolerances. The decision and exact-resume config are in
+  `artifacts/phase2_experiments/phase5_rung2_decision`.
+- Continue A from its bound 2.048M state through the declared checkpoints up to
+  10.24M. Prospective plateau stopping begins no earlier than 4.096M, requires
+  three non-improving eligible checkpoints, and defines material improvement
+  as one stochastic-validation percentage point. Final test remains sealed.
