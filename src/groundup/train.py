@@ -37,6 +37,8 @@ class TrainConfig:
     shaping_coef: float = 0.1
     time_channel: bool = True
     canonical_identity: bool = True
+    stop_planes: bool = False
+    distance_plane: bool = False
     # curriculum: "reverse" | "uniform"
     curriculum: str = "reverse"
     tau: float = 0.75
@@ -63,13 +65,16 @@ class TrainConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.05
-    # model
+    # model: "flat" = GridTrunk features + MLP heads; "spatial" = SpatialPolicy
+    # (pointer head over stop planes; requires stop_planes: true)
+    policy_head: str = "flat"
     channels: int = 64
     n_blocks: int = 4
     reduce_channels: int = 16
     features_dim: int = 256
     pi_head: int = 128
     vf_head: int = 128
+    vf_latent: int = 64
     # evaluation
     eval_every: int = 100_000
     eval_per_length: int = 25
@@ -141,7 +146,7 @@ def build_and_train(config: TrainConfig) -> dict:
     from .curriculum import ReverseFrontierSampler, UniformSampler
     from .env import EnvConfig, RicochetEnv
     from .evaluate import evaluate_policy, scripted_baseline
-    from .model import GridTrunk
+    from .model import GridTrunk, SpatialPolicy
     from .puzzles import load_puzzles, stratified_subset
 
     out = Path(config.out_dir) / config.run_name
@@ -149,6 +154,10 @@ def build_and_train(config: TrainConfig) -> dict:
     (out / "config.json").write_text(json.dumps(dataclasses.asdict(config), indent=2))
     wandb_run = _maybe_init_wandb(config, out)
 
+    if config.policy_head not in {"flat", "spatial"}:
+        raise ValueError(f"Unknown policy_head: {config.policy_head}")
+    if config.policy_head == "spatial" and not config.stop_planes:
+        raise ValueError("policy_head: spatial requires stop_planes: true")
     env_config = EnvConfig(
         horizon=config.horizon,
         step_penalty=config.step_penalty,
@@ -157,6 +166,8 @@ def build_and_train(config: TrainConfig) -> dict:
         gamma=config.gamma,
         time_channel=config.time_channel,
         canonical_identity=config.canonical_identity,
+        stop_planes=config.stop_planes,
+        distance_plane=config.distance_plane,
     )
 
     split_kwargs = dict(
@@ -207,8 +218,34 @@ def build_and_train(config: TrainConfig) -> dict:
     device = _resolve_device(config.device)
     lr0, lr1 = config.learning_rate, config.learning_rate_final
 
+    if config.policy_head == "spatial":
+        probe_env = RicochetEnv(train_puzzles[:1], env_config)
+        policy = SpatialPolicy
+        policy_kwargs = dict(
+            stop_offset=probe_env.stop_planes_offset,
+            trunk_channels=config.channels,
+            trunk_blocks=config.n_blocks,
+            vf_latent=config.vf_latent,
+        )
+    else:
+        policy = "MlpPolicy"
+        policy_kwargs = dict(
+            features_extractor_class=GridTrunk,
+            features_extractor_kwargs=dict(
+                features_dim=config.features_dim,
+                channels=config.channels,
+                n_blocks=config.n_blocks,
+                reduce_channels=config.reduce_channels,
+            ),
+            net_arch=dict(pi=[config.pi_head], vf=[config.vf_head]),
+            # SB3's default Tanh heads saturate on CNN features (constant
+            # value function; see E3 v1 diagnosis and the legacy Phase 5
+            # provenance which hit the identical failure).
+            activation_fn=nn.ReLU,
+        )
+
     model = MaskablePPO(
-        "MlpPolicy",
+        policy,
         vec_env,
         learning_rate=lambda progress: lr1 + (lr0 - lr1) * progress,
         n_steps=config.n_steps,
@@ -224,20 +261,7 @@ def build_and_train(config: TrainConfig) -> dict:
         seed=config.seed,
         device=device,
         verbose=0,
-        policy_kwargs=dict(
-            features_extractor_class=GridTrunk,
-            features_extractor_kwargs=dict(
-                features_dim=config.features_dim,
-                channels=config.channels,
-                n_blocks=config.n_blocks,
-                reduce_channels=config.reduce_channels,
-            ),
-            net_arch=dict(pi=[config.pi_head], vf=[config.vf_head]),
-            # SB3's default Tanh heads saturate on CNN features (constant
-            # value function; see E3 v1 diagnosis and the legacy Phase 5
-            # provenance which hit the identical failure).
-            activation_fn=nn.ReLU,
-        ),
+        policy_kwargs=policy_kwargs,
     )
     n_params = sum(p.numel() for p in model.policy.parameters())
     print(f"[groundup] device={device} policy_params={n_params:,}", flush=True)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from gymnasium.spaces import Box
+from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
@@ -25,6 +26,77 @@ class _ResidualBlock(nn.Module):
         h = self.act(self.conv1(x))
         h = self.conv2(h)
         return self.act(x + h)
+
+
+class SpatialExtractor(nn.Module):
+    """Drop-in MlpExtractor computing spatially-grounded action scores.
+
+    Receives SB3's flattened observation, restores (C, H, W), runs the shared
+    residual trunk once, then:
+
+    - actor latent = per-action scores read at each action's landing cell:
+      a 1x1 conv produces one score map per action; the score for action a is
+      its map contracted against the env's stop plane for a (one-hot of where
+      that slide ends). "Evaluate the square you'd land on" — no flatten, no
+      location-specific parameters, and the goal/stop conjunction that decides
+      success is a local feature at the landing cell.
+    - critic latent = global mean+max pooled trunk features through a linear.
+
+    Motivated by the E3 v2 diagnosis: a flat readout failed to learn
+    "this slide ends on the goal" at 16x16 (value flat in start distance,
+    policy stuck near 3x uniform on the optimal move at d=1).
+    """
+
+    def __init__(
+        self,
+        obs_shape: tuple[int, int, int],
+        n_actions: int,
+        stop_offset: int,
+        channels: int = 64,
+        n_blocks: int = 6,
+        vf_latent: int = 64,
+    ) -> None:
+        super().__init__()
+        in_channels, height, width = obs_shape
+        self.obs_shape = obs_shape
+        self.n_actions = n_actions
+        self.stop_offset = stop_offset
+        self.latent_dim_pi = n_actions
+        self.latent_dim_vf = vf_latent
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.blocks = nn.Sequential(*[_ResidualBlock(channels) for _ in range(n_blocks)])
+        self.score = nn.Conv2d(channels, n_actions, kernel_size=1)
+        self.vf = nn.Sequential(
+            nn.Linear(2 * channels, vf_latent),
+            nn.LayerNorm(vf_latent),
+            nn.ReLU(inplace=True),
+        )
+
+    def _trunk(self, features: torch.Tensor) -> torch.Tensor:
+        x = features.reshape(features.shape[0], *self.obs_shape)
+        return self.blocks(self.stem(x))
+
+    def _actor(self, trunk: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        obs = features.reshape(features.shape[0], *self.obs_shape)
+        stop = obs[:, self.stop_offset : self.stop_offset + self.n_actions]
+        return (self.score(trunk) * stop).sum(dim=(2, 3))
+
+    def _critic(self, trunk: torch.Tensor) -> torch.Tensor:
+        pooled = torch.cat([trunk.mean(dim=(2, 3)), trunk.amax(dim=(2, 3))], dim=1)
+        return self.vf(pooled)
+
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        trunk = self._trunk(features)
+        return self._actor(trunk, features), self._critic(trunk)
+
+    def forward_actor(self, features: torch.Tensor) -> torch.Tensor:
+        return self._actor(self._trunk(features), features)
+
+    def forward_critic(self, features: torch.Tensor) -> torch.Tensor:
+        return self._critic(self._trunk(features))
 
 
 class GridTrunk(BaseFeaturesExtractor):
@@ -57,3 +129,43 @@ class GridTrunk(BaseFeaturesExtractor):
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.readout(self.blocks(self.stem(observations)))
+
+
+class SpatialPolicy(MaskableActorCriticPolicy):
+    """MaskableActorCriticPolicy with the SpatialExtractor as its torso.
+
+    Uses SB3's default FlattenExtractor as the (identity) features extractor;
+    all convolutional work happens inside the shared SpatialExtractor so actor
+    and critic reuse one trunk pass. The stock action_net becomes a learned
+    Linear(n_actions, n_actions) on top of the spatial scores (initialised
+    near zero by SB3's small-gain orthogonal init, as usual for PPO).
+    """
+
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        lr_schedule,
+        *args,
+        stop_offset: int,
+        trunk_channels: int = 64,
+        trunk_blocks: int = 6,
+        vf_latent: int = 64,
+        **kwargs,
+    ) -> None:
+        self._stop_offset = int(stop_offset)
+        self._trunk_channels = int(trunk_channels)
+        self._trunk_blocks = int(trunk_blocks)
+        self._vf_latent = int(vf_latent)
+        kwargs.pop("net_arch", None)  # torso structure is fixed by SpatialExtractor
+        super().__init__(observation_space, action_space, lr_schedule, *args, **kwargs)
+
+    def _build_mlp_extractor(self) -> None:
+        self.mlp_extractor = SpatialExtractor(
+            obs_shape=self.observation_space.shape,
+            n_actions=int(self.action_space.n),
+            stop_offset=self._stop_offset,
+            channels=self._trunk_channels,
+            n_blocks=self._trunk_blocks,
+            vf_latent=self._vf_latent,
+        )

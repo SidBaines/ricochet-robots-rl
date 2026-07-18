@@ -451,3 +451,22 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   regression test added (12 tests green). Lesson recorded in CLAUDE.md.
 - E2 8×8 rerun with the fixed architecture (`e2_8x8_scratch_v2`) to confirm
   no regression, then E3 relaunch as v2.
+
+### E3 v2 stall diagnosed: representational bottleneck at the readout (2026-07-18)
+
+- With healthy heads (ReLU+LayerNorm), 16×16 v2 tripled v1's early val det
+  (17.5% vs 9% at 254k) but then regressed to 10% by 1.25M with the frontier
+  pinned at d=1 (band EMA ~0.7; masked-random is 0.51).
+- Probes on the checkpoint: value function alive (std 0.15) but carries no
+  information about start distance (means +0.27..+0.31 for d=1..5, should be
+  strongly decreasing); policy puts only ~0.21 probability on the known
+  optimal final move at d=1, flat in slide length (refutes the receptive-field
+  hypothesis).
+- Diagnosis: the flat global readout cannot efficiently learn the relational
+  predicate "this slide ends on the goal" at 16×16 scale.
+- Fix (v3): (a) env now offers stop-cell planes (one-hot landing cell per
+  robot×direction) and a normalized relaxed-distance plane; (b) new
+  `SpatialPolicy` pointer head — per-action logits read from trunk features at
+  that action's landing cell (1×1 conv score maps contracted against stop
+  planes), critic on pooled trunk features. No flatten anywhere; no
+  location-specific parameters. 14 tests green.

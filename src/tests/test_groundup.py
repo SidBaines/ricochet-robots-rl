@@ -273,3 +273,57 @@ def test_policy_heads_relu_and_bounded_features(puzzles16):
         if isinstance(feats, tuple):
             feats = feats[0]
     assert float(feats.abs().max()) < 50.0  # LayerNorm keeps features bounded
+
+
+@needs_bank16
+def test_stop_planes_correct(puzzles16):
+    """Each stop plane is one-hot at exactly the slide destination, and at
+    d=1 the goal cell carries the stop plane of a solving action."""
+    config = EnvConfig(stop_planes=True, time_channel=False, horizon=50)
+    env = RicochetEnv(puzzles16, config)
+    rng = np.random.default_rng(5)
+    for _ in range(20):
+        idx = int(rng.integers(len(puzzles16)))
+        obs, _ = env.reset(options={"puzzle_index": idx, "start_distance": 1})
+        off = env.stop_planes_offset
+        goal_solving = []
+        for action in range(env.action_space.n):
+            plane = obs[off + action]
+            assert plane.sum() == 1.0
+            sr, sc = np.unravel_index(int(plane.argmax()), plane.shape)
+            expect = env._slide_from(env._robots, action // 4, action % 4, env._puzzle)
+            assert (sr, sc) == expect
+            if action < 4 and (sr, sc) == env._puzzle.goal:
+                goal_solving.append(action)
+        assert goal_solving, "d=1 state must have a target-robot action stopping on the goal"
+
+
+@needs_bank16
+def test_spatial_policy_builds_and_masks(puzzles16):
+    import torch
+    from sb3_contrib import MaskablePPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from src.groundup.model import SpatialPolicy
+
+    config = EnvConfig(stop_planes=True, distance_plane=True)
+    probe = RicochetEnv(puzzles16[:10], config, seed=0)
+    env = DummyVecEnv([lambda: RicochetEnv(puzzles16[:10], config, seed=0)])
+    model = MaskablePPO(
+        SpatialPolicy,
+        env,
+        n_steps=16,
+        batch_size=16,
+        device="cpu",
+        policy_kwargs=dict(stop_offset=probe.stop_planes_offset, trunk_channels=16, trunk_blocks=2),
+    )
+    raw = RicochetEnv(puzzles16[:10], config, seed=1)
+    obs, _ = raw.reset(options={"puzzle_index": 0})
+    mask = raw.action_masks()
+    obs_t = torch.as_tensor(obs[None])
+    dist = model.policy.get_distribution(obs_t, action_masks=torch.as_tensor(mask[None]))
+    probs = dist.distribution.probs.detach().numpy()[0]
+    assert np.all(probs[~mask] < 1e-8), "masked actions must get zero probability"
+    assert abs(probs.sum() - 1.0) < 1e-5
+    # short learn smoke: one rollout + update must run
+    model.learn(total_timesteps=32)

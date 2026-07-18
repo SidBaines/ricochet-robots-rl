@@ -37,6 +37,12 @@ class EnvConfig:
     gamma: float = 0.99  # must equal the PPO discount for valid shaping
     time_channel: bool = True
     canonical_identity: bool = True
+    # One plane per (robot, direction): one-hot of the cell that robot would
+    # stop at if it slid that way now. Injects one-step dynamics the flat
+    # trunk otherwise has to learn by ray-tracing (E3 v2 diagnosis).
+    stop_planes: bool = False
+    # Normalized relaxed-distance-to-goal map (same field the shaping uses).
+    distance_plane: bool = False
 
 
 class RicochetEnv(gym.Env):
@@ -74,7 +80,13 @@ class RicochetEnv(gym.Env):
         self._rng = np.random.default_rng(seed)
         self._dmap_cache: Dict[int, np.ndarray] = {}
 
-        channels = 5 + self.num_robots + (1 if config.time_channel else 0)
+        channels = 5 + self.num_robots
+        if config.stop_planes:
+            channels += 4 * self.num_robots
+        if config.distance_plane:
+            channels += 1
+        if config.time_channel:
+            channels += 1
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(channels, self.height, self.width), dtype=np.float32
         )
@@ -160,10 +172,27 @@ class RicochetEnv(gym.Env):
         for i, (r, c) in enumerate(self._robots):
             robot_planes[i, r, c] = 1.0
         parts = [planes, robot_planes]
+        if self.config.stop_planes:
+            stops = np.zeros((4 * self.num_robots, self.height, self.width), dtype=np.float32)
+            for rid in range(self.num_robots):
+                for direction in range(4):
+                    sr, sc = self._slide_from(self._robots, rid, direction, self._puzzle)
+                    stops[rid * 4 + direction, sr, sc] = 1.0
+            parts.append(stops)
+        if self.config.distance_plane:
+            dmap = self._distance_map(self._puzzle).astype(np.float32)
+            parts.append((dmap / max(1.0, float(dmap.max())))[None])
         if self.config.time_channel:
             remaining = (self.config.horizon - self._steps) / self.config.horizon
             parts.append(np.full((1, self.height, self.width), remaining, dtype=np.float32))
         return np.concatenate(parts, axis=0)
+
+    @property
+    def stop_planes_offset(self) -> int:
+        """First channel index of the stop planes (requires stop_planes=True)."""
+        if not self.config.stop_planes:
+            raise ValueError("stop_planes disabled")
+        return 5 + self.num_robots
 
     # ------------------------------------------------------------ gym API
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
