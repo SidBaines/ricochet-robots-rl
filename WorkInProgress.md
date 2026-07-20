@@ -548,3 +548,14 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   normalized-advantage clamp, value clipping, max-KL telemetry); 8×8 re-gate
   queued after the RGB 16×16 run frees the GPU.
 - RGB 16×16 (10M, all helpers) now training: W&B groundup-r1-16x16-rgb.
+
+### R1 16×16 RGB COMPLETE: pixels match structured planes (2026-07-20)
+
+- 10M steps, 3.0 h, 484k params, ~920 st/s. Validation 78.8% det / 80.3%
+  stoch. **Sealed test: 77.1% det / 79.9% stoch** (planes run: 78.1% det —
+  statistically indistinguishable on 480 puzzles).
+- The board (walls/goal/robots) is perceived purely from 80×80 RGB pixels;
+  only the helper planes (stop/distance/time) remain symbolic. Cell-aligned
+  patch embedding avoids the legacy NatureCNN aliasing entirely.
+- W&B: groundup-r1-16x16-rgb. Ladder implication: step 5 (planes→RGB) is
+  de-risked; the remaining hard step is removing the stop planes (step 2).
