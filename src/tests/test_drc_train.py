@@ -23,8 +23,10 @@ from src.groundup.drc_train import (
     RecurrentPPO,
     build_and_train,
     build_net,
+    clipped_value_loss,
     compute_gae,
     evaluate_drc,
+    normalize_advantages,
     replay_sequences,
 )
 from src.groundup.env import EnvConfig, RicochetEnv
@@ -280,6 +282,81 @@ def test_truncation_bootstraps_final_value_and_termination_does_not():
     assert not torch.allclose(buf_trunc.returns[:2, 0], buf_term.returns[:2, 0])
 
 
+# ------------------------------------------------- post-convergence hardening
+def test_normalize_advantages_floor_caps_tiny_std_amplification():
+    # Near-solved batch: residual advantages at 1e-3 scale.
+    adv = torch.tensor([1e-3, -1e-3, 2e-3, -2e-3, 0.0])
+    plain = normalize_advantages(adv, std_floor=0.0, clip=None)
+    floored = normalize_advantages(adv, std_floor=0.05, clip=None)
+    # Plain normalization inflates residual noise to unit scale ...
+    assert float(plain.abs().max()) > 1.0
+    # ... the floor keeps it at its natural scale / 0.05 (<= 20x).
+    assert torch.allclose(floored, (adv - adv.mean()) / (0.05 + 1e-8))
+    assert float(floored.abs().max()) < 0.1
+    # Floor inactive when std is healthy: identical to the plain formula.
+    healthy = torch.tensor([1.0, -1.0, 2.0, -2.0, 0.5])
+    assert torch.equal(
+        normalize_advantages(healthy, std_floor=0.05, clip=None),
+        normalize_advantages(healthy, std_floor=0.0, clip=None),
+    )
+    # std_floor=0 / clip=None reproduce the pre-hardening formula exactly.
+    assert torch.equal(plain, (adv - adv.mean()) / (adv.std() + 1e-8))
+
+
+def test_normalize_advantages_clips_outliers():
+    adv = torch.tensor([0.0] * 99 + [1.0])  # one extreme outlier
+    clipped = normalize_advantages(adv, std_floor=0.0, clip=3.0)
+    unclipped = normalize_advantages(adv, std_floor=0.0, clip=None)
+    assert float(unclipped.max()) > 3.0
+    assert float(clipped.max()) == 3.0
+    assert torch.equal(clipped, unclipped.clamp(-3.0, 3.0))
+
+
+def test_clipped_value_loss_matches_sb3_and_bounds_gradients():
+    old_values = torch.tensor([0.0, 0.0, 0.0])
+    returns = torch.tensor([1.0, 1.0, 1.0])
+    values = torch.tensor([0.1, 0.9, -0.9], requires_grad=True)
+    # clip_range_vf=None reproduces the plain MSE exactly.
+    assert torch.equal(
+        clipped_value_loss(values, old_values, returns, None),
+        torch.nn.functional.mse_loss(returns, values),
+    )
+    # SB3 semantics: prediction clamped to old_values +/- clip before the MSE.
+    loss = clipped_value_loss(values, old_values, returns, clip_range_vf=0.2)
+    expected_pred = torch.tensor([0.1, 0.2, -0.2])
+    assert torch.allclose(loss, torch.nn.functional.mse_loss(returns, expected_pred))
+    # Gradient flows only where the prediction change is inside the clip.
+    loss.backward()
+    assert values.grad[0] != 0.0  # |0.1| < 0.2: live
+    assert values.grad[1] == 0.0  # clamped: no gradient
+    assert values.grad[2] == 0.0  # clamped: no gradient
+
+
+def test_hardening_guards_inactive_on_healthy_update():
+    """On a healthy first update the guards must not perturb the losses:
+    at unchanged weights the value clip is a no-op, the advantage std is well
+    above the floor, and normalized advantages are far inside the clamp."""
+
+    def run_once(**hardening):
+        puzzles = synthetic_puzzles()
+        envs = [RicochetEnv(puzzles, EnvConfig(horizon=4), seed=800 + r) for r in range(2)]
+        net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n, seed=9)
+        torch.manual_seed(31)
+        # batch_size = n_steps * num_envs -> exactly one minibatch.
+        algo = make_algo(net, envs, n_steps=6, batch_size=12, n_epochs=1, seed=5, **hardening)
+        buf = algo.collect_rollout()
+        assert float(buf.advantages.std()) > 0.05  # healthy-batch premise
+        return algo.update(buf, progress_remaining=1.0)
+
+    off = run_once(adv_std_floor=0.0, adv_clip=None, clip_range_vf=None)
+    on = run_once(adv_std_floor=0.05, adv_clip=10.0, clip_range_vf=0.2)
+    for key in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction"):
+        assert abs(on[key] - off[key]) < 1e-6, key
+    for metrics in (off, on):
+        assert np.isfinite(metrics["approx_kl_max"])
+        assert metrics["approx_kl_max"] >= metrics["approx_kl"]
+
+
 # ----------------------------------------------------------------- guardrails
 def test_batch_size_must_be_whole_sequences():
     obs_shape, n_actions = (4, 5, 5), 6
@@ -304,11 +381,15 @@ def test_config_yaml_and_unknown_keys(tmp_path):
     path.write_text(
         "run_name: abc\nnum_envs: 4\ndrc_depth: 2\n"
         "drc_hidden_channels: 8\ndrc_encoder_channels: [8, 8]\n"
+        "adv_std_floor: 0.02\nadv_clip: 5.0\nclip_range_vf: null\n"
     )
     config = DRCTrainConfig.from_yaml(path)
     assert config.run_name == "abc"
     assert config.num_envs == 4
     assert config.drc_depth == 2
+    assert config.adv_std_floor == 0.02
+    assert config.adv_clip == 5.0
+    assert config.clip_range_vf is None
     net = build_net(config, (8, 8, 8), 8)
     assert net.depth == 2 and net.ticks == 3
     bad = tmp_path / "bad.yaml"
@@ -358,8 +439,9 @@ def test_seeded_runs_produce_identical_first_update():
     m1 = run_once()
     m2 = run_once()
     assert m1 == m2
-    for key in ("policy_loss", "value_loss", "entropy", "approx_kl"):
+    for key in ("policy_loss", "value_loss", "entropy", "approx_kl", "approx_kl_max"):
         assert np.isfinite(m1[key])
+    assert m1["approx_kl_max"] >= m1["approx_kl"]  # max-KL telemetry
     assert m1["n_grad_updates"] == 4  # 2 epochs x 2 minibatches, no early stop
 
 
@@ -402,9 +484,19 @@ def test_learn_smoke_end_to_end(tmp_path):
 
     curve = [json.loads(line) for line in (out / "curve.jsonl").read_text().splitlines()]
     assert len(curve) >= 1
-    assert {"timesteps", "elapsed_s", "steps_per_s", "val_det", "sampler", "losses"} <= set(curve[0])
+    assert {
+        "timesteps", "elapsed_s", "steps_per_s", "val_det", "sampler", "losses",
+        "best_val_det", "best_timesteps",
+    } <= set(curve[0])
     assert curve[0]["val_det"]["episodes"] > 0
     assert curve[0]["sampler"]["sampler"] == "reverse_frontier"
+    assert "approx_kl_max" in curve[0]["losses"]
+    # Best tracking is monotone and consistent with the entries seen so far.
+    best_so_far = None
+    for entry in curve:
+        if best_so_far is None or entry["val_det"]["success_rate"] > best_so_far:
+            best_so_far = entry["val_det"]["success_rate"]
+        assert entry["best_val_det"] == best_so_far
 
     saved_report = json.loads((out / "report.json").read_text())
     assert saved_report == json.loads(json.dumps(report))  # file matches return value
@@ -424,6 +516,13 @@ def test_learn_smoke_end_to_end(tmp_path):
         assert summary["episodes"] > 0
     assert saved_report["final_val_stoch"]["deterministic"] is False
 
+    # Keep-best: periodic evals ran, so a best checkpoint exists and the
+    # report evals used it.
+    assert (out / "model_best.pt").exists()
+    assert saved_report["report_eval_weights"] == "best"
+    assert saved_report["best_val_det"] == curve[-1]["best_val_det"]
+    assert saved_report["best_timesteps"] == curve[-1]["best_timesteps"]
+
     # Model checkpoints exist and reload into a working net.
     assert (out / "model_final.pt").exists()
     payload = torch.load(out / "model_final.pt", weights_only=False)
@@ -431,3 +530,58 @@ def test_learn_smoke_end_to_end(tmp_path):
         DRCTrainConfig(**payload["config"]), payload["observation_shape"], payload["n_actions"]
     )
     net.load_state_dict(payload["state_dict"])
+
+
+def test_report_evals_use_best_checkpoint(tmp_path):
+    """Rebuilding the net from model_best.pt and re-running the deterministic
+    final eval must reproduce report['final_val_det'] exactly."""
+    puzzles = synthetic_puzzles()
+    config = DRCTrainConfig(
+        out_dir=str(tmp_path),
+        run_name="drc_best",
+        horizon=6,
+        curriculum="reverse",
+        min_episodes=10,
+        seed=1,
+        num_envs=4,
+        n_steps=16,
+        batch_size=32,
+        n_epochs=2,
+        total_steps=256,
+        eval_every=64,
+        eval_batch_size=4,
+        final_eval_episodes=1,
+        drc_depth=1,
+        drc_ticks=1,
+        drc_hidden_channels=8,
+        drc_encoder_channels=(8, 8),
+        drc_encoder_kernels=(3, 3),
+        drc_mlp_hidden=32,
+        device="cpu",
+    )
+    report = build_and_train(config, puzzles_override=puzzles)
+    assert report["report_eval_weights"] == "best"
+
+    payload = torch.load(tmp_path / "drc_best" / "model_best.pt", weights_only=False)
+    net = build_net(
+        DRCTrainConfig(**payload["config"]), payload["observation_shape"], payload["n_actions"]
+    )
+    net.load_state_dict(payload["state_dict"])
+    env_config = EnvConfig(
+        horizon=config.horizon,
+        step_penalty=config.step_penalty,
+        goal_reward=config.goal_reward,
+        shaping_coef=config.shaping_coef,
+        gamma=config.gamma,
+        time_channel=config.time_channel,
+        canonical_identity=config.canonical_identity,
+    )
+    redo = evaluate_drc(
+        net,
+        puzzles,  # puzzles_override: final_suite == the training list
+        env_config,
+        episodes_per_puzzle=1,
+        deterministic=True,
+        batch_size=config.eval_batch_size,
+    )
+    assert redo == report["final_val_det"]

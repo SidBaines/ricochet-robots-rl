@@ -32,6 +32,26 @@ Recurrence (the part the legacy stack botched):
   discount (checked at construction), otherwise the potential-based shaping
   is not policy-invariant.
 
+Post-convergence hardening (added after the 8x8 gate run collapsed from
+val_det 1.00 at t=600k to 0.37 at t=650k with no mean-KL signature; see
+artifacts/groundup/drc33_8x8_gate/curve.jsonl):
+
+- ``adv_std_floor``: per-minibatch advantage normalization divides by
+  ``max(std, adv_std_floor)`` instead of ``std``.  At ~100% success the
+  advantage std collapses toward zero and plain normalization amplifies
+  residual noise to unit scale -- the identified collapse amplifier.
+- ``adv_clip``: normalized advantages are clamped to +/- adv_clip.
+- ``clip_range_vf``: SB3-style value clipping (predictions clamped to within
+  clip_range_vf of the behaviour values before the MSE), bounding the
+  shared-trunk gradients from value-loss spikes.
+- Keep-best checkpointing: ``model_best.pt`` is saved whenever the periodic
+  val_det improves and the BEST weights are reloaded for the final report
+  evals; ``approx_kl_max`` (max per-minibatch KL per update) is logged for
+  telemetry.
+
+Setting ``adv_std_floor: 0``, ``adv_clip: null``, ``clip_range_vf: null``
+recovers the pre-hardening update semantics exactly.
+
 Usage:
     .venv-phase2/bin/python -m src.groundup.drc_train --config configs/<name>.yaml
 
@@ -111,6 +131,22 @@ class DRCTrainConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.05
+    # Post-convergence hardening (0 / null / null disables all three and
+    # recovers the pre-hardening semantics exactly).
+    # adv_std_floor: with goal_reward 1.0 (advantage scale O(0.1-1) while
+    # learning), a per-minibatch advantage std below 0.05 practically only
+    # occurs once the batch is (near-)solved and advantages are residual
+    # noise; flooring the denominator caps the noise amplification at 20x
+    # instead of inflating ~1e-3-scale residuals to unit scale.
+    adv_std_floor: float = 0.05
+    # adv_clip: normalized advantages are ~N(0,1), so +/-10 only removes
+    # pathological outliers (e.g. produced by tiny-std minibatches).
+    adv_clip: Optional[float] = 10.0
+    # clip_range_vf: SB3-style value clipping, set to match clip_range (the
+    # SB3 convention when enabled); bounds the per-update value change per
+    # state so value-loss spikes (0.45-0.50 observed pre-collapse) cannot
+    # drive huge gradients through the shared ConvLSTM trunk.
+    clip_range_vf: Optional[float] = 0.2
     # DRC network (paper defaults: DRC(3,3), 32 channels)
     drc_depth: int = 3
     drc_ticks: int = 3
@@ -211,6 +247,44 @@ def compute_gae(
     return advantages, advantages + values
 
 
+def normalize_advantages(
+    advantages: torch.Tensor,
+    std_floor: float = 0.0,
+    clip: Optional[float] = None,
+) -> torch.Tensor:
+    """Per-minibatch advantage normalization with hardening guards.
+
+    ``std_floor`` floors the normalization denominator (``std_floor=0``
+    reproduces the classic ``(a - mean) / (std + 1e-8)`` exactly); ``clip``
+    clamps the result to +/- clip (``None`` disables). See the module
+    docstring for why the guards exist.
+    """
+    if advantages.numel() > 1:
+        denom = torch.clamp(advantages.std(), min=std_floor) + 1e-8
+        advantages = (advantages - advantages.mean()) / denom
+    if clip is not None:
+        advantages = advantages.clamp(-clip, clip)
+    return advantages
+
+
+def clipped_value_loss(
+    values: torch.Tensor,
+    old_values: torch.Tensor,
+    returns: torch.Tensor,
+    clip_range_vf: Optional[float] = None,
+) -> torch.Tensor:
+    """Value MSE with SB3-style clipping of the prediction change.
+
+    With ``clip_range_vf`` set, predictions are clamped to within
+    clip_range_vf of the behaviour-time values before the MSE (so gradients
+    vanish for predictions that already moved further than the clip);
+    ``None`` reproduces the plain MSE exactly.
+    """
+    if clip_range_vf is not None:
+        values = old_values + torch.clamp(values - old_values, -clip_range_vf, clip_range_vf)
+    return F.mse_loss(returns, values)
+
+
 def replay_sequences(
     net: DRCNet,
     obs: torch.Tensor,
@@ -296,6 +370,9 @@ class RecurrentPPO:
         learning_rate: float = 3e-4,
         learning_rate_final: Optional[float] = None,
         target_kl: Optional[float] = 0.05,
+        adv_std_floor: float = 0.05,
+        adv_clip: Optional[float] = 10.0,
+        clip_range_vf: Optional[float] = 0.2,
         device: str = "cpu",
         seed: int = 0,
     ) -> None:
@@ -339,6 +416,9 @@ class RecurrentPPO:
         self.lr0 = learning_rate
         self.lr_final = learning_rate if learning_rate_final is None else learning_rate_final
         self.target_kl = target_kl
+        self.adv_std_floor = adv_std_floor
+        self.adv_clip = adv_clip
+        self.clip_range_vf = clip_range_vf
 
         self.device = torch.device(device)
         self.net = net.to(self.device)
@@ -460,16 +540,23 @@ class RecurrentPPO:
                 entropy = dist.entropy().mean()
                 values = values.reshape(-1)
 
-                advantages = buf.advantages[:, idx].reshape(-1)
-                if advantages.numel() > 1:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                advantages = normalize_advantages(
+                    buf.advantages[:, idx].reshape(-1),
+                    std_floor=self.adv_std_floor,
+                    clip=self.adv_clip,
+                )
                 log_ratio = new_log_prob - buf.log_probs[:, idx].reshape(-1)
                 ratio = torch.exp(log_ratio)
                 policy_loss = -torch.min(
                     advantages * ratio,
                     advantages * torch.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range),
                 ).mean()
-                value_loss = F.mse_loss(buf.returns[:, idx].reshape(-1), values)
+                value_loss = clipped_value_loss(
+                    values,
+                    buf.values[:, idx].reshape(-1),
+                    buf.returns[:, idx].reshape(-1),
+                    clip_range_vf=self.clip_range_vf,
+                )
                 loss = policy_loss - self.ent_coef * entropy + self.vf_coef * value_loss
 
                 with torch.no_grad():
@@ -507,6 +594,8 @@ class RecurrentPPO:
             "value_loss": float(np.mean(value_losses)),
             "entropy": float(np.mean(entropies)),
             "approx_kl": float(np.mean(approx_kls)),
+            # Max per-minibatch KL: collapse telemetry the mean hides.
+            "approx_kl_max": float(np.max(approx_kls)),
             "clip_fraction": float(np.mean(clip_fracs)),
             "explained_variance": explained_variance,
             "n_grad_updates": n_grad_updates,
@@ -755,6 +844,9 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         learning_rate=config.learning_rate,
         learning_rate_final=config.learning_rate_final,
         target_kl=config.target_kl,
+        adv_std_floor=config.adv_std_floor,
+        adv_clip=config.adv_clip,
+        clip_range_vf=config.clip_range_vf,
         device=device,
         seed=config.seed,
     )
@@ -768,9 +860,11 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
     curve_path = out / "curve.jsonl"
     start_time = time.time()
     next_eval = config.eval_every
+    best_val_det: Optional[float] = None
+    best_timesteps: Optional[int] = None
 
     def on_iteration(algo: RecurrentPPO, metrics: Dict[str, object]) -> None:
-        nonlocal next_eval
+        nonlocal next_eval, best_val_det, best_timesteps
         if algo.num_timesteps < next_eval:
             return
         next_eval += config.eval_every
@@ -782,11 +876,17 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             deterministic=True,
             batch_size=config.eval_batch_size,
         )
+        if best_val_det is None or det["success_rate"] > best_val_det:
+            best_val_det = float(det["success_rate"])
+            best_timesteps = int(algo.num_timesteps)
+            _save_model(net, config, out / "model_best.pt")
         entry = {
             "timesteps": int(algo.num_timesteps),
             "elapsed_s": round(time.time() - start_time, 1),
             "steps_per_s": round(algo.num_timesteps / max(1e-9, time.time() - start_time), 1),
             "val_det": det,
+            "best_val_det": best_val_det,
+            "best_timesteps": best_timesteps,
             "sampler": sampler.stats(),
             "losses": metrics,
         }
@@ -813,10 +913,23 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
     algo.learn(config.total_steps, on_iteration)
     _save_model(net, config, out / "model_final.pt")
 
+    # Final report evals use the BEST periodic-eval checkpoint (post-convergence
+    # collapse protection); fall back to the final weights when no periodic
+    # eval ever ran (total_steps < eval_every).
+    report_eval_weights = "final"
+    best_path = out / "model_best.pt"
+    if best_path.exists():
+        payload = torch.load(best_path, map_location="cpu", weights_only=False)
+        net.load_state_dict(payload["state_dict"])
+        report_eval_weights = "best"
+
     report = {
         "config": dataclasses.asdict(config),
         "policy_params": int(n_params),
         "elapsed_s": round(time.time() - start_time, 1),
+        "best_val_det": best_val_det,
+        "best_timesteps": best_timesteps,
+        "report_eval_weights": report_eval_weights,
         "final_val_det": evaluate_drc(
             net,
             final_suite,
