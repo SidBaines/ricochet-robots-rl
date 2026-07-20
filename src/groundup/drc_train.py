@@ -41,8 +41,8 @@ artifacts/groundup/drc33_8x8_gate/curve.jsonl):
   advantage std collapses toward zero and plain normalization amplifies
   residual noise to unit scale -- the identified collapse amplifier.
 - ``adv_clip``: normalized advantages are clamped to +/- adv_clip.
-- ``clip_range_vf``: SB3-style value clipping (predictions clamped to within
-  clip_range_vf of the behaviour values before the MSE), bounding the
+- ``clip_range_vf``: PPO2-style value clipping (element-wise max of clipped
+  and unclipped losses; default off), bounding the
   shared-trunk gradients from value-loss spikes.
 - Keep-best checkpointing: ``model_best.pt`` is saved whenever the periodic
   val_det improves and the BEST weights are reloaded for the final report
@@ -146,7 +146,7 @@ class DRCTrainConfig:
     # SB3 convention when enabled); bounds the per-update value change per
     # state so value-loss spikes (0.45-0.50 observed pre-collapse) cannot
     # drive huge gradients through the shared ConvLSTM trunk.
-    clip_range_vf: Optional[float] = 0.2
+    clip_range_vf: Optional[float] = None
     # DRC network (paper defaults: DRC(3,3), 32 channels)
     drc_depth: int = 3
     drc_ticks: int = 3
@@ -273,16 +273,23 @@ def clipped_value_loss(
     returns: torch.Tensor,
     clip_range_vf: Optional[float] = None,
 ) -> torch.Tensor:
-    """Value MSE with SB3-style clipping of the prediction change.
+    """Value MSE with PPO2-style clipping (element-wise max of losses).
 
-    With ``clip_range_vf`` set, predictions are clamped to within
-    clip_range_vf of the behaviour-time values before the MSE (so gradients
-    vanish for predictions that already moved further than the clip);
-    ``None`` reproduces the plain MSE exactly.
+    The clip-only variant (SB3's ``clip_range_vf``: loss on the clamped
+    prediction alone) under-corrects large errors — gradients vanish once the
+    prediction has moved past the clip, so the value net can only drift
+    clip_range_vf per rollout while the truncation bootstrap keeps feeding the
+    biased V back into rewards. That positive feedback produced exponential
+    value divergence in the drc33_8x8_gate_v2 run (value_loss 43 -> 9.4e6,
+    policy entropy -> 0). The max form keeps a full correction gradient
+    whenever the unclipped error dominates; ``None`` is the plain MSE.
     """
-    if clip_range_vf is not None:
-        values = old_values + torch.clamp(values - old_values, -clip_range_vf, clip_range_vf)
-    return F.mse_loss(returns, values)
+    unclipped = (returns - values) ** 2
+    if clip_range_vf is None:
+        return unclipped.mean()
+    clipped_pred = old_values + torch.clamp(values - old_values, -clip_range_vf, clip_range_vf)
+    clipped = (returns - clipped_pred) ** 2
+    return torch.maximum(unclipped, clipped).mean()
 
 
 def replay_sequences(
@@ -372,7 +379,7 @@ class RecurrentPPO:
         target_kl: Optional[float] = 0.05,
         adv_std_floor: float = 0.05,
         adv_clip: Optional[float] = 10.0,
-        clip_range_vf: Optional[float] = 0.2,
+        clip_range_vf: Optional[float] = None,
         device: str = "cpu",
         seed: int = 0,
     ) -> None:

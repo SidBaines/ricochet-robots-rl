@@ -321,15 +321,23 @@ def test_clipped_value_loss_matches_sb3_and_bounds_gradients():
         clipped_value_loss(values, old_values, returns, None),
         torch.nn.functional.mse_loss(returns, values),
     )
-    # SB3 semantics: prediction clamped to old_values +/- clip before the MSE.
+    # PPO2 max-of-losses semantics (NOT SB3's clip-only variant, which
+    # under-corrects large errors and produced exponential value divergence in
+    # drc33_8x8_gate_v2: value_loss 43 -> 9.4e6 via the truncation-bootstrap
+    # feedback loop).
     loss = clipped_value_loss(values, old_values, returns, clip_range_vf=0.2)
-    expected_pred = torch.tensor([0.1, 0.2, -0.2])
-    assert torch.allclose(loss, torch.nn.functional.mse_loss(returns, expected_pred))
-    # Gradient flows only where the prediction change is inside the clip.
+    clipped_pred = torch.tensor([0.1, 0.2, -0.2])
+    expected = torch.maximum((returns - values.detach()) ** 2, (returns - clipped_pred) ** 2).mean()
+    assert torch.allclose(loss, expected)
     loss.backward()
-    assert values.grad[0] != 0.0  # |0.1| < 0.2: live
-    assert values.grad[1] == 0.0  # clamped: no gradient
-    assert values.grad[2] == 0.0  # clamped: no gradient
+    # element 0: inside the clip -> full gradient
+    assert values.grad[0] != 0.0
+    # element 1: moved toward target past the clip; pessimistic clipped branch
+    # dominates and its gradient is zero -> no further incentive to move
+    assert values.grad[1] == 0.0
+    # element 2: far from target; unclipped branch dominates -> FULL correction
+    # gradient (this is the case the clip-only variant killed)
+    assert values.grad[2] != 0.0
 
 
 def test_hardening_guards_inactive_on_healthy_update():

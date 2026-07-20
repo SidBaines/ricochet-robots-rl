@@ -1,0 +1,27 @@
+# DRC(3,3) recurrent PPO gate on the phase2b 8x8 bank, all helpers on.
+bank_path: artifacts/phase2b_bank/size-8x8_numR2_ET1_CL1_gen10.parquet
+out_dir: artifacts/groundup
+run_name: drc33_8x8_gate_v3
+curriculum: reverse
+horizon: 16
+shaping_coef: 0.1
+stop_planes: true
+distance_plane: true
+seed: 11
+num_envs: 32
+n_steps: 32
+batch_size: 256
+n_epochs: 2
+total_steps: 1000000
+learning_rate: 3.0e-4
+learning_rate_final: 5.0e-5
+drc_depth: 3
+drc_ticks: 3
+drc_hidden_channels: 32
+eval_every: 50000
+eval_per_length: 25
+final_eval_per_length: 60
+final_eval_episodes: 3
+device: auto
+wandb_project: ricochet-robots-rl
+wandb_run_name: groundup-drc33-8x8-gate-v3
