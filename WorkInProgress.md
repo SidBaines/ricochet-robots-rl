@@ -559,3 +559,16 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   patch embedding avoids the legacy NatureCNN aliasing entirely.
 - W&B: groundup-r1-16x16-rgb. Ladder implication: step 5 (planes→RGB) is
   de-risked; the remaining hard step is removing the stop planes (step 2).
+
+### DRC(3,3) 8×8 gate v3 PASSED — stable end to end (2026-07-20)
+
+- Fixed value-clipping bug (v2's clip-only form caused exponential value
+  divergence via the truncation-bootstrap feedback loop; replaced with the
+  PPO2 max-of-losses form, default off). Guards from v1's diagnosis retained
+  (advantage-std floor + clamp, keep-best checkpoints, max-KL telemetry).
+- v3 run: 99% val det at 251k, 100% at 600k, **stable 97–100% through 1M**
+  (both prior collapse windows passed cleanly). Final report from best
+  checkpoint: **99.2% det / 97.9% stoch**. 20 min wall-clock, ~830 st/s,
+  998k params (faithful DRC(3,3)).
+- DRC track: architecture + recurrent trainer validated at 8×8. W&B:
+  groundup-drc33-8x8-gate-v3. Next candidate: DRC(3,3) 16×16 (all helpers).
