@@ -15,6 +15,13 @@ from .env import EnvConfig, RicochetEnv
 from .puzzles import Puzzle
 
 
+def _stack_obs(obs_list: List) -> object:
+    """Stack per-env observations into a batch; supports Dict observations."""
+    if isinstance(obs_list[0], dict):
+        return {key: np.stack([obs[key] for obs in obs_list]) for key in obs_list[0]}
+    return np.stack(obs_list)
+
+
 def _aggregate(records: List[dict]) -> Dict[str, object]:
     overall = float(np.mean([r["success"] for r in records])) if records else 0.0
     by_length: Dict[int, List[int]] = defaultdict(list)
@@ -75,7 +82,7 @@ def evaluate_policy(
 
     while any(p is not None for p in slot_puzzle):
         active = [s for s in range(n_slots) if slot_puzzle[s] is not None]
-        obs_batch = np.stack([obs_list[s] for s in active])
+        obs_batch = _stack_obs([obs_list[s] for s in active])
         mask_batch = np.stack([envs[s].action_masks() for s in active])
         actions, _ = model.predict(
             obs_batch, action_masks=mask_batch, deterministic=deterministic

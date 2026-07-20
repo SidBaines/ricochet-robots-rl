@@ -11,7 +11,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from gymnasium.spaces import Box
-from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
+from sb3_contrib.common.maskable.policies import (
+    MaskableActorCriticPolicy,
+    MaskableMultiInputActorCriticPolicy,
+)
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
@@ -165,6 +168,125 @@ class SpatialPolicy(MaskableActorCriticPolicy):
             obs_shape=self.observation_space.shape,
             n_actions=int(self.action_space.n),
             stop_offset=self._stop_offset,
+            channels=self._trunk_channels,
+            n_blocks=self._trunk_blocks,
+            vf_latent=self._vf_latent,
+        )
+
+
+class SpatialRgbExtractor(nn.Module):
+    """SpatialExtractor variant for Dict obs {image: pixels, planes: helpers}.
+
+    The pixel stream is patch-embedded back to cell resolution with a
+    cell-aligned strided conv (kernel = stride = cell_px), concatenated with
+    the helper planes, and fed through the same residual trunk, pointer-style
+    actor readout (contract score maps against the stop planes, which sit at
+    offset 0 of the planes tensor) and pooled critic as SpatialExtractor.
+    """
+
+    def __init__(
+        self,
+        image_shape: tuple[int, int, int],
+        planes_shape: tuple[int, int, int],
+        n_actions: int,
+        cell_px: int,
+        embed_channels: int = 32,
+        channels: int = 64,
+        n_blocks: int = 6,
+        vf_latent: int = 64,
+    ) -> None:
+        super().__init__()
+        self.image_shape = image_shape
+        self.planes_shape = planes_shape
+        self.n_actions = n_actions
+        self.image_numel = image_shape[0] * image_shape[1] * image_shape[2]
+        self.latent_dim_pi = n_actions
+        self.latent_dim_vf = vf_latent
+        if image_shape[1] != planes_shape[1] * cell_px or image_shape[2] != planes_shape[2] * cell_px:
+            raise ValueError("image dims must be cell_px x the planes grid")
+        self.embed = nn.Sequential(
+            nn.Conv2d(image_shape[0], embed_channels, kernel_size=cell_px, stride=cell_px),
+            nn.ReLU(inplace=True),
+        )
+        self.stem = nn.Sequential(
+            nn.Conv2d(embed_channels + planes_shape[0], channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.blocks = nn.Sequential(*[_ResidualBlock(channels) for _ in range(n_blocks)])
+        self.score = nn.Conv2d(channels, n_actions, kernel_size=1)
+        self.vf = nn.Sequential(
+            nn.Linear(2 * channels, vf_latent),
+            nn.LayerNorm(vf_latent),
+            nn.ReLU(inplace=True),
+        )
+
+    def _split(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        image = features[:, : self.image_numel].reshape(features.shape[0], *self.image_shape)
+        planes = features[:, self.image_numel :].reshape(features.shape[0], *self.planes_shape)
+        return image, planes
+
+    def _trunk(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        image, planes = self._split(features)
+        cells = torch.cat([self.embed(image), planes], dim=1)
+        return self.blocks(self.stem(cells)), planes
+
+    def _actor(self, trunk: torch.Tensor, planes: torch.Tensor) -> torch.Tensor:
+        stop = planes[:, : self.n_actions]
+        return (self.score(trunk) * stop).sum(dim=(2, 3))
+
+    def _critic(self, trunk: torch.Tensor) -> torch.Tensor:
+        pooled = torch.cat([trunk.mean(dim=(2, 3)), trunk.amax(dim=(2, 3))], dim=1)
+        return self.vf(pooled)
+
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        trunk, planes = self._trunk(features)
+        return self._actor(trunk, planes), self._critic(trunk)
+
+    def forward_actor(self, features: torch.Tensor) -> torch.Tensor:
+        trunk, planes = self._trunk(features)
+        return self._actor(trunk, planes)
+
+    def forward_critic(self, features: torch.Tensor) -> torch.Tensor:
+        trunk, _ = self._trunk(features)
+        return self._critic(trunk)
+
+
+class SpatialRgbPolicy(MaskableMultiInputActorCriticPolicy):
+    """Masked actor-critic over Dict {image, planes} with SpatialRgbExtractor.
+
+    The default CombinedExtractor flattens and concatenates the two streams
+    (image first: gymnasium Dict spaces iterate alphabetically); the extractor
+    splits them back by size. Requires stop planes at planes offset 0.
+    """
+
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        lr_schedule,
+        *args,
+        cell_px: int,
+        embed_channels: int = 32,
+        trunk_channels: int = 64,
+        trunk_blocks: int = 6,
+        vf_latent: int = 64,
+        **kwargs,
+    ) -> None:
+        self._cell_px = int(cell_px)
+        self._embed_channels = int(embed_channels)
+        self._trunk_channels = int(trunk_channels)
+        self._trunk_blocks = int(trunk_blocks)
+        self._vf_latent = int(vf_latent)
+        kwargs.pop("net_arch", None)
+        super().__init__(observation_space, action_space, lr_schedule, *args, **kwargs)
+
+    def _build_mlp_extractor(self) -> None:
+        self.mlp_extractor = SpatialRgbExtractor(
+            image_shape=self.observation_space["image"].shape,
+            planes_shape=self.observation_space["planes"].shape,
+            n_actions=int(self.action_space.n),
+            cell_px=self._cell_px,
+            embed_channels=self._embed_channels,
             channels=self._trunk_channels,
             n_blocks=self._trunk_blocks,
             vf_latent=self._vf_latent,

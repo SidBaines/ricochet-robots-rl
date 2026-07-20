@@ -327,3 +327,61 @@ def test_spatial_policy_builds_and_masks(puzzles16):
     assert abs(probs.sum() - 1.0) < 1e-5
     # short learn smoke: one rollout + update must run
     model.learn(total_timesteps=32)
+
+
+@needs_bank16
+def test_rgb_obs_rendering(puzzles16):
+    """RGB dict obs: image faithfully encodes walls/goal/robots; planes carry helpers."""
+    config = EnvConfig(rgb_obs=True, rgb_cell_px=5, stop_planes=True, distance_plane=True)
+    env = RicochetEnv(puzzles16, config)
+    obs, _ = env.reset(options={"puzzle_index": 0})
+    puzzle = puzzles16[0]
+    k = 5
+    img, planes = obs["image"], obs["planes"]
+    assert img.shape == (3, 16 * k, 16 * k) and planes.shape == (16 + 1 + 1, 16, 16)
+    # target robot (canonical slot 0) drawn red at its cell centre
+    tr, tc = env._robots[0]
+    center = img[:, tr * k + 2, tc * k + 2]
+    assert center[0] > 0.8 and center[1] < 0.3 and center[2] < 0.3
+    # walls are black pixels: check a known interior wall from the layout
+    hw = np.argwhere(puzzle.h_walls[1:-1, :])
+    r, c = hw[0][0] + 1, hw[0][1]
+    assert np.all(img[:, r * k, c * k + 2] < 0.05)
+    # goal cell tinted toward red (not pure white) unless a robot covers it
+    gr, gc = puzzle.goal
+    if (gr, gc) not in env._robots:
+        goal_px = img[:, gr * k + 2, gc * k + 2]
+        assert goal_px[0] > goal_px[1] and goal_px[0] > goal_px[2]
+    # image changes when a robot moves; static bg (a wall pixel) unchanged
+    mask = env.action_masks()
+    obs2, _, _, _, _ = env.step(int(np.flatnonzero(mask)[0]))
+    assert not np.array_equal(obs["image"], obs2["image"])
+    assert np.all(obs2["image"][:, r * k, c * k + 2] < 0.05)
+
+
+@needs_bank16
+def test_rgb_spatial_policy_builds_and_masks(puzzles16):
+    import torch
+    from sb3_contrib import MaskablePPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from src.groundup.model import SpatialRgbPolicy
+
+    config = EnvConfig(rgb_obs=True, rgb_cell_px=5, stop_planes=True, distance_plane=True)
+    env = DummyVecEnv([lambda: RicochetEnv(puzzles16[:10], config, seed=0)])
+    model = MaskablePPO(
+        SpatialRgbPolicy,
+        env,
+        n_steps=16,
+        batch_size=16,
+        device="cpu",
+        policy_kwargs=dict(cell_px=5, embed_channels=8, trunk_channels=16, trunk_blocks=1),
+    )
+    raw = RicochetEnv(puzzles16[:10], config, seed=1)
+    obs, _ = raw.reset(options={"puzzle_index": 0})
+    mask = raw.action_masks()
+    obs_t = {key: torch.as_tensor(value[None]) for key, value in obs.items()}
+    dist = model.policy.get_distribution(obs_t, action_masks=torch.as_tensor(mask[None]))
+    probs = dist.distribution.probs.detach().numpy()[0]
+    assert np.all(probs[~mask] < 1e-8) and abs(probs.sum() - 1.0) < 1e-5
+    model.learn(total_timesteps=32)

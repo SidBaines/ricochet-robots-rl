@@ -39,6 +39,9 @@ class TrainConfig:
     canonical_identity: bool = True
     stop_planes: bool = False
     distance_plane: bool = False
+    rgb_obs: bool = False
+    rgb_cell_px: int = 5
+    embed_channels: int = 32
     # curriculum: "reverse" | "uniform"
     curriculum: str = "reverse"
     tau: float = 0.75
@@ -146,7 +149,7 @@ def build_and_train(config: TrainConfig) -> dict:
     from .curriculum import ReverseFrontierSampler, UniformSampler
     from .env import EnvConfig, RicochetEnv
     from .evaluate import evaluate_policy, scripted_baseline
-    from .model import GridTrunk, SpatialPolicy
+    from .model import GridTrunk, SpatialPolicy, SpatialRgbPolicy
     from .puzzles import load_puzzles, stratified_subset
 
     out = Path(config.out_dir) / config.run_name
@@ -158,6 +161,8 @@ def build_and_train(config: TrainConfig) -> dict:
         raise ValueError(f"Unknown policy_head: {config.policy_head}")
     if config.policy_head == "spatial" and not config.stop_planes:
         raise ValueError("policy_head: spatial requires stop_planes: true")
+    if config.rgb_obs and config.policy_head != "spatial":
+        raise ValueError("rgb_obs currently requires policy_head: spatial")
     env_config = EnvConfig(
         horizon=config.horizon,
         step_penalty=config.step_penalty,
@@ -168,6 +173,8 @@ def build_and_train(config: TrainConfig) -> dict:
         canonical_identity=config.canonical_identity,
         stop_planes=config.stop_planes,
         distance_plane=config.distance_plane,
+        rgb_obs=config.rgb_obs,
+        rgb_cell_px=config.rgb_cell_px,
     )
 
     split_kwargs = dict(
@@ -218,7 +225,16 @@ def build_and_train(config: TrainConfig) -> dict:
     device = _resolve_device(config.device)
     lr0, lr1 = config.learning_rate, config.learning_rate_final
 
-    if config.policy_head == "spatial":
+    if config.rgb_obs:
+        policy = SpatialRgbPolicy
+        policy_kwargs = dict(
+            cell_px=config.rgb_cell_px,
+            embed_channels=config.embed_channels,
+            trunk_channels=config.channels,
+            trunk_blocks=config.n_blocks,
+            vf_latent=config.vf_latent,
+        )
+    elif config.policy_head == "spatial":
         probe_env = RicochetEnv(train_puzzles[:1], env_config)
         policy = SpatialPolicy
         policy_kwargs = dict(

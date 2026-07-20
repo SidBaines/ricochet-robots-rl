@@ -41,6 +41,8 @@ def main() -> None:
         canonical_identity=train_config["canonical_identity"],
         stop_planes=train_config.get("stop_planes", False),
         distance_plane=train_config.get("distance_plane", False),
+        rgb_obs=train_config.get("rgb_obs", False),
+        rgb_cell_px=train_config.get("rgb_cell_px", 5),
     )
     puzzles = load_puzzles(
         train_config["bank_path"],

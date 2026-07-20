@@ -43,6 +43,11 @@ class EnvConfig:
     stop_planes: bool = False
     # Normalized relaxed-distance-to-goal map (same field the shaping uses).
     distance_plane: bool = False
+    # RGB observation mode: the board (walls/goal/robots) is delivered as a
+    # rendered image instead of structured planes; helper planes (stop,
+    # distance, time) ride alongside at cell resolution in a Dict obs.
+    rgb_obs: bool = False
+    rgb_cell_px: int = 5
 
 
 class RicochetEnv(gym.Env):
@@ -80,16 +85,34 @@ class RicochetEnv(gym.Env):
         self._rng = np.random.default_rng(seed)
         self._dmap_cache: Dict[int, np.ndarray] = {}
 
-        channels = 5 + self.num_robots
+        helper_channels = 0
         if config.stop_planes:
-            channels += 4 * self.num_robots
+            helper_channels += 4 * self.num_robots
         if config.distance_plane:
-            channels += 1
+            helper_channels += 1
         if config.time_channel:
-            channels += 1
-        self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(channels, self.height, self.width), dtype=np.float32
-        )
+            helper_channels += 1
+        if config.rgb_obs:
+            if helper_channels == 0:
+                raise ValueError("rgb_obs currently requires at least one helper plane")
+            k = int(config.rgb_cell_px)
+            self.observation_space = spaces.Dict(
+                {
+                    "image": spaces.Box(
+                        low=0.0, high=1.0,
+                        shape=(3, self.height * k, self.width * k), dtype=np.float32,
+                    ),
+                    "planes": spaces.Box(
+                        low=0.0, high=1.0,
+                        shape=(helper_channels, self.height, self.width), dtype=np.float32,
+                    ),
+                }
+            )
+        else:
+            channels = 5 + self.num_robots + helper_channels
+            self.observation_space = spaces.Box(
+                low=0.0, high=1.0, shape=(channels, self.height, self.width), dtype=np.float32
+            )
         self.action_space = spaces.Discrete(4 * self.num_robots)
 
         self._puzzle: Optional[Puzzle] = None
@@ -166,12 +189,8 @@ class RicochetEnv(gym.Env):
         tr, tc = self._robots[self._target_index()]
         return -self.config.shaping_coef * float(dmap[tr, tc])
 
-    def _obs(self) -> np.ndarray:
-        planes = self._static_planes(self._puzzle)
-        robot_planes = np.zeros((self.num_robots, self.height, self.width), dtype=np.float32)
-        for i, (r, c) in enumerate(self._robots):
-            robot_planes[i, r, c] = 1.0
-        parts = [planes, robot_planes]
+    def _helper_planes(self) -> list:
+        parts = []
         if self.config.stop_planes:
             stops = np.zeros((4 * self.num_robots, self.height, self.width), dtype=np.float32)
             for rid in range(self.num_robots):
@@ -185,6 +204,21 @@ class RicochetEnv(gym.Env):
         if self.config.time_channel:
             remaining = (self.config.horizon - self._steps) / self.config.horizon
             parts.append(np.full((1, self.height, self.width), remaining, dtype=np.float32))
+        return parts
+
+    def _obs(self):
+        if self.config.rgb_obs:
+            from .render import render
+
+            return {
+                "image": render(self._puzzle, self._robots, int(self.config.rgb_cell_px)),
+                "planes": np.concatenate(self._helper_planes(), axis=0),
+            }
+        planes = self._static_planes(self._puzzle)
+        robot_planes = np.zeros((self.num_robots, self.height, self.width), dtype=np.float32)
+        for i, (r, c) in enumerate(self._robots):
+            robot_planes[i, r, c] = 1.0
+        parts = [planes, robot_planes] + self._helper_planes()
         return np.concatenate(parts, axis=0)
 
     @property
