@@ -1,0 +1,29 @@
+# DRC(3,3) on 16x16, 4 robots, lengths 1-8 (phase4 bank), all helpers, 10M steps.
+# Trainer: hardened recurrent masked PPO (adv-std floor+clamp, keep-best,
+# max-KL telemetry, value clip default off).
+bank_path: artifacts/phase4_bank/size-16x16_numR4_ET2_CL2_gen10.parquet
+out_dir: artifacts/groundup
+run_name: drc33_16x16
+curriculum: reverse
+horizon: 32
+shaping_coef: 0.1
+stop_planes: true
+distance_plane: true
+seed: 11
+num_envs: 32
+n_steps: 32
+batch_size: 256
+n_epochs: 2
+total_steps: 10000000
+learning_rate: 3.0e-4
+learning_rate_final: 5.0e-5
+drc_depth: 3
+drc_ticks: 3
+drc_hidden_channels: 32
+eval_every: 250000
+eval_per_length: 25
+final_eval_per_length: 50
+final_eval_episodes: 3
+device: auto
+wandb_project: ricochet-robots-rl
+wandb_run_name: groundup-drc33-16x16
