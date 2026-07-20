@@ -1,4 +1,6 @@
 # DRC(3,3) on 16x16, 4 robots, lengths 1-8 (phase4 bank), all helpers, 10M steps.
+# Throughput (benchmarked 2026-07-20): 128 envs + 1 epoch = 1,000 st/s (2.8h/10M)
+# vs 440 st/s baseline; BPTT update dominates wall time (~85%).
 # Trainer: hardened recurrent masked PPO (adv-std floor+clamp, keep-best,
 # max-KL telemetry, value clip default off).
 bank_path: artifacts/phase4_bank/size-16x16_numR4_ET2_CL2_gen10.parquet
@@ -10,10 +12,10 @@ shaping_coef: 0.1
 stop_planes: true
 distance_plane: true
 seed: 11
-num_envs: 32
+num_envs: 128
 n_steps: 32
-batch_size: 256
-n_epochs: 2
+batch_size: 1024
+n_epochs: 1
 total_steps: 10000000
 learning_rate: 3.0e-4
 learning_rate_final: 5.0e-5
