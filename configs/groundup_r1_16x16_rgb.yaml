@@ -1,0 +1,29 @@
+# E3: 16x16, 4 robots, lengths 1-8 (phase4 bank), from scratch - the headline.
+# Full recipe: masked PPO + shaping + reverse-frontier curriculum + canonical identity.
+bank_path: artifacts/phase4_bank/size-16x16_numR4_ET2_CL2_gen10.parquet
+out_dir: artifacts/groundup
+run_name: r1_16x16_rgb
+curriculum: reverse
+horizon: 32
+shaping_coef: 0.1
+seed: 11
+num_envs: 32
+n_steps: 128
+batch_size: 1024
+n_epochs: 4
+total_steps: 10000000
+eval_every: 250000
+eval_per_length: 25
+final_eval_per_length: 50
+final_eval_episodes: 3
+channels: 64
+n_blocks: 6
+device: auto
+wandb_project: ricochet-robots-rl
+wandb_run_name: groundup-r1-16x16-rgb
+policy_head: spatial
+stop_planes: true
+distance_plane: true
+rgb_obs: true
+rgb_cell_px: 5
+embed_channels: 32

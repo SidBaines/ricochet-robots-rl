@@ -513,3 +513,24 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - Experiment ladder closed: E1 overfit ✓, E2 8×8 (99.6% sealed test) ✓,
   E3 16×16 (78.1% sealed test, from scratch) ✓, E4 causal ablations ✓.
   Multi-seed confirmation of E3 remains open (single seed 11 so far).
+
+## RGB + DRC tracks (2026-07-20)
+
+### R1 8×8 RGB gate PASSED (2026-07-20)
+
+- RGB Dict obs (40×40 px image at 5 px/cell + helper planes at cell
+  resolution), SpatialRgbPolicy (cell-aligned patch embed → shared trunk →
+  pointer head). Walls/goal/robots are perceived from pixels only.
+- 1M steps, ~5 min, 331k params, ~2,950 st/s: **99.6% det / 98.6% stoch**
+  held-out val — identical to the structured-planes result (99.6%).
+- Example obs image saved for reference; canonical identity on (target =
+  red), goal tinted with target colour. W&B: groundup-r1-8x8-rgb.
+
+### DRC trainer landed; DRC 8×8 gate + RGB 16×16 chained (2026-07-20)
+
+- src/groundup/drc_train.py: self-contained recurrent masked PPO for the
+  faithful DRCNet (sequence replay from stored segment-initial states with
+  in-replay done resets; collection==replay invariant tested; truncation
+  bootstrap; masks stored/applied everywhere). 11 CPU tests green (49 total
+  in the groundup suite).
+- Chain launched: DRC(3,3) 8×8 gate (all helpers), then RGB 16×16 (10M).
