@@ -534,3 +534,17 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   bootstrap; masks stored/applied everywhere). 11 CPU tests green (49 total
   in the groundup suite).
 - Chain launched: DRC(3,3) 8×8 gate (all helpers), then RGB 16×16 (10M).
+
+### DRC(3,3) 8×8 gate: learnability PASSED, late-run collapse found (2026-07-20)
+
+- All helpers on, 1M steps, ~810 st/s. val_det 0.54 @50k → 0.97 @251k →
+  **1.00 @450–600k** — DRC + the recurrent trainer learn the game cleanly.
+- Then a terminal post-convergence collapse between 600k and 650k (1.00 →
+  0.37 → 0.04 by 850k, entropy 0.14→0.42, mean-KL guard never triggered).
+  Diagnosis: near-zero advantage std at convergence amplifies outliers in
+  per-minibatch advantage normalization; value-loss spikes through the shared
+  ConvLSTM trunk are the co-suspect (0.45–0.50 spikes seen pre-collapse).
+- Hardening delegated (keep-best checkpointing, advantage-std floor +
+  normalized-advantage clamp, value clipping, max-KL telemetry); 8×8 re-gate
+  queued after the RGB 16×16 run frees the GPU.
+- RGB 16×16 (10M, all helpers) now training: W&B groundup-r1-16x16-rgb.
