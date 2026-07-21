@@ -621,3 +621,18 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - 8×8, fixed-geometry renderer (+1px canvas): 98.75% det / 99.7% stoch at 1M
   steps — matches the old-renderer gate (99.6%). Rendering fixes are
   performance-neutral; all future RGB runs use the corrected geometry.
+
+### P1 launched: 12×12 plane-free learnability + landing-cell probes (2026-07-21)
+
+- New 12×12/3-robot bank generated (ET2/CL2, lengths 1–8): 53,000 puzzles of
+  60,000 attempts, fingerprint 68ea3ea6c85ed7eb; splits disjoint; 100/100
+  sampled plans replay to the goal. Spot-check board sheet reviewed by Sid.
+- Run: plane-free obs (walls/goal/robots/time only — no stop/distance
+  planes), flat head (6 blocks, RF ±13 ≥ max ray 11), shaping + reverse
+  curriculum + masking retained. 200M-step / ~1-day budget, snapshots every
+  5M. W&B: groundup-p1-12x12-planefree.
+- Question: how long until a conv net learns slide dynamics from RL alone at
+  a scale between 8×8 (learned plane-free) and 16×16 (didn't, in 2M)?
+- Instrument: linear landing-cell probes (src/groundup/probe_landing.py) on
+  frozen trunk activations per checkpoint, stratified by slide length, with
+  random-init control — tracks when/whether the ray-tracing circuit forms.
