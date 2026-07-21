@@ -615,3 +615,9 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   Natural follow-up: DRC core + pointer readout hybrid (documented
   deviation), and/or 2-epoch training if sample efficiency is suspected.
 - 8×8 RGB re-gate on the fixed renderer launched (groundup-r1-8x8-rgb-v2render).
+
+### RGB re-gate on fixed renderer PASSED (2026-07-21)
+
+- 8×8, fixed-geometry renderer (+1px canvas): 98.75% det / 99.7% stoch at 1M
+  steps — matches the old-renderer gate (99.6%). Rendering fixes are
+  performance-neutral; all future RGB runs use the corrected geometry.
