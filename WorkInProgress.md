@@ -598,3 +598,20 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   feedforward curve by ~6pp at matched steps so far. W&B run
   groundup-drc33-16x16 (xd0ucugn).
 - Queued after it: 8×8 RGB re-gate on the fixed renderer.
+
+### DRC(3,3) 16×16 COMPLETE: 64.8% sealed test — readout-limited (2026-07-21)
+
+- 10M steps (wall-clock stretched to 15.7h by machine sleeps; ~2.8h awake).
+  Best checkpoint 8.5M (63.5% val). Keep-best used for all final evals.
+- **Sealed test: 64.8% det / 63.5% stoch** (suite of 480). By robots-moved
+  (det): 89% / 39% / 41% — multi-robot coordination is the gap vs the
+  feedforward pointer-head model (89/68/59, 78.1% overall).
+- Learning curve ground slowly upward after an apparent plateau at ~60%
+  (3.5M) to ~63% (8.5M); never approached the feedforward trajectory.
+- Interpretation: DRC's paper-faithful flatten→FC readout is the binding
+  constraint at 16×16 (the same bottleneck E4 measured at +51pp on the
+  feedforward side). The recurrent ticks compensate substantially
+  (vs the flat-head feedforward's 12% at 2M) but do not close the gap.
+  Natural follow-up: DRC core + pointer readout hybrid (documented
+  deviation), and/or 2-epoch training if sample efficiency is suspected.
+- 8×8 RGB re-gate on the fixed renderer launched (groundup-r1-8x8-rgb-v2render).
