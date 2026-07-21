@@ -572,3 +572,20 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
   998k params (faithful DRC(3,3)).
 - DRC track: architecture + recurrent trainer validated at 8×8. W&B:
   groundup-drc33-8x8-gate-v3. Next candidate: DRC(3,3) 16×16 (all helpers).
+
+### RGB renderer geometry fixes after visual review (2026-07-20)
+
+- Sid's review of the example obs found four defects, all rooted in the
+  H*k-px canvas clamping the final boundary line into the last cell row/col:
+  open wall corners (central block), shrunken bottom/right-edge cells,
+  off-centre undersized robot sprites, and goal tint bleeding onto the
+  left grid line.
+- Fix: canvas is now (H*k+1)x(W*k+1) so every boundary line owns a pixel
+  row/col; wall segments span both corner pixels (junctions close); sprites
+  and tint fill exactly the (k-1)^2 cell interior. Policy patch encoder is
+  now kernel k+1 / stride k (each patch sees its cell plus both bounding
+  lines; output grid = board grid).
+- New regression test covers all four defects; 17 groundup tests green.
+- NOTE: the completed R1 runs (99.6% 8×8 / 77.1% 16×16 sealed) used the old
+  renderer; results stand for that obs version. A quick 8×8 RGB re-gate on
+  the fixed renderer is queued after the DRC 16×16 run frees the GPU.

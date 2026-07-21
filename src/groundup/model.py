@@ -202,10 +202,16 @@ class SpatialRgbExtractor(nn.Module):
         self.image_numel = image_shape[0] * image_shape[1] * image_shape[2]
         self.latent_dim_pi = n_actions
         self.latent_dim_vf = vf_latent
-        if image_shape[1] != planes_shape[1] * cell_px or image_shape[2] != planes_shape[2] * cell_px:
-            raise ValueError("image dims must be cell_px x the planes grid")
+        if (
+            image_shape[1] != planes_shape[1] * cell_px + 1
+            or image_shape[2] != planes_shape[2] * cell_px + 1
+        ):
+            raise ValueError("image dims must be cell_px x the planes grid, +1 for boundary lines")
+        # kernel = cell_px + 1 at stride cell_px: each patch covers one cell
+        # interior plus BOTH of its boundary lines, and the output grid is
+        # exactly the board grid.
         self.embed = nn.Sequential(
-            nn.Conv2d(image_shape[0], embed_channels, kernel_size=cell_px, stride=cell_px),
+            nn.Conv2d(image_shape[0], embed_channels, kernel_size=cell_px + 1, stride=cell_px),
             nn.ReLU(inplace=True),
         )
         self.stem = nn.Sequential(

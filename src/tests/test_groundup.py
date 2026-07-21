@@ -338,7 +338,7 @@ def test_rgb_obs_rendering(puzzles16):
     puzzle = puzzles16[0]
     k = 5
     img, planes = obs["image"], obs["planes"]
-    assert img.shape == (3, 16 * k, 16 * k) and planes.shape == (16 + 1 + 1, 16, 16)
+    assert img.shape == (3, 16 * k + 1, 16 * k + 1) and planes.shape == (16 + 1 + 1, 16, 16)
     # target robot (canonical slot 0) drawn red at its cell centre
     tr, tc = env._robots[0]
     center = img[:, tr * k + 2, tc * k + 2]
@@ -357,6 +357,55 @@ def test_rgb_obs_rendering(puzzles16):
     obs2, _, _, _, _ = env.step(int(np.flatnonzero(mask)[0]))
     assert not np.array_equal(obs["image"], obs2["image"])
     assert np.all(obs2["image"][:, r * k, c * k + 2] < 0.05)
+
+
+@needs_bank16
+def test_rgb_rendering_geometry_regressions(puzzles16):
+    """Visual-review fixes (2026-07-20): closed wall corners, uniform cell
+    sizes, full-interior sprites, tint confined to the cell interior."""
+    from src.groundup.render import GRID_GRAY, WALL_BLACK, render, static_background
+
+    k = 5
+    config = EnvConfig(rgb_obs=True, rgb_cell_px=k, stop_planes=True, distance_plane=True)
+    env = RicochetEnv(puzzles16, config)
+    obs, _ = env.reset(options={"puzzle_index": 0})
+    puzzle = puzzles16[0]
+    img = obs["image"]
+
+    # (1) wall junctions are closed: every pair of touching wall segments
+    # shares a black corner pixel. Central 2x2 block: all four outer corners.
+    height = puzzle.height
+    mid = height // 2
+    for (yr, xc) in [(mid - 1, mid - 1), (mid - 1, mid + 1), (mid + 1, mid - 1), (mid + 1, mid + 1)]:
+        corner = img[:, yr * k, xc * k]
+        assert np.all(corner <= WALL_BLACK + 1e-6), f"open wall corner at line ({yr},{xc})"
+
+    # (2) uniform cell interiors: every cell, including bottom/right edges,
+    # has a full (k-1)x(k-1) non-boundary interior (probe: last row/col cells'
+    # interior pixels are not grid-coloured).
+    for (r, c) in [(height - 1, 0), (0, puzzle.width - 1), (height - 1, puzzle.width - 1)]:
+        interior = img[:, r * k + 1 : (r + 1) * k, c * k + 1 : (c + 1) * k]
+        assert interior.shape[1:] == (k - 1, k - 1)
+        assert not np.any(np.all(np.isclose(interior, GRID_GRAY), axis=0)), (
+            f"grid line bleeding into cell ({r},{c}) interior"
+        )
+
+    # (3) robot sprites fill the whole interior
+    tr, tc = env._robots[0]
+    sprite = img[:, tr * k + 1 : (tr + 1) * k, tc * k + 1 : (tc + 1) * k]
+    assert np.allclose(sprite[0], sprite[0, 0, 0]) and sprite.shape[1:] == (k - 1, k - 1)
+    assert float(sprite[0].min()) > 0.8  # red channel saturated across the sprite
+
+    # (4) goal tint never touches boundary pixels: all four bounding lines of
+    # the goal cell are grid gray or wall black, never a red-tinted blend.
+    gr, gc = puzzle.goal
+    bg = static_background(puzzle, k)
+    for y, xs in [(gr * k, slice(gc * k, (gc + 1) * k + 1)), ((gr + 1) * k, slice(gc * k, (gc + 1) * k + 1))]:
+        line = bg[:, y, xs]
+        assert np.all(np.isclose(line, GRID_GRAY) | np.isclose(line, WALL_BLACK))
+    for x, ys in [(gc * k, slice(gr * k, (gr + 1) * k + 1)), ((gc + 1) * k, slice(gr * k, (gr + 1) * k + 1))]:
+        line = bg[:, ys, x]
+        assert np.all(np.isclose(line, GRID_GRAY) | np.isclose(line, WALL_BLACK))
 
 
 @needs_bank16

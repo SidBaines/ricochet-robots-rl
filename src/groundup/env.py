@@ -96,11 +96,12 @@ class RicochetEnv(gym.Env):
             if helper_channels == 0:
                 raise ValueError("rgb_obs currently requires at least one helper plane")
             k = int(config.rgb_cell_px)
+            # +1: every boundary line owns a pixel row/col (see render.py).
             self.observation_space = spaces.Dict(
                 {
                     "image": spaces.Box(
                         low=0.0, high=1.0,
-                        shape=(3, self.height * k, self.width * k), dtype=np.float32,
+                        shape=(3, self.height * k + 1, self.width * k + 1), dtype=np.float32,
                     ),
                     "planes": spaces.Box(
                         low=0.0, high=1.0,
