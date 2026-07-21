@@ -83,6 +83,9 @@ class TrainConfig:
     eval_per_length: int = 25
     final_eval_per_length: int = 50
     final_eval_episodes: int = 3
+    # save model_<timesteps>.zip snapshots at this interval (for probing);
+    # None keeps only model_latest/model_final
+    checkpoint_every: Optional[int] = None
     device: str = "auto"
     # W&B (opt-in, mirrors the legacy harness convention)
     wandb_project: Optional[str] = None
@@ -289,6 +292,7 @@ def build_and_train(config: TrainConfig) -> dict:
         def __init__(self) -> None:
             super().__init__()
             self.next_eval = config.eval_every
+            self.next_checkpoint = config.checkpoint_every
 
         def _on_step(self) -> bool:
             return True
@@ -325,6 +329,9 @@ def build_and_train(config: TrainConfig) -> dict:
                 flush=True,
             )
             self.model.save(out / "model_latest.zip")
+            if self.next_checkpoint is not None and self.num_timesteps >= self.next_checkpoint:
+                self.model.save(out / f"model_{self.num_timesteps}.zip")
+                self.next_checkpoint += config.checkpoint_every
 
     model.learn(total_timesteps=config.total_steps, callback=PeriodicEval(), progress_bar=False)
     model.save(out / "model_final.zip")

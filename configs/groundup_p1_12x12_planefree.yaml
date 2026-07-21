@@ -1,0 +1,31 @@
+# P1: 12x12, 3 robots, PLANE-FREE (no stop/distance planes, flat head) -
+# how long does it take a conv net to learn slide dynamics from RL alone?
+# Training-time helpers stay (shaping, reverse curriculum, masking, time ch).
+# ~1-day budget; checkpoints every 5M for landing-cell probes.
+bank_path: artifacts/groundup_bank_12x12/size-12x12_numR3_ET2_CL2.parquet
+out_dir: artifacts/groundup
+run_name: p1_12x12_planefree
+curriculum: reverse
+horizon: 24
+shaping_coef: 0.1
+policy_head: flat
+stop_planes: false
+distance_plane: false
+seed: 11
+num_envs: 32
+n_steps: 128
+batch_size: 1024
+n_epochs: 4
+total_steps: 200000000
+learning_rate: 0.0003
+learning_rate_final: 0.0001
+channels: 64
+n_blocks: 6
+eval_every: 1000000
+eval_per_length: 25
+final_eval_per_length: 60
+final_eval_episodes: 3
+checkpoint_every: 5000000
+device: auto
+wandb_project: ricochet-robots-rl
+wandb_run_name: groundup-p1-12x12-planefree
