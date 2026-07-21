@@ -179,3 +179,42 @@ richer (stop/distance planes) until ladder steps 1–2 land.
 
 Results are appended chronologically to `WorkInProgress.md` per repo
 convention.
+
+## 6. Results to date (updated 2026-07-20)
+
+All numbers are masked, full-start evaluations; "sealed test" suites were
+never used for any training or selection decision. Single seed (11)
+throughout — exploratory phase by agreement. W&B project:
+`ricochet-robots-rl`, runs prefixed `groundup-`.
+
+| Experiment | Setup | Result |
+| --- | --- | --- |
+| E1 overfit gate | 8 fixed 16×16 puzzles | 100% det by 60k steps |
+| E2 8×8 from scratch | planes, full recipe | **99.6% sealed-test det** (1M steps, ~4 min; legacy best 87%) |
+| E3 16×16 from scratch | planes, full recipe, 10M | **78.1% sealed-test det / 80.9% stoch** (legacy from-scratch 3–7%; legacy BC→PPO ≈40% val) |
+| E4 ablations (2M, matched) | v3 minus one lever | no-shaping 60.3%, no-reverse 58.8%, no-planes+flat-head **12.0%** (full ≈63%) — spatial perception/head is the decisive lever |
+| R1 8×8 RGB gate | pixels + helper planes | 99.6% det (matches planes) |
+| R1 16×16 RGB | pixels + helper planes, 10M | **77.1% sealed-test det** (matches planes 78.1%) |
+| D1 DRC(3,3) 8×8 gate | faithful DRC, recurrent masked PPO | **99.2% det, stable through 1M** (v3; v1/v2 exposed and fixed two trainer bugs) |
+| D1 DRC(3,3) 16×16 | all helpers, 10M, in progress | ~60% val det at ~4M steps (feedforward comparison point: 66.5%) |
+
+Failures found and fixed along the way (each within ~1M steps of training,
+via behavioral probes; all now regression-tested):
+
+1. SB3 default Tanh heads saturated on unbounded CNN features → constant
+   value function (E3 v1). Fix: ReLU heads + LayerNorm. In CLAUDE.md.
+2. Flat global readout could not learn "this slide ends on the goal" at
+   16×16 (E3 v2). Fix: stop-cell planes + pointer-style spatial head.
+3. Recurrent trainer post-convergence collapse (D1 v1): advantage
+   normalization amplifies noise at near-zero advantage std. Fix: std floor
+   + clamp + keep-best checkpoints.
+4. Value divergence via clip-only value loss + truncation bootstrap feedback
+   (D1 v2). Fix: PPO2 max-of-losses form, clipping default off.
+5. RGB renderer geometry (open wall corners, shrunken edge cells, off-centre
+   sprites, tint bleed). Fix: +1px canvas, closed segments, interior-only
+   sprites/tint.
+
+Infrastructure: `src/groundup/` (~2,400 lines incl. the faithful DRC core
+and recurrent trainer), 66 tests across `test_groundup.py`,
+`test_drc_faithful.py`, `test_drc_train.py`. Throughput: 1,000–4,000 st/s
+depending on configuration (legacy: ~700).

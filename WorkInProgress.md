@@ -589,3 +589,12 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - NOTE: the completed R1 runs (99.6% 8×8 / 77.1% 16×16 sealed) used the old
   renderer; results stand for that obs version. A quick 8×8 RGB re-gate on
   the fixed renderer is queued after the DRC 16×16 run frees the GPU.
+
+### Write-up checkpoint; DRC 16×16 in flight (2026-07-20)
+
+- Consolidated results table added to docs/GroundUpRLRedesign.md §6.
+- DRC(3,3) 16×16 (all helpers, 10M, 128 envs / 1 epoch after throughput
+  benchmark) in progress: ~60% val det at ~4M steps, trailing the
+  feedforward curve by ~6pp at matched steps so far. W&B run
+  groundup-drc33-16x16 (xd0ucugn).
+- Queued after it: 8×8 RGB re-gate on the fixed renderer.
