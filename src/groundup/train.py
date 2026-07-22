@@ -86,6 +86,9 @@ class TrainConfig:
     # save model_<timesteps>.zip snapshots at this interval (for probing);
     # None keeps only model_latest/model_final
     checkpoint_every: Optional[int] = None
+    # resume from a saved model zip: continues num_timesteps and the lr
+    # schedule; curriculum sampler state re-warms from scratch (EMAs reset)
+    resume_from: Optional[str] = None
     device: str = "auto"
     # W&B (opt-in, mirrors the legacy harness convention)
     wandb_project: Optional[str] = None
@@ -263,7 +266,16 @@ def build_and_train(config: TrainConfig) -> dict:
             activation_fn=nn.ReLU,
         )
 
-    model = MaskablePPO(
+    if config.resume_from is not None:
+        model = MaskablePPO.load(
+            config.resume_from,
+            env=vec_env,
+            device=device,
+            custom_objects={"learning_rate": lambda progress: lr1 + (lr0 - lr1) * progress},
+        )
+        print(f"[groundup] resumed from {config.resume_from} at t={model.num_timesteps:,}", flush=True)
+    else:
+        model = MaskablePPO(
         policy,
         vec_env,
         learning_rate=lambda progress: lr1 + (lr0 - lr1) * progress,
@@ -288,11 +300,17 @@ def build_and_train(config: TrainConfig) -> dict:
     curve_path = out / "curve.jsonl"
     start_time = time.time()
 
+    start_timesteps = int(model.num_timesteps)
+
     class PeriodicEval(BaseCallback):
         def __init__(self) -> None:
             super().__init__()
-            self.next_eval = config.eval_every
-            self.next_checkpoint = config.checkpoint_every
+            self.next_eval = start_timesteps + config.eval_every
+            self.next_checkpoint = (
+                start_timesteps + config.checkpoint_every
+                if config.checkpoint_every is not None
+                else None
+            )
 
         def _on_step(self) -> bool:
             return True
@@ -333,7 +351,15 @@ def build_and_train(config: TrainConfig) -> dict:
                 self.model.save(out / f"model_{self.num_timesteps}.zip")
                 self.next_checkpoint += config.checkpoint_every
 
-    model.learn(total_timesteps=config.total_steps, callback=PeriodicEval(), progress_bar=False)
+    remaining = config.total_steps - start_timesteps
+    if remaining <= 0:
+        raise ValueError(f"Nothing to train: total_steps={config.total_steps} <= resumed t={start_timesteps}")
+    model.learn(
+        total_timesteps=remaining,
+        callback=PeriodicEval(),
+        progress_bar=False,
+        reset_num_timesteps=(config.resume_from is None),
+    )
     model.save(out / "model_final.zip")
 
     report = {
