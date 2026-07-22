@@ -636,3 +636,36 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - Instrument: linear landing-cell probes (src/groundup/probe_landing.py) on
   frozen trunk activations per checkpoint, stratified by slide length, with
   random-init control — tracks when/whether the ray-tracing circuit forms.
+
+### P1 STOPPED at 181M by decision; full write-up (2026-07-23)
+
+- Run: 12×12/3-robot, plane-free obs (no stop/distance planes, flat head),
+  shaping + reverse curriculum + masking retained. Stopped at 181M of 200M
+  (interrupted once at 95M by a machine crash; resumed via new resume_from).
+- Task performance: fast climb to ~60% by 30M, then a long oscillating
+  plateau (66–73%) from ~50M onward. Best val checkpoint: 73% at ~112M.
+  **Sealed test at that checkpoint: 69.2% det / 68.3% stoch**; by length
+  100/92/90/82/65/57/47/22% (L1–L8); by robots-moved 84/49/12%. Baselines
+  under identical protocol: random 14.3%, target-only 26.0%.
+- Probes (35 checkpoints, 5M cadence, linear landing-cell decodability from
+  trunk activations, random-init control 14.8%):
+  - blocked-move detection rose 19%→~26%; short slides (1–3) 10%→~18%;
+  - **mid (4–7) never exceeded ~6%; long (8+) stayed at 2–4% for the entire
+    181M steps** (chance 0.7%). No linearly-decodable ray-tracing circuit
+    ever formed.
+  - Trained-trunk decodability was BELOW the random-init control until
+    ~35M (task-driven compression), and only marginally above after.
+- Conclusions: (1) plane-free 12×12 is learnable to ~70% test with helpers,
+  so scale alone isn't a hard wall; (2) task success and long-range dynamics
+  decodability plateau TOGETHER — performance beyond ~70% appears gated on
+  exactly the knowledge the probes show missing; (3) 181M steps of RL was not
+  enough for the ray-tracing circuit to form spontaneously — supporting the
+  auxiliary supervised landing-cell loss as the next lever (predict stop
+  planes as an output head; labels free from the env; obs stays plane-free).
+- Comparators at 12×12: none directly; 16×16 full-recipe = 78.1% test with
+  stop planes vs 12% without (E4, 2M). P1 shows the without-planes ceiling
+  rises a lot given 90× the budget, but stays ~9pp below the with-planes
+  16×16 number even on the smaller board.
+- Artifacts: artifacts/groundup/p1_12x12_planefree/ (curve, 35 probe JSONs,
+  probe_curve.png, probe_summary.md, test_eval_best112M.json, snapshots).
+  W&B: groundup-p1-12x12-planefree + groundup-p1_12x12_planefree-probes.

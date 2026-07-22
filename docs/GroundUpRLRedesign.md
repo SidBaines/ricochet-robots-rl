@@ -196,7 +196,8 @@ throughout — exploratory phase by agreement. W&B project:
 | R1 8×8 RGB gate | pixels + helper planes | 99.6% det (matches planes) |
 | R1 16×16 RGB | pixels + helper planes, 10M | **77.1% sealed-test det** (matches planes 78.1%) |
 | D1 DRC(3,3) 8×8 gate | faithful DRC, recurrent masked PPO | **99.2% det, stable through 1M** (v3; v1/v2 exposed and fixed two trainer bugs) |
-| D1 DRC(3,3) 16×16 | all helpers, 10M, in progress | ~60% val det at ~4M steps (feedforward comparison point: 66.5%) |
+| D1 DRC(3,3) 16×16 | all helpers, 10M | **64.8% sealed-test det** — matches feedforward on 1-robot puzzles, collapses on multi-robot (39/41% vs 68/59%); faithful flatten readout is the suspected binding constraint |
+| P1 12×12 plane-free | no stop/distance planes, flat head, 181M steps | **69.2% sealed-test det** (best ckpt 112M); task plateaued 66–73% from 50M; landing-cell probes: mid/long slides never exceeded ~6%/4% decodability — the ray-tracing circuit never formed; motivates auxiliary landing-cell loss for ladder step 2 |
 
 Failures found and fixed along the way (each within ~1M steps of training,
 via behavioral probes; all now regression-tested):
