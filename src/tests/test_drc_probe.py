@@ -14,7 +14,12 @@ from src.groundup.probe_drc_landing import (
     extract_zero_state_features,
     load_drc_checkpoint,
 )
+from src.groundup.probe_drc_daemon import _available_snapshots
 from src.groundup.probe_landing import train_probe
+from src.groundup.retain_drc_probe_snapshots import (
+    pending_eval_timesteps,
+    retain_available,
+)
 
 
 def probe_net(seed: int = 0) -> DRCNet:
@@ -78,6 +83,73 @@ def test_checkpoint_reconstruction_and_random_control_are_reproducible(tmp_path)
     assert torch.equal(next(loaded.parameters()), next(net.parameters()))
     assert torch.equal(next(control1.parameters()), next(control2.parameters()))
     assert not torch.equal(next(control1.parameters()), next(loaded.parameters()))
+
+
+def test_eval_snapshot_retention_and_periodic_preference(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config = DRCTrainConfig(
+        drc_depth=2,
+        drc_ticks=3,
+        drc_hidden_channels=8,
+        drc_encoder_channels=(8, 8),
+        drc_encoder_kernels=(3, 3),
+        drc_encoder_strides=(1, 1),
+        drc_mlp_hidden=32,
+    )
+    net = probe_net()
+    curve = run_dir / "curve.jsonl"
+    curve.write_text(json.dumps({"timesteps": 1_003_520}) + "\n")
+    latest = run_dir / "model_latest.pt"
+    _save_model(net, config, latest, metadata={"timesteps": 1_003_520})
+
+    retained = retain_available(run_dir)
+    assert retained == run_dir / "probe_model_1003520.pt"
+    assert retained.exists()
+    assert pending_eval_timesteps(run_dir) == []
+    assert retain_available(run_dir) is None
+    assert _available_snapshots(run_dir) == [retained]
+
+    periodic = run_dir / "model_1003520.pt"
+    _save_model(net, config, periodic, metadata={"timesteps": 1_003_520})
+    assert _available_snapshots(run_dir) == [periodic]
+
+    with curve.open("a") as handle:
+        handle.write(json.dumps({"timesteps": 2_007_040}) + "\n")
+    assert pending_eval_timesteps(run_dir) == [2_007_040]
+    assert retain_available(run_dir) is None
+    _save_model(net, config, latest, metadata={"timesteps": 2_007_040})
+    second = retain_available(run_dir)
+    assert second == run_dir / "probe_model_2007040.pt"
+    assert pending_eval_timesteps(run_dir) == []
+
+
+def test_dense_retention_starts_at_first_available_model(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config = DRCTrainConfig(
+        drc_depth=2,
+        drc_ticks=3,
+        drc_hidden_channels=8,
+        drc_encoder_channels=(8, 8),
+        drc_encoder_kernels=(3, 3),
+        drc_encoder_strides=(1, 1),
+        drc_mlp_hidden=32,
+    )
+    net = probe_net()
+    (run_dir / "curve.jsonl").write_text(
+        "\n".join(json.dumps({"timesteps": steps}) for steps in (1_003_520, 2_007_040, 3_006_464)) + "\n"
+    )
+    _save_model(
+        net,
+        config,
+        run_dir / "model_latest.pt",
+        metadata={"timesteps": 3_006_464},
+    )
+
+    retained = retain_available(run_dir)
+    assert retained == run_dir / "probe_model_3006464.pt"
+    assert pending_eval_timesteps(run_dir) == []
 
 
 def test_linear_probe_recovers_synthetic_spatial_landing_code():

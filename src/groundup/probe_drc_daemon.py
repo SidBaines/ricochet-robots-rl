@@ -14,10 +14,20 @@ from .probe_drc_landing import probe_checkpoint
 
 
 def _timesteps(path: Path) -> int:
-    match = re.fullmatch(r"model_(\d+)\.pt", path.name)
+    match = re.fullmatch(r"(?:probe_)?model_(\d+)\.pt", path.name)
     if not match:
-        raise ValueError(f"Not an immutable model snapshot: {path}")
+        raise ValueError(f"Not a retained model snapshot: {path}")
     return int(match.group(1))
+
+
+def _available_snapshots(run_dir: Path) -> list[Path]:
+    """Return one checkpoint per step, preferring registered 5M snapshots."""
+    by_step: dict[int, Path] = {}
+    for model in run_dir.glob("probe_model_[0-9]*.pt"):
+        by_step[_timesteps(model)] = model
+    for model in run_dir.glob("model_[0-9]*.pt"):
+        by_step[_timesteps(model)] = model
+    return [by_step[steps] for steps in sorted(by_step)]
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -36,7 +46,7 @@ def process_available(
     p1_run_dir: str | Path | None,
 ) -> int:
     run_dir = Path(run_dir)
-    snapshots = sorted(run_dir.glob("model_[0-9]*.pt"), key=_timesteps)
+    snapshots = _available_snapshots(run_dir)
     completed = 0
     for model in snapshots:
         steps = _timesteps(model)

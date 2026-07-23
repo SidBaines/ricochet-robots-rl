@@ -1,7 +1,7 @@
 # DRC Helper-Free Slide-Dynamics Research Plan and Execution Log
 
 Date created: 2026-07-23
-Status: planned; no implementation or training started
+Status: executing; mandatory 60M structured-input DRC sweep in progress
 Branch at creation: `rl-ground-up`
 
 This document is both:
@@ -798,3 +798,68 @@ Use this template for each entry:
 - Sealed test: not loaded by the trainer and not evaluated.
 - Next action: monitor first 1M evaluation/checkpoint health; do not
   performance-stop before 60M.
+
+### 2026-07-23 18:17 BST — Probe cadence increased to every 1M evaluation
+
+- Status before: the trainer evaluated and rewrote `model_latest.pt` every
+  1M steps, but retained immutable analysis snapshots only every 5M. The
+  detached probe worker therefore planned to probe at 5M intervals. The run
+  had reached 3,006,464 steps; the 1M and 2M weights had already been
+  overwritten, while the 3M weights remained available.
+- Decision: retain a separate immutable probe-only copy of each 1M
+  `model_latest.pt` checkpoint from 3M onward and run the registered
+  zero-state landing-cell probe on every retained evaluation checkpoint.
+  Keep the original 5M model/training-state snapshot schedule unchanged.
+- Reason: 1M probe resolution makes it easier to distinguish gradual
+  representation formation from a late discontinuous change and to align
+  tick-wise decodability with task and curriculum transitions. Probe work is
+  read-only, runs at reduced CPU priority, and does not affect the MPS
+  training path.
+- Scientific impact: this is a diagnostic-cadence enhancement, not an
+  intervention in the optimizer, environment, curriculum, validation model
+  selection, or sealed-test protocol. All 5M checkpoints remain part of the
+  original registered series; additional 1M points will be labelled
+  explicitly. No conclusion will treat the denser cadence itself as an
+  independent experimental condition.
+- Limitation: 1M and 2M model states cannot be reconstructed because
+  `model_latest.pt` had already advanced. The dense series therefore begins
+  at the exact 3M evaluation step.
+- Next action: add and test an independent fast snapshot-retention watcher,
+  update the probe worker to consume those snapshots without duplicate work,
+  preserve the 3M model, and relaunch only the probe-side processes. Do not
+  restart or otherwise alter the live trainer.
+
+### 2026-07-23 18:20 BST — Dense probe retention activated at 4M
+
+- Result since the cadence decision: the 4M evaluation landed while the
+  retention code was being implemented and tested. It improved validation
+  success from 39.0% to 45.5%, so both `model_latest.pt` and
+  `model_best.pt` advanced to 4,005,888 steps. The 3M model could therefore
+  not be recovered. Contrary to the intended next action above, the dense
+  series begins at 4,005,888, not 3,006,464. The 1M-3M task metrics remain in
+  `curve.jsonl`, but no representation result will be implied for their
+  unavailable weights.
+- Implementation: added a lightweight independent watcher that notices a
+  completed curve row, verifies the exact step in the atomically written
+  `model_latest.pt`, and retains it as
+  `probe_model_<exact_steps>.pt`. The probe daemon now consumes registered
+  `model_<steps>.pt` and dense `probe_model_<steps>.pt` files, deduplicating
+  by exact step and preferring the registered snapshot.
+- Verification: six focused DRC trace/probe/retention tests pass; Ruff check
+  and format pass. The first retained checkpoint is
+  `probe_model_4005888.pt`, with matching embedded timestep metadata.
+- Live processes: retention Screen `drc33_p1_probe_snapshots` polls every
+  five seconds; probe Screen `drc33_p1_probes` runs the fixed 16,000-state,
+  30-epoch zero-state probes on low-priority CPU with two threads. The old
+  idle probe worker was stopped before duplicate work. The MPS trainer
+  process and Screen were not restarted or signalled.
+- Training state at 4M: deterministic validation 45.5%; length 1-8 success
+  88/84/64/44/20/24/20/20%; one/two/three-robot success
+  66.4/18.8/14.3%; curriculum frontier 3. PPO telemetry remained healthy
+  (KL 0.0072, explained variance 0.63, no KL early stop).
+- Comparator: P1 was 35.0% at its 4.00M checkpoint, so DRC is 10.5
+  percentage points ahead at this boundary. This remains an early,
+  200-puzzle validation comparison rather than a conclusion.
+- Next action: let the 4M probe finish, confirm the registered 5M immutable
+  model and training-state snapshots, then retain and probe each subsequent
+  1M evaluation without changing the mandatory 60M stop floor.
