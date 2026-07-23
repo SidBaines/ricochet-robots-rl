@@ -902,3 +902,39 @@ Use this template for each entry:
 - Decision: all 5M correctness and monitoring gates passed. Continue the
   uninterrupted mandatory 60M sweep, retaining and probing every 1M
   evaluation and preserving the original 5M exact-resume snapshot cadence.
+
+### 2026-07-23 22:50 BST — 6M result and clamshell-sleep pause
+
+- Task result: deterministic validation reached 57.5% at 6,004,736 steps,
+  versus P1's 44.0% at 6,000,640. Length 1-8 success was
+  92/92/72/60/40/32/24/48%; one/two/three-robot success was
+  72.6/37.5/42.9%. The three-robot stratum contains only seven periodic
+  puzzles, so 42.9% is 3/7 and should not be treated as a precise estimate.
+- Health: learning rate 0.0002925, entropy 0.661, mean/max approximate KL
+  0.0033/0.0064, clip fraction 0.036, explained variance 0.674, and no
+  target-KL early stop. `probe_model_6004736.pt` was retained with exact
+  matching metadata, and the 6M probe completed on the fixed dataset.
+- Probe result: mid and long decoding remained below matched random
+  initialization at every representation. At tick 1—the strongest long-slide
+  point—trained mid/long accuracy was 3.29/5.65%, versus control
+  3.60/6.66%. The encoder and readout gaps widened. Strong task learning is
+  therefore still not accompanied by the pre-registered linear
+  landing-cell signal.
+- Operational incident: the 6M curve row and exact `training_latest.pt` were
+  flushed at 18:37:32. macOS entered clamshell sleep at 18:37:35 and fully
+  woke at 22:40:19 when the lid reopened. The original trainer, retention
+  watcher, and probe worker remained present and resumed automatically;
+  there was no process restart or checkpoint reload.
+- Cause and impact: `caffeinate -is` prevents idle/system sleep while the lid
+  is open but cannot override clamshell sleep. This paused computation for
+  approximately four hours without advancing environment steps or changing
+  optimizer, recurrent, environment, sampler, or RNG state. The machine was
+  subsequently connected to AC and charging. The run remains scientifically
+  valid.
+- Telemetry caveat: trainer `elapsed_s` uses wall time, so all later reported
+  aggregate steps/second values include this sleep interval and understate
+  active throughput. Use the pre-sleep 1,665 steps/s measurement and
+  step-to-step active intervals for compute comparisons; label post-sleep
+  aggregate throughput accordingly.
+- Decision: continue the same live run. Keep the lid open and AC connected
+  during the remaining sweep; no training/config change is warranted.
