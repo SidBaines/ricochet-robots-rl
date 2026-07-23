@@ -863,3 +863,42 @@ Use this template for each entry:
 - Next action: let the 4M probe finish, confirm the registered 5M immutable
   model and training-state snapshots, then retain and probe each subsequent
   1M evaluation without changing the mandatory 60M stop floor.
+
+### 2026-07-23 18:29 BST — First registered 5M checkpoint verified
+
+- Task trajectory: deterministic validation reached 54.5% at 5,005,312
+  steps, up from 21.0/24.5/39.0/45.5% at the preceding 1M boundaries.
+  Length 1-8 success was 88/80/84/48/44/52/24/16%; one/two/three-robot
+  success was 74.3/30.0/14.3%. The reverse-curriculum frontier advanced to
+  4.
+- P1 comparison: the registered P1 checkpoint at or before 5M was 35.0%, so
+  DRC is 19.5 percentage points ahead on the same fixed 200-puzzle
+  validation protocol. This is an early curve comparison, not a sealed-test
+  result.
+- Optimizer health: learning rate 0.0002937, entropy 0.640, mean/max
+  approximate KL 0.0150/0.0281, clip fraction 0.132, explained variance
+  0.679, four gradient updates, and no target-KL early stop.
+- Registered artifacts: `model_5005312.pt` (6.3 MB) and
+  `training_5005312.pt` (54 MB) have matching exact-step, clean-launch Git,
+  config, bank, split, observation, action, and parameter metadata.
+  `training_latest.pt` records next evaluation 6M, next registered checkpoint
+  10M, and best validation 54.5% at 5,005,312. The dense watcher correctly
+  avoided creating a duplicate probe-only model because the registered model
+  is canonical for this exact step.
+- Probe contract: both 4M and 5M used the same 16,000-state validation dataset
+  fingerprint
+  `e97ef31a7e5c0bf133ee508b4ea8bbb27bf32a6a9a58893d9f41d1df5c48adfc`
+  and the same matched random-initialization control.
+- Probe result: despite strong task learning, there is not yet evidence for
+  the hypothesized trained mid/long landing-cell representation. At 5M,
+  encoder/tick-1/tick-2/tick-3/readout mid accuracies were
+  1.7/3.0/2.4/2.7/1.9%, versus control 4.7/3.6/3.5/3.3/4.3%. Long accuracies
+  were 2.0/5.2/4.1/3.9/2.4%, versus control
+  6.2/6.7/7.2/6.9/6.7%. Tick 1 consistently improves long decoding over the
+  trained encoder, but not above the architectural random control.
+- Interpretation: early task learning and the registered representation
+  hypothesis currently diverge. Continue measuring; do not reinterpret
+  overall or short-slide decoding gains as mid/long slide-dynamics evidence.
+- Decision: all 5M correctness and monitoring gates passed. Continue the
+  uninterrupted mandatory 60M sweep, retaining and probing every 1M
+  evaluation and preserving the original 5M exact-resume snapshot cadence.
