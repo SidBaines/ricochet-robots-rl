@@ -938,3 +938,39 @@ Use this template for each entry:
   aggregate throughput accordingly.
 - Decision: continue the same live run. Keep the lid open and AC connected
   during the remaining sweep; no training/config change is warranted.
+
+### 2026-07-23 23:31 BST — 10M milestone
+
+- Progress: the same live process reached 10,002,432 environment steps after
+  waking, with no restart or checkpoint reload. Validation at 7M-10M was
+  57.0/59.5/61.0/59.5%; the current best is 61.0% at 9,003,008.
+- Matched P1 comparison: at 8M/9M/10M, DRC achieved
+  59.5/61.0/59.5% versus P1's 44.5/48.0/45.0%, leads of
+  15.0/13.0/14.5 percentage points. The early DRC advantage is sustained
+  across several fixed-suite evaluations rather than depending on one peak.
+- Difficulty at 10M: length 1-8 success was
+  96/80/76/76/56/36/24/32%; one/two/three-robot success was
+  73.5/43.8/14.3%. The reverse curriculum remained at frontier 4.
+- Optimizer health at 10M: learning rate 0.0002875, entropy 0.497, mean/max
+  approximate KL 0.0073/0.0214, clip fraction 0.062, explained variance
+  0.645, four gradient updates, and no target-KL early stop. Value loss was
+  3.15 on this update but was not accompanied by non-finite values, a KL
+  spike, explained-variance collapse, or other instability.
+- Checkpoints: registered `model_10002432.pt` and
+  `training_10002432.pt` have matching exact-step metadata.
+  `training_latest.pt` records algorithm step 10,002,432, best validation
+  61.0% at 9,003,008, next evaluation 11M, and next registered checkpoint
+  15M.
+- Dense probes: the worker completed every 1M checkpoint through 9M and was
+  processing 10M at this review. Tick-3 trained-minus-random mid/long gains
+  from 4M through 9M remained negative:
+  mid -1.01/-0.67/-0.57/-0.67/-0.74/-1.08 percentage points and long
+  -2.64/-2.96/-2.96/-2.60/-3.26/-3.52 points. There is no registered
+  representation success yet.
+- Active throughput after wake was approximately 1,448 steps/s from 7M-8M,
+  1,302 from 8M-9M, and 1,207 from 9M-10M while the low-priority CPU probe
+  worker was active. The downward change will be monitored for thermal or
+  resource contention; it does not affect the environment-step comparison.
+- Decision: continue unchanged. Task evidence is strongly positive and probe
+  evidence is currently negative, making the mandatory longer sweep and
+  dense diagnostic trajectory informative.
