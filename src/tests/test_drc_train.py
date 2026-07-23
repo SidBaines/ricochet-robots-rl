@@ -9,6 +9,8 @@ contract, and seed determinism.
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
 import json
 from pathlib import Path
 
@@ -17,10 +19,13 @@ import pytest
 import torch
 from gymnasium import spaces
 
+from src.groundup.benchmark_drc_throughput import parse_candidate
 from src.groundup.drc import DRCNet, DRCState
 from src.groundup.drc_train import (
     DRCTrainConfig,
     RecurrentPPO,
+    _load_training_checkpoint,
+    _save_training_checkpoint,
     build_and_train,
     build_net,
     clipped_value_loss,
@@ -29,10 +34,12 @@ from src.groundup.drc_train import (
     normalize_advantages,
     replay_sequences,
 )
+from src.groundup.curriculum import ReverseFrontierSampler
 from src.groundup.env import EnvConfig, RicochetEnv
 from src.groundup.puzzles import Puzzle
 
 BANK_8 = Path("artifacts/phase2b_bank/size-8x8_numR2_ET1_CL1_gen10.parquet")
+PRIMARY_DRC_CONFIG = Path("configs/groundup_drc33_p1_12x12_planefree.yaml")
 
 
 # ------------------------------------------------------------------- fixtures
@@ -199,9 +206,11 @@ def test_replay_resets_state_at_done_and_applies_masks():
             if episode_starts[t, b]:
                 state = net.initial_state(1)
             with torch.no_grad():
-                l, v, state = net(obs[t, b : b + 1], state, action_mask=masks[t, b : b + 1])
-            assert torch.allclose(logits[t, b], l[0], atol=1e-5), f"t={t} b={b}"
-            assert torch.allclose(values[t, b], v[0], atol=1e-5), f"t={t} b={b}"
+                logits_one, values_one, state = net(
+                    obs[t, b : b + 1], state, action_mask=masks[t, b : b + 1]
+                )
+            assert torch.allclose(logits[t, b], logits_one[0], atol=1e-5), f"t={t} b={b}"
+            assert torch.allclose(values[t, b], values_one[0], atol=1e-5), f"t={t} b={b}"
 
     # Masks were applied inside the replay.
     assert (logits[~masks] < -1e8).all()
@@ -406,6 +415,38 @@ def test_config_yaml_and_unknown_keys(tmp_path):
         DRCTrainConfig.from_yaml(bad)
 
 
+def test_primary_12x12_drc_config_is_helper_free_and_extension_safe():
+    config = DRCTrainConfig.from_yaml(PRIMARY_DRC_CONFIG)
+    assert config.stop_planes is False
+    assert config.distance_plane is False
+    assert config.time_channel is True
+    assert config.canonical_identity is True
+    assert config.horizon == 24
+    assert config.drc_depth == 3 and config.drc_ticks == 3
+    assert (config.num_envs, config.n_steps, config.batch_size, config.n_epochs) == (
+        256,
+        32,
+        2048,
+        1,
+    )
+    assert config.total_steps == 60_000_000
+    assert config.schedule_total_steps == 200_000_000
+    assert config.checkpoint_every == 5_000_000
+    # 4 walls + goal + 3 robots + time; 3 robots x 4 directions.
+    net = build_net(config, (9, 12, 12), 12)
+    assert net.observation_shape == (9, 12, 12)
+    assert net._state_hw == (12, 12)
+    assert net.n_actions == 12
+
+
+def test_throughput_candidate_parser_enforces_recurrent_minibatches():
+    assert parse_candidate("128x32x1024x1") == (128, 32, 1024, 1)
+    with pytest.raises(argparse.ArgumentTypeError, match="divisible"):
+        parse_candidate("32x32x100x1")
+    with pytest.raises(argparse.ArgumentTypeError, match="exceeds"):
+        parse_candidate("2x32x96x1")
+
+
 # ----------------------------------------------------------------- evaluation
 def test_evaluate_drc_protocol_and_determinism():
     puzzles = synthetic_puzzles()
@@ -453,6 +494,88 @@ def test_seeded_runs_produce_identical_first_update():
     assert m1["n_grad_updates"] == 4  # 2 epochs x 2 minibatches, no early stop
 
 
+def test_exact_resume_matches_uninterrupted_next_update(tmp_path):
+    """Full state restore must reproduce the next rollout and optimizer update."""
+
+    def build(seed):
+        puzzles = synthetic_puzzles()
+        sampler = ReverseFrontierSampler(puzzles, min_episodes=2)
+        envs = [
+            RicochetEnv(
+                puzzles,
+                EnvConfig(horizon=4),
+                sampler=sampler,
+                seed=700 + rank,
+            )
+            for rank in range(2)
+        ]
+        net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n, seed=9)
+        torch.manual_seed(31)
+        algo = make_algo(
+            net,
+            envs,
+            n_steps=6,
+            batch_size=6,
+            n_epochs=2,
+            seed=seed,
+        )
+        return sampler, algo
+
+    config = DRCTrainConfig(
+        num_envs=2,
+        n_steps=6,
+        batch_size=6,
+        n_epochs=2,
+        schedule_total_steps=1000,
+        drc_depth=1,
+        drc_ticks=1,
+        drc_hidden_channels=8,
+        drc_encoder_channels=(8, 8),
+        drc_encoder_kernels=(3, 3),
+        drc_mlp_hidden=32,
+        device="cpu",
+    )
+    sampler1, algo1 = build(seed=5)
+    first = algo1.collect_rollout()
+    algo1.update(first, progress_remaining=0.9)
+    checkpoint = tmp_path / "training.pt"
+    _save_training_checkpoint(
+        algo1,
+        sampler1,
+        config,
+        checkpoint,
+        run_state={"elapsed_s": 1.0},
+        metadata={"test": True},
+    )
+
+    uninterrupted_buf = algo1.collect_rollout()
+    uninterrupted_metrics = algo1.update(uninterrupted_buf, progress_remaining=0.8)
+    uninterrupted_weights = {
+        key: value.detach().clone() for key, value in algo1.net.state_dict().items()
+    }
+    uninterrupted_sampler = sampler1.state_dict()
+
+    sampler2, algo2 = build(seed=5)
+    _load_training_checkpoint(checkpoint, algo=algo2, sampler=sampler2, config=config)
+    resumed_buf = algo2.collect_rollout()
+    resumed_metrics = algo2.update(resumed_buf, progress_remaining=0.8)
+
+    assert torch.equal(resumed_buf.actions, uninterrupted_buf.actions)
+    assert torch.equal(resumed_buf.rewards, uninterrupted_buf.rewards)
+    assert torch.equal(resumed_buf.episode_starts, uninterrupted_buf.episode_starts)
+    assert resumed_metrics == uninterrupted_metrics
+    assert algo2.num_timesteps == algo1.num_timesteps
+    for key, value in algo2.net.state_dict().items():
+        assert torch.equal(value, uninterrupted_weights[key]), key
+    assert np.array_equal(sampler2.ema, uninterrupted_sampler["ema"])
+    assert np.array_equal(sampler2.count, uninterrupted_sampler["count"])
+
+    changed = dataclasses.replace(config, horizon=config.horizon + 1)
+    sampler3, algo3 = build(seed=5)
+    with pytest.raises(ValueError, match="config contract changed"):
+        _load_training_checkpoint(checkpoint, algo=algo3, sampler=sampler3, config=changed)
+
+
 # ---------------------------------------------------------------------- smoke
 def test_learn_smoke_end_to_end(tmp_path):
     config = DRCTrainConfig(
@@ -472,6 +595,7 @@ def test_learn_smoke_end_to_end(tmp_path):
         final_eval_per_length=2,
         final_eval_episodes=2,
         eval_batch_size=8,
+        checkpoint_every=64,
         drc_depth=1,
         drc_ticks=1,
         drc_hidden_channels=8,
@@ -538,6 +662,33 @@ def test_learn_smoke_end_to_end(tmp_path):
         DRCTrainConfig(**payload["config"]), payload["observation_shape"], payload["n_actions"]
     )
     net.load_state_dict(payload["state_dict"])
+
+    # Immutable model/training snapshots and provenance are written on the
+    # declared cadence; latest/final training states support crash recovery.
+    snapshots = sorted(out.glob("model_[0-9]*.pt"))
+    training_snapshots = sorted(out.glob("training_[0-9]*.pt"))
+    assert len(snapshots) >= 2
+    assert len(training_snapshots) == len(snapshots)
+    assert (out / "training_latest.pt").exists()
+    assert (out / "training_final.pt").exists()
+    manifest = [
+        json.loads(line) for line in (out / "snapshot_manifest.jsonl").read_text().splitlines()
+    ]
+    assert len(manifest) == len(snapshots)
+    assert all(
+        set(entry)
+        >= {
+            "timesteps",
+            "elapsed_s",
+            "steps_per_s",
+            "git",
+            "config_fingerprint",
+            "bank_sha256",
+            "split_fingerprints",
+            "policy_params",
+        }
+        for entry in manifest
+    )
 
 
 def test_report_evals_use_best_checkpoint(tmp_path):

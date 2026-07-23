@@ -629,27 +629,27 @@ write-ups should be committed.
 
 ### Before implementation
 
-- [ ] Confirm this plan and experimental contract.
-- [ ] Record starting commit and repository status.
-- [ ] Confirm P1 artifacts and bank fingerprint are readable.
+- [x] Confirm this plan and experimental contract.
+- [x] Record starting commit and repository status.
+- [x] Confirm P1 artifacts and bank fingerprint are readable.
 
 ### Engineering
 
-- [ ] Implement crash-safe recurrent resume.
-- [ ] Implement immutable periodic DRC snapshots.
-- [ ] Implement DRC encoder/tick/hidden-state probes.
-- [ ] Implement probe collation and shared-axis charts.
-- [ ] Add structured helper-free DRC config.
-- [ ] Add/extend tests for every new contract.
-- [ ] Run complete test suite.
+- [x] Implement crash-safe recurrent resume.
+- [x] Implement immutable periodic DRC snapshots.
+- [x] Implement DRC encoder/tick/hidden-state probes.
+- [x] Implement probe collation and shared-axis charts.
+- [x] Add structured helper-free DRC config.
+- [x] Add/extend tests for every new contract.
+- [x] Run complete test suite.
 
 ### Preflight
 
-- [ ] Validate bank plans and split disjointness.
-- [ ] Assert observation channels exclude stop/distance planes.
-- [ ] Run checkpoint/resume/probe smoke test.
-- [ ] Benchmark real-factory throughput candidates.
-- [ ] Freeze and record the selected run config.
+- [x] Validate bank plans and split disjointness.
+- [x] Assert observation channels exclude stop/distance planes.
+- [x] Run checkpoint/resume/probe smoke test.
+- [x] Benchmark real-factory throughput candidates.
+- [x] Freeze and record the selected run config.
 - [ ] Verify detached launch and machine-sleep protection.
 
 ### Initial sweep
@@ -704,3 +704,69 @@ Use this template for each entry:
 - Follow-up: move to corrected-renderer RGB after the structured DRC result is
   understood and the pixel entry gate is reviewed.
 - Implementation/training performed: none.
+
+### 2026-07-23 — Engineering prerequisites implemented and tested
+
+- Status before: the DRC trainer had keep-best weight checkpoints but no
+  resumable optimizer/curriculum/environment state, no immutable analysis
+  snapshots, and no DRC-compatible landing-cell probes.
+- Action: implemented full recurrent-PPO state serialization, adaptive
+  sampler and environment state restoration, immutable model/training
+  snapshots, provenance manifests, and separate stop-target versus
+  learning-rate-schedule horizons. Added zero-state DRC probes for the encoder,
+  tick 1/2/3, and faithful readout map; fixed-dataset fingerprinting; automatic
+  collation; and a snapshot-watching probe daemon.
+- Reason: the mandatory 60M run must survive machine interruption, preserve a
+  200M learning-rate horizon for possible extensions, and expose delayed
+  recurrent representation formation every 5M steps.
+- Tests: exact CPU interrupted-versus-uninterrupted continuation reproduces
+  the next rollout, metrics, weights, and sampler state. Tick tracing
+  reconstructs ordinary policy outputs exactly. Synthetic probe and
+  collation tests pass. Full suite: 191 passed, 9 intentionally skipped.
+- MPS smoke: a 128-step real-bank run produced evaluation, immutable model and
+  training snapshots, provenance, final reports, and a resumable
+  `training_final.pt`. The first MPS resume attempt exposed a device-mapped CPU
+  RNG byte-tensor bug; RNG tensors are now normalized to CPU on restore. Exact
+  continuation then resumed at t=128 and completed to t=256. The DRC probe and
+  daemon processed all smoke snapshots and wrote the shared-axis chart/table.
+- Artifacts:
+  `artifacts/groundup/drc33_p1_12x12_smoke/`.
+- Research training performed: none; smoke metrics are not scientific results.
+
+### 2026-07-23 — Real-bank preflight passed
+
+- Config: `configs/groundup_drc33_p1_12x12_planefree.yaml`.
+- Bank build fingerprint: `68ea3ea6c85ed7eb`; file SHA-256:
+  `0103a7b9ca2cf0f0fdba27f66cfd610f5c6954006986d48524c0a66395fb02b5`.
+- Splits: 39,713 train / 6,677 validation / 6,610 sealed test; zero
+  layout-hash overlap between every pair.
+- Correctness: 100/100 sampled stored plans replayed successfully; 360/360
+  sampled action-mask checks matched actual movement.
+- Observation contract: `(9, 12, 12)` = four walls + goal + three robots +
+  time; stop and distance channels absent. Actions: 12. DRC encoded/recurrent
+  grid remains 12x12. Policy parameters: 1,650,701.
+- Artifact:
+  `artifacts/groundup/drc33_p1_12x12_planefree/preflight.json`.
+- Decision: preflight gates passed.
+
+### 2026-07-23 — Throughput geometry frozen
+
+- Method: complete collect-plus-recurrent-update measurements on the real
+  39,713-puzzle 12x12 training factory, with MPS synchronization around the
+  timed region, two warm-up and four measured updates.
+- Results:
+  - 32 env / 32 steps / batch 256 / 2 epochs: 584 steps/s;
+  - 64 / 32 / 512 / 1: 1,337 steps/s;
+  - 128 / 32 / 1024 / 1: 1,573 steps/s;
+  - 64 / 64 / 1024 / 1: 1,361 steps/s;
+  - 256 / 32 / 2048 / 1: **1,742 steps/s**, RSS 2.1 GB;
+  - 512 / 32 / 4096 / 1: 1,756 steps/s, RSS 3.3 GB.
+- Decision: freeze 256 env / 32 steps / batch 2048 / 1 epoch. It improves
+  throughput 10.7% over 128 envs; the extra 0.8% from 512 envs is not worth
+  1.2 GB additional RSS and reduced operational headroom.
+- Config updated with the frozen geometry. Expected 60M awake training time at
+  the measured rate is approximately 9.6 hours before periodic evaluation and
+  probe overhead.
+- Artifacts:
+  `artifacts/groundup/drc33_p1_12x12_planefree/throughput_benchmark.json`,
+  `throughput_benchmark_256.json`, and `throughput_benchmark_512.json`.

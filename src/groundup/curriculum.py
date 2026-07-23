@@ -33,6 +33,13 @@ class UniformSampler:
     def stats(self) -> Dict[str, object]:
         return {"sampler": "uniform"}
 
+    def state_dict(self) -> Dict[str, object]:
+        return {"sampler": "uniform"}
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if state != {"sampler": "uniform"}:
+            raise ValueError(f"Incompatible uniform sampler state: {state}")
+
 
 class ReverseFrontierSampler:
     """Adaptive mixture over start-distance bands.
@@ -114,3 +121,30 @@ class ReverseFrontierSampler:
             "ema": {d: round(float(self.ema[d]), 3) for d in range(1, self.max_distance + 1)},
             "count": {d: int(self.count[d]) for d in range(1, self.max_distance + 1)},
         }
+
+    def state_dict(self) -> Dict[str, object]:
+        """Exact adaptive-curriculum state for crash-safe training resume."""
+        return {
+            "sampler": "reverse_frontier",
+            "max_distance": self.max_distance,
+            "ema": self.ema.copy(),
+            "count": self.count.copy(),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if state.get("sampler") != "reverse_frontier":
+            raise ValueError(f"Incompatible sampler state: {state.get('sampler')}")
+        if int(state.get("max_distance", -1)) != self.max_distance:
+            raise ValueError(
+                f"Sampler max_distance changed: checkpoint={state.get('max_distance')} "
+                f"current={self.max_distance}"
+            )
+        ema = np.asarray(state["ema"], dtype=np.float64)
+        count = np.asarray(state["count"], dtype=np.int64)
+        if ema.shape != self.ema.shape or count.shape != self.count.shape:
+            raise ValueError(
+                f"Sampler state shape changed: checkpoint={ema.shape}/{count.shape} "
+                f"current={self.ema.shape}/{self.count.shape}"
+            )
+        self.ema[...] = ema
+        self.count[...] = count

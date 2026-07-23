@@ -65,7 +65,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
+import os
+import random
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,7 +77,6 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
 from torch.distributions import Categorical
 
@@ -122,6 +125,11 @@ class DRCTrainConfig:
     batch_size: int = 256
     n_epochs: int = 2
     total_steps: int = 1_000_000
+    # Learning-rate progress is measured against this horizon while
+    # ``total_steps`` is the current stop/review target. This permits the
+    # pre-registered 60M -> 120M -> 200M extensions without restarting or
+    # prematurely exhausting the schedule.
+    schedule_total_steps: Optional[int] = None
     learning_rate: float = 3e-4
     learning_rate_final: float = 1e-4
     ent_coef: float = 0.01
@@ -163,6 +171,9 @@ class DRCTrainConfig:
     final_eval_per_length: int = 50
     final_eval_episodes: int = 3
     eval_batch_size: int = 32
+    # Immutable lightweight model and full training-state snapshots.
+    checkpoint_every: Optional[int] = None
+    resume_from: Optional[str] = None
     device: str = "auto"
     # W&B (opt-in, mirrors the train.py convention)
     wandb_project: Optional[str] = None
@@ -441,6 +452,100 @@ class RecurrentPPO:
         self._episode_start = np.ones(self.num_envs, dtype=bool)
         self._state = self.net.initial_state(self.num_envs, device=self.device)
 
+    # --------------------------------------------------------------- resume
+    def state_dict(self) -> Dict[str, object]:
+        """Complete iteration-boundary state for exact crash recovery."""
+        env_states = []
+        for env in self.envs:
+            if not hasattr(env, "state_dict"):
+                raise TypeError(f"Environment {type(env).__name__} does not support exact resume")
+            env_states.append(env.state_dict())
+        state: Dict[str, object] = {
+            "schema_version": 1,
+            "contract": {
+                "num_envs": self.num_envs,
+                "obs_shape": self.obs_shape,
+                "n_actions": self.n_actions,
+                "n_steps": self.n_steps,
+                "batch_size": self.batch_size,
+                "n_epochs": self.n_epochs,
+            },
+            "net_state_dict": self.net.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "minibatch_generator_state": self._gen.get_state(),
+            "num_timesteps": self.num_timesteps,
+            "obs": self._obs.copy(),
+            "episode_start": self._episode_start.copy(),
+            "recurrent_state": {
+                "h": self._state.h.detach().cpu(),
+                "c": self._state.c.detach().cpu(),
+            },
+            "env_states": env_states,
+            "torch_rng_state": torch.get_rng_state(),
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+        }
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            state["device_rng_state"] = ("cuda", torch.cuda.get_rng_state_all())
+        elif self.device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
+            state["device_rng_state"] = ("mps", torch.mps.get_rng_state())
+        return state
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if int(state.get("schema_version", -1)) != 1:
+            raise ValueError(f"Unsupported recurrent PPO checkpoint schema: {state.get('schema_version')}")
+        expected = {
+            "num_envs": self.num_envs,
+            "obs_shape": self.obs_shape,
+            "n_actions": self.n_actions,
+            "n_steps": self.n_steps,
+            "batch_size": self.batch_size,
+            "n_epochs": self.n_epochs,
+        }
+        actual = state["contract"]
+        if actual != expected:
+            raise ValueError(f"Recurrent PPO contract changed: checkpoint={actual} current={expected}")
+
+        self.net.load_state_dict(state["net_state_dict"])
+        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        self._gen.set_state(state["minibatch_generator_state"].cpu())
+        self.num_timesteps = int(state["num_timesteps"])
+
+        obs = np.asarray(state["obs"], dtype=np.float32)
+        episode_start = np.asarray(state["episode_start"], dtype=bool)
+        if obs.shape != self._obs.shape or episode_start.shape != self._episode_start.shape:
+            raise ValueError(
+                f"Rollout state shape changed: checkpoint={obs.shape}/{episode_start.shape} "
+                f"current={self._obs.shape}/{self._episode_start.shape}"
+            )
+        self._obs[...] = obs
+        self._episode_start[...] = episode_start
+        recurrent = state["recurrent_state"]
+        self._state = DRCState(
+            h=recurrent["h"].to(self.device),
+            c=recurrent["c"].to(self.device),
+        )
+        if len(state["env_states"]) != self.num_envs:
+            raise ValueError(
+                f"Environment count changed: checkpoint={len(state['env_states'])} "
+                f"current={self.num_envs}"
+            )
+        for env, env_state in zip(self.envs, state["env_states"]):
+            if not hasattr(env, "load_state_dict"):
+                raise TypeError(f"Environment {type(env).__name__} does not support exact resume")
+            env.load_state_dict(env_state)
+
+        torch.set_rng_state(state["torch_rng_state"].cpu())
+        np.random.set_state(state["numpy_rng_state"])
+        random.setstate(state["python_rng_state"])
+        device_rng = state.get("device_rng_state")
+        if device_rng is not None:
+            kind, rng_state = device_rng
+            if kind == "cuda" and self.device.type == "cuda":
+                torch.cuda.set_rng_state_all([value.cpu() for value in rng_state])
+            elif kind == "mps" and self.device.type == "mps":
+                torch.mps.set_rng_state(rng_state.cpu())
+
     # -------------------------------------------------------------- collection
     def collect_rollout(self) -> RolloutBuffer:
         """Collect n_steps transitions from all envs (one forward per vec step)."""
@@ -614,10 +719,17 @@ class RecurrentPPO:
         self,
         total_steps: int,
         on_iteration: Optional[Callable[["RecurrentPPO", Dict[str, object]], None]] = None,
+        *,
+        schedule_total_steps: Optional[int] = None,
     ) -> None:
+        schedule_steps = total_steps if schedule_total_steps is None else schedule_total_steps
+        if schedule_steps < total_steps:
+            raise ValueError(
+                f"schedule_total_steps ({schedule_steps}) must be >= total_steps ({total_steps})"
+            )
         while self.num_timesteps < total_steps:
             buf = self.collect_rollout()
-            progress_remaining = max(0.0, 1.0 - self.num_timesteps / total_steps)
+            progress_remaining = max(0.0, 1.0 - self.num_timesteps / schedule_steps)
             metrics = self.update(buf, progress_remaining)
             if on_iteration is not None:
                 on_iteration(self, metrics)
@@ -749,16 +861,166 @@ def _resolve_device(requested: str) -> str:
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-def _save_model(net: DRCNet, config: DRCTrainConfig, path: Path) -> None:
-    torch.save(
+_RESUME_MUTABLE_CONFIG_FIELDS = {
+    "out_dir",
+    "run_name",
+    "total_steps",
+    "resume_from",
+    "eval_every",
+    "checkpoint_every",
+    "eval_per_length",
+    "final_eval_per_length",
+    "final_eval_episodes",
+    "eval_batch_size",
+    "wandb_project",
+    "wandb_run_name",
+}
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _sha256_json(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _config_contract(config: DRCTrainConfig) -> Dict[str, object]:
+    values = dataclasses.asdict(config)
+    return {key: value for key, value in values.items() if key not in _RESUME_MUTABLE_CONFIG_FIELDS}
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _puzzle_fingerprint(puzzles: Sequence) -> str:
+    rows = [
+        (
+            puzzle.layout_hash,
+            puzzle.seed,
+            puzzle.optimal_length,
+            puzzle.robots_moved,
+            puzzle.actions,
+        )
+        for puzzle in puzzles
+    ]
+    return _sha256_json(rows)
+
+
+def _git_provenance() -> Dict[str, object]:
+    root = Path(__file__).resolve().parents[2]
+
+    def run(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    try:
+        return {
+            "commit": run("rev-parse", "HEAD"),
+            "branch": run("branch", "--show-current"),
+            "dirty": bool(run("status", "--porcelain", "--untracked-files=no")),
+        }
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": None, "branch": None, "dirty": None}
+
+
+def _atomic_torch_save(payload: Dict[str, object], path: Path, *, immutable: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if immutable and path.exists():
+        raise FileExistsError(f"Refusing to overwrite immutable checkpoint: {path}")
+    temporary = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _save_model(
+    net: DRCNet,
+    config: DRCTrainConfig,
+    path: Path,
+    *,
+    metadata: Optional[Dict[str, object]] = None,
+    immutable: bool = False,
+) -> None:
+    _atomic_torch_save(
         {
+            "kind": "drc_model",
+            "schema_version": 2,
             "state_dict": net.state_dict(),
             "config": dataclasses.asdict(config),
+            "config_fingerprint": _sha256_json(dataclasses.asdict(config)),
             "observation_shape": tuple(net.observation_shape),
             "n_actions": int(net.n_actions),
+            "metadata": metadata or {},
         },
         path,
+        immutable=immutable,
     )
+
+
+def _save_training_checkpoint(
+    algo: RecurrentPPO,
+    sampler: object,
+    config: DRCTrainConfig,
+    path: Path,
+    *,
+    run_state: Dict[str, object],
+    metadata: Dict[str, object],
+    immutable: bool = False,
+) -> None:
+    if not hasattr(sampler, "state_dict"):
+        raise TypeError(f"Sampler {type(sampler).__name__} does not support exact resume")
+    _atomic_torch_save(
+        {
+            "kind": "drc_training_state",
+            "schema_version": 1,
+            "config": dataclasses.asdict(config),
+            "config_contract": _config_contract(config),
+            "config_contract_fingerprint": _sha256_json(_config_contract(config)),
+            "algo_state": algo.state_dict(),
+            "sampler_state": sampler.state_dict(),
+            "run_state": run_state,
+            "metadata": metadata,
+        },
+        path,
+        immutable=immutable,
+    )
+
+
+def _load_training_checkpoint(
+    path: str | Path,
+    *,
+    algo: RecurrentPPO,
+    sampler: object,
+    config: DRCTrainConfig,
+) -> Dict[str, object]:
+    payload = torch.load(path, map_location=algo.device, weights_only=False)
+    if payload.get("kind") != "drc_training_state" or int(payload.get("schema_version", -1)) != 1:
+        raise ValueError(f"Not a supported DRC training-state checkpoint: {path}")
+    expected_contract = _config_contract(config)
+    if payload.get("config_contract") != expected_contract:
+        stored = payload.get("config_contract", {})
+        changed = sorted(
+            key
+            for key in set(stored) | set(expected_contract)
+            if stored.get(key) != expected_contract.get(key)
+        )
+        raise ValueError(f"Resume config contract changed in fields: {changed}")
+    if not hasattr(sampler, "load_state_dict"):
+        raise TypeError(f"Sampler {type(sampler).__name__} does not support exact resume")
+    sampler.load_state_dict(payload["sampler_state"])
+    algo.load_state_dict(payload["algo_state"])
+    return payload
 
 
 # ------------------------------------------------------------------ entrypoint
@@ -770,8 +1032,21 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
     """
     from .puzzles import load_puzzles, stratified_subset
 
+    schedule_total_steps = (
+        config.total_steps if config.schedule_total_steps is None else config.schedule_total_steps
+    )
+    if schedule_total_steps < config.total_steps:
+        raise ValueError(
+            f"schedule_total_steps ({schedule_total_steps}) must be >= "
+            f"total_steps ({config.total_steps})"
+        )
     out = Path(config.out_dir) / config.run_name
     out.mkdir(parents=True, exist_ok=True)
+    curve_path = out / "curve.jsonl"
+    if config.resume_from is None and curve_path.exists():
+        raise FileExistsError(
+            f"Run already has a curve; use resume_from or a new run_name: {curve_path}"
+        )
     (out / "config.json").write_text(json.dumps(dataclasses.asdict(config), indent=2))
     wandb_run = _maybe_init_wandb(config, out)
 
@@ -789,6 +1064,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
 
     if puzzles_override is not None:
         train_puzzles = list(puzzles_override)
+        val_puzzles = list(train_puzzles)
         val_suite = list(train_puzzles)
         final_suite = list(train_puzzles)
     else:
@@ -802,6 +1078,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             train_puzzles = stratified_subset(
                 train_puzzles, per_length=max(1, config.overfit_n // 4), seed=config.seed
             )[: config.overfit_n]
+            val_puzzles = list(train_puzzles)
             val_suite = list(train_puzzles)
             final_suite = list(train_puzzles)
         else:
@@ -858,82 +1135,246 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         seed=config.seed,
     )
     n_params = sum(p.numel() for p in net.parameters())
+    provenance = {
+        "git": _git_provenance(),
+        "config_fingerprint": _sha256_json(dataclasses.asdict(config)),
+        "config_contract_fingerprint": _sha256_json(_config_contract(config)),
+        "bank_sha256": (
+            _file_sha256(config.bank_path)
+            if puzzles_override is None and Path(config.bank_path).is_file()
+            else None
+        ),
+        "split_fingerprints": {
+            "train": _puzzle_fingerprint(train_puzzles),
+            "validation_pool": _puzzle_fingerprint(val_puzzles),
+            "validation_periodic_suite": _puzzle_fingerprint(val_suite),
+            "validation_final_suite": _puzzle_fingerprint(final_suite),
+        },
+        "observation_shape": tuple(net.observation_shape),
+        "n_actions": int(net.n_actions),
+        "policy_params": int(n_params),
+    }
     print(
         f"[drc] device={device} DRC({config.drc_depth},{config.drc_ticks}) "
         f"policy_params={n_params:,}",
         flush=True,
     )
 
-    curve_path = out / "curve.jsonl"
     start_time = time.time()
+    elapsed_before = 0.0
     next_eval = config.eval_every
+    next_checkpoint = config.checkpoint_every
     best_val_det: Optional[float] = None
     best_timesteps: Optional[int] = None
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
 
-    def on_iteration(algo: RecurrentPPO, metrics: Dict[str, object]) -> None:
-        nonlocal next_eval, best_val_det, best_timesteps
-        if algo.num_timesteps < next_eval:
-            return
-        next_eval += config.eval_every
-        det = evaluate_drc(
-            net,
-            val_suite,
-            env_config,
-            episodes_per_puzzle=1,
-            deterministic=True,
-            batch_size=config.eval_batch_size,
+    if config.resume_from is not None:
+        resume_payload = _load_training_checkpoint(
+            config.resume_from,
+            algo=algo,
+            sampler=sampler,
+            config=config,
         )
-        if best_val_det is None or det["success_rate"] > best_val_det:
-            best_val_det = float(det["success_rate"])
-            best_timesteps = int(algo.num_timesteps)
-            _save_model(net, config, out / "model_best.pt")
-        entry = {
-            "timesteps": int(algo.num_timesteps),
-            "elapsed_s": round(time.time() - start_time, 1),
-            "steps_per_s": round(algo.num_timesteps / max(1e-9, time.time() - start_time), 1),
-            "val_det": det,
-            "best_val_det": best_val_det,
-            "best_timesteps": best_timesteps,
-            "sampler": sampler.stats(),
-            "losses": metrics,
-        }
-        with curve_path.open("a") as fh:
-            fh.write(json.dumps(entry) + "\n")
-        if wandb_run is not None:
-            payload = {
-                "train/timesteps": int(algo.num_timesteps),
-                "train/steps_per_s": entry["steps_per_s"],
-                **{f"train/{k}": v for k, v in metrics.items() if isinstance(v, (int, float))},
-                **_flatten_eval("val_det", det),
-                **_flatten_sampler(sampler.stats()),
-            }
-            wandb_run.log(payload, step=int(algo.num_timesteps))
+        run_state = resume_payload.get("run_state", {})
+        elapsed_before = float(run_state.get("elapsed_s", 0.0))
+        best_val_det = run_state.get("best_val_det")
+        best_timesteps = run_state.get("best_timesteps")
+        best_state_dict = run_state.get("best_state_dict")
+        next_eval = int(run_state.get("next_eval", 0))
+        if next_eval <= algo.num_timesteps:
+            next_eval = (algo.num_timesteps // config.eval_every + 1) * config.eval_every
+        saved_next_checkpoint = run_state.get("next_checkpoint")
+        if config.checkpoint_every is None:
+            next_checkpoint = None
+        elif saved_next_checkpoint is None or int(saved_next_checkpoint) <= algo.num_timesteps:
+            next_checkpoint = (
+                algo.num_timesteps // config.checkpoint_every + 1
+            ) * config.checkpoint_every
+        else:
+            next_checkpoint = int(saved_next_checkpoint)
         print(
-            f"[drc] t={entry['timesteps']:>9,} ({entry['steps_per_s']:.0f} st/s) "
-            f"val_det={det['success_rate']:.3f} "
-            f"by_len={ {k: v['success_rate'] for k, v in det['by_length'].items()} } "
-            f"sampler={sampler.stats().get('frontier', '-')}",
+            f"[drc] resumed exact training state from {config.resume_from} "
+            f"at t={algo.num_timesteps:,}",
             flush=True,
         )
-        _save_model(net, config, out / "model_latest.pt")
+    if algo.num_timesteps >= config.total_steps:
+        raise ValueError(
+            f"Nothing to train: checkpoint t={algo.num_timesteps} >= "
+            f"target total_steps={config.total_steps}"
+        )
 
-    algo.learn(config.total_steps, on_iteration)
-    _save_model(net, config, out / "model_final.pt")
+    history_entry = {
+        "started_at_unix": time.time(),
+        "resume_from": config.resume_from,
+        "start_timesteps": int(algo.num_timesteps),
+        "target_total_steps": int(config.total_steps),
+        "schedule_total_steps": int(schedule_total_steps),
+        **provenance,
+    }
+    with (out / "run_history.jsonl").open("a") as handle:
+        handle.write(json.dumps(history_entry) + "\n")
+
+    def elapsed_total() -> float:
+        return elapsed_before + (time.time() - start_time)
+
+    def snapshot_metadata(kind: str) -> Dict[str, object]:
+        elapsed = elapsed_total()
+        return {
+            "kind": kind,
+            "timesteps": int(algo.num_timesteps),
+            "elapsed_s": round(elapsed, 3),
+            "steps_per_s": round(algo.num_timesteps / max(elapsed, 1e-9), 3),
+            **provenance,
+        }
+
+    def current_run_state() -> Dict[str, object]:
+        return {
+            "elapsed_s": elapsed_total(),
+            "best_val_det": best_val_det,
+            "best_timesteps": best_timesteps,
+            "best_state_dict": best_state_dict,
+            "next_eval": next_eval,
+            "next_checkpoint": next_checkpoint,
+        }
+
+    def save_training_latest() -> None:
+        _save_training_checkpoint(
+            algo,
+            sampler,
+            config,
+            out / "training_latest.pt",
+            run_state=current_run_state(),
+            metadata=snapshot_metadata("training_latest"),
+        )
+
+    def on_iteration(algo: RecurrentPPO, metrics: Dict[str, object]) -> None:
+        nonlocal next_eval, next_checkpoint, best_val_det, best_timesteps, best_state_dict
+        saved_something = False
+        if algo.num_timesteps >= next_eval:
+            while next_eval <= algo.num_timesteps:
+                next_eval += config.eval_every
+            det = evaluate_drc(
+                net,
+                val_suite,
+                env_config,
+                episodes_per_puzzle=1,
+                deterministic=True,
+                batch_size=config.eval_batch_size,
+            )
+            if best_val_det is None or det["success_rate"] > best_val_det:
+                best_val_det = float(det["success_rate"])
+                best_timesteps = int(algo.num_timesteps)
+                best_state_dict = {
+                    key: value.detach().cpu().clone() for key, value in net.state_dict().items()
+                }
+                _save_model(
+                    net,
+                    config,
+                    out / "model_best.pt",
+                    metadata=snapshot_metadata("model_best"),
+                )
+            entry = {
+                "timesteps": int(algo.num_timesteps),
+                "elapsed_s": round(elapsed_total(), 1),
+                "steps_per_s": round(
+                    algo.num_timesteps / max(1e-9, elapsed_total()), 1
+                ),
+                "val_det": det,
+                "best_val_det": best_val_det,
+                "best_timesteps": best_timesteps,
+                "sampler": sampler.stats(),
+                "losses": metrics,
+            }
+            with curve_path.open("a") as fh:
+                fh.write(json.dumps(entry) + "\n")
+            if wandb_run is not None:
+                payload = {
+                    "train/timesteps": int(algo.num_timesteps),
+                    "train/steps_per_s": entry["steps_per_s"],
+                    **{
+                        f"train/{key}": value
+                        for key, value in metrics.items()
+                        if isinstance(value, (int, float))
+                    },
+                    **_flatten_eval("val_det", det),
+                    **_flatten_sampler(sampler.stats()),
+                }
+                wandb_run.log(payload, step=int(algo.num_timesteps))
+            print(
+                f"[drc] t={entry['timesteps']:>9,} ({entry['steps_per_s']:.0f} st/s) "
+                f"val_det={det['success_rate']:.3f} "
+                f"by_len={ {k: v['success_rate'] for k, v in det['by_length'].items()} } "
+                f"sampler={sampler.stats().get('frontier', '-')}",
+                flush=True,
+            )
+            _save_model(
+                net,
+                config,
+                out / "model_latest.pt",
+                metadata=snapshot_metadata("model_latest"),
+            )
+            saved_something = True
+
+        if next_checkpoint is not None and algo.num_timesteps >= next_checkpoint:
+            while next_checkpoint <= algo.num_timesteps:
+                next_checkpoint += config.checkpoint_every
+            actual = int(algo.num_timesteps)
+            metadata = snapshot_metadata("periodic")
+            _save_model(
+                net,
+                config,
+                out / f"model_{actual}.pt",
+                metadata=metadata,
+                immutable=True,
+            )
+            _save_training_checkpoint(
+                algo,
+                sampler,
+                config,
+                out / f"training_{actual}.pt",
+                run_state=current_run_state(),
+                metadata=metadata,
+                immutable=True,
+            )
+            with (out / "snapshot_manifest.jsonl").open("a") as handle:
+                handle.write(json.dumps(metadata) + "\n")
+            saved_something = True
+
+        if saved_something:
+            save_training_latest()
+
+    algo.learn(
+        config.total_steps,
+        on_iteration,
+        schedule_total_steps=schedule_total_steps,
+    )
+    final_metadata = snapshot_metadata("final")
+    _save_model(net, config, out / "model_final.pt", metadata=final_metadata)
+    _save_training_checkpoint(
+        algo,
+        sampler,
+        config,
+        out / "training_final.pt",
+        run_state=current_run_state(),
+        metadata=final_metadata,
+    )
+    save_training_latest()
 
     # Final report evals use the BEST periodic-eval checkpoint (post-convergence
     # collapse protection); fall back to the final weights when no periodic
     # eval ever ran (total_steps < eval_every).
     report_eval_weights = "final"
-    best_path = out / "model_best.pt"
-    if best_path.exists():
-        payload = torch.load(best_path, map_location="cpu", weights_only=False)
-        net.load_state_dict(payload["state_dict"])
+    if best_state_dict is not None:
+        net.load_state_dict(best_state_dict)
         report_eval_weights = "best"
 
     report = {
         "config": dataclasses.asdict(config),
         "policy_params": int(n_params),
-        "elapsed_s": round(time.time() - start_time, 1),
+        "elapsed_s": round(elapsed_total(), 1),
+        "actual_timesteps": int(algo.num_timesteps),
+        "schedule_total_steps": int(schedule_total_steps),
+        "provenance": provenance,
         "best_val_det": best_val_det,
         "best_timesteps": best_timesteps,
         "report_eval_weights": report_eval_weights,
@@ -962,6 +1403,9 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         "sampler_final": sampler.stats(),
     }
     (out / "report.json").write_text(json.dumps(report, indent=2))
+    report_at_steps = out / f"report_{algo.num_timesteps}.json"
+    if not report_at_steps.exists():
+        report_at_steps.write_text(json.dumps(report, indent=2))
     print(
         json.dumps(
             {
@@ -980,13 +1424,13 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
     if wandb_run is not None:
         wandb_run.log(
             {
-                "train/timesteps": int(config.total_steps),
+                "train/timesteps": int(algo.num_timesteps),
                 **_flatten_eval("final/val_det", report["final_val_det"]),
                 **_flatten_eval("final/val_stoch", report["final_val_stoch"]),
                 **_flatten_eval("final/baseline_random", report["baseline_random"]),
                 **_flatten_eval("final/baseline_target_only", report["baseline_target_only"]),
             },
-            step=int(config.total_steps),
+            step=int(algo.num_timesteps),
         )
         wandb_run.finish()
     return report

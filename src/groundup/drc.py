@@ -468,6 +468,44 @@ class DRCNet(nn.Module):
                 x = F.relu(x)
         return x
 
+    def recurrent_trace(
+        self,
+        obs: Tensor,
+        state: Optional[DRCState] = None,
+    ) -> Tuple[Tensor, Tuple[Tensor, ...], Tensor, DRCState]:
+        """Expose encoder/tick spatial maps without changing policy semantics.
+
+        Returns ``(encoded, tick_outputs, readout_map, new_state)`` where each
+        tick output is the final-depth hidden map after that recurrent tick,
+        and ``readout_map`` is the map flattened by the faithful policy/value
+        readout (including the encoder skip when enabled). This method is
+        primarily for frozen-network mechanistic probes.
+        """
+        if obs.dim() != 4 or obs.shape[1:] != self.observation_shape:
+            raise ValueError(
+                f"expected obs of shape (B, {self.observation_shape}), got {tuple(obs.shape)}"
+            )
+        if state is None:
+            state = self.initial_state(obs.shape[0], device=obs.device, dtype=obs.dtype)
+
+        encoded = self.encode(obs)
+        h = list(state.h.unbind(0))
+        c = list(state.c.unbind(0))
+        tick_outputs = []
+        for _ in range(self.ticks):
+            # Top-down skip: read h_D of the PREVIOUS tick before updating.
+            below = h[-1]
+            for depth, cell in enumerate(self.cells):
+                h[depth], c[depth] = cell(encoded, below, (h[depth], c[depth]))
+                below = h[depth]
+            tick_outputs.append(h[-1])
+
+        readout_map = h[-1]
+        if self.encoder_skip:
+            readout_map = readout_map + encoded
+        new_state = DRCState(h=torch.stack(h), c=torch.stack(c))
+        return encoded, tuple(tick_outputs), readout_map, new_state
+
     def forward(
         self,
         obs: Tensor,
@@ -487,34 +525,15 @@ class DRCNet(nn.Module):
         Returns:
             ``(policy_logits (B, n_actions), value (B,), new_state)``.
         """
-        if obs.dim() != 4 or obs.shape[1:] != self.observation_shape:
-            raise ValueError(f"expected obs of shape (B, {self.observation_shape}), got {tuple(obs.shape)}")
-        if state is None:
-            state = self.initial_state(obs.shape[0], device=obs.device, dtype=obs.dtype)
-
-        encoded = self.encode(obs)
-
-        h = list(state.h.unbind(0))
-        c = list(state.c.unbind(0))
-        for _ in range(self.ticks):
-            # Top-down skip: read h_D of the PREVIOUS tick before updating.
-            below = h[-1]
-            for d, cell in enumerate(self.cells):
-                h[d], c[d] = cell(encoded, below, (h[d], c[d]))
-                below = h[d]
-
-        out = h[-1]
-        if self.encoder_skip:
-            out = out + encoded
-
-        hidden = F.relu(self.mlp(out.flatten(1)))
+        _encoded, _ticks, readout_map, new_state = self.recurrent_trace(obs, state)
+        hidden = F.relu(self.mlp(readout_map.flatten(1)))
         logits = self.actor(hidden)
         value = self.critic(hidden).squeeze(-1)
 
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask, LOGIT_MASK_VALUE)
 
-        return logits, value, DRCState(h=torch.stack(h), c=torch.stack(c))
+        return logits, value, new_state
 
 
 def sokoban_drc33() -> DRCNet:

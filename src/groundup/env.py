@@ -15,6 +15,7 @@ Differences from the legacy stack (see docs/GroundUpRLRedesign.md):
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -84,6 +85,7 @@ class RicochetEnv(gym.Env):
         self.sampler = sampler
         self._rng = np.random.default_rng(seed)
         self._dmap_cache: Dict[int, np.ndarray] = {}
+        self._puzzle_index_by_id = {id(puzzle): i for i, puzzle in enumerate(self.puzzles)}
 
         helper_channels = 0
         if config.stop_planes:
@@ -117,6 +119,7 @@ class RicochetEnv(gym.Env):
         self.action_space = spaces.Discrete(4 * self.num_robots)
 
         self._puzzle: Optional[Puzzle] = None
+        self._puzzle_index: Optional[int] = None
         self._robots: List[Tuple[int, int]] = []
         self._steps = 0
         self._start_distance = 0
@@ -234,18 +237,25 @@ class RicochetEnv(gym.Env):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         if options and "puzzle_index" in options:
-            puzzle = self.puzzles[int(options["puzzle_index"])]
+            puzzle_index = int(options["puzzle_index"])
+            puzzle = self.puzzles[puzzle_index]
             start_distance = int(options.get("start_distance", puzzle.optimal_length))
         elif self.sampler is not None:
             puzzle, start_distance = self.sampler.sample(self._rng)
+            try:
+                puzzle_index = self._puzzle_index_by_id[id(puzzle)]
+            except KeyError as exc:
+                raise ValueError("Sampler returned a puzzle outside this environment's table") from exc
         else:
-            puzzle = self.puzzles[int(self._rng.integers(len(self.puzzles)))]
+            puzzle_index = int(self._rng.integers(len(self.puzzles)))
+            puzzle = self.puzzles[puzzle_index]
             start_distance = puzzle.optimal_length
         if not 1 <= start_distance <= puzzle.optimal_length:
             raise ValueError(
                 f"start_distance {start_distance} out of range for optimal_length {puzzle.optimal_length}"
             )
         self._puzzle = puzzle
+        self._puzzle_index = puzzle_index
         positions = self._start_positions(puzzle, start_distance)
         self._robots = self._canonicalize(puzzle, positions)
         self._steps = 0
@@ -257,6 +267,39 @@ class RicochetEnv(gym.Env):
             "robots_moved": puzzle.robots_moved,
         }
         return self._obs(), info
+
+    def state_dict(self) -> Dict[str, object]:
+        """Exact mutable episode state for iteration-boundary resume."""
+        return {
+            "puzzle_index": self._puzzle_index,
+            "robots": tuple(self._robots),
+            "steps": self._steps,
+            "start_distance": self._start_distance,
+            "episode_done": self._episode_done,
+            "rng_state": copy.deepcopy(self._rng.bit_generator.state),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        puzzle_index = state.get("puzzle_index")
+        if puzzle_index is None:
+            self._puzzle = None
+            self._puzzle_index = None
+        else:
+            puzzle_index = int(puzzle_index)
+            if not 0 <= puzzle_index < len(self.puzzles):
+                raise ValueError(f"Checkpoint puzzle index out of range: {puzzle_index}")
+            self._puzzle_index = puzzle_index
+            self._puzzle = self.puzzles[puzzle_index]
+        self._robots = [tuple(map(int, position)) for position in state["robots"]]
+        if self._puzzle is not None and len(self._robots) != self.num_robots:
+            raise ValueError(
+                f"Checkpoint robot count changed: checkpoint={len(self._robots)} "
+                f"current={self.num_robots}"
+            )
+        self._steps = int(state["steps"])
+        self._start_distance = int(state["start_distance"])
+        self._episode_done = bool(state["episode_done"])
+        self._rng.bit_generator.state = copy.deepcopy(state["rng_state"])
 
     def step(self, action: int):
         if self._episode_done:
