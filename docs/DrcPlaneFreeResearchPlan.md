@@ -650,11 +650,11 @@ write-ups should be committed.
 - [x] Run checkpoint/resume/probe smoke test.
 - [x] Benchmark real-factory throughput candidates.
 - [x] Freeze and record the selected run config.
-- [ ] Verify detached launch and machine-sleep protection.
+- [x] Verify detached launch and machine-sleep protection.
 
 ### Initial sweep
 
-- [ ] Launch seed-11 run.
+- [x] Launch seed-11 run.
 - [ ] Monitor optimizer health and artifacts.
 - [ ] Probe every 5M snapshot.
 - [ ] Do not performance-stop before 60M.
@@ -770,3 +770,31 @@ Use this template for each entry:
 - Artifacts:
   `artifacts/groundup/drc33_p1_12x12_planefree/throughput_benchmark.json`,
   `throughput_benchmark_256.json`, and `throughput_benchmark_512.json`.
+
+### 2026-07-23 17:37 BST — Mandatory 60M sweep launched
+
+- Status before: all engineering, test, preflight, and throughput gates green;
+  repository clean at commit `1964f7d`.
+- Exact config:
+  `configs/groundup_drc33_p1_12x12_planefree.yaml`; seed 11; 60M current
+  stop target; 200M schedule horizon; frozen 256/32/2048/1 geometry.
+- Launch: detached GNU Screen session `drc33_p1_60m`, with
+  `caffeinate -is` wrapping the Python trainer. The direct `nohup` attempt was
+  immediately reaped by the command-execution host before Python started and
+  produced no run state; it is an operational non-run.
+- Verified live processes: Screen, `caffeinate`, and Python trainer all
+  present. Trainer reported 39,713 train puzzles, fixed 200-puzzle periodic
+  validation suite, 480-puzzle final validation suite, MPS device, DRC(3,3),
+  and 1,650,701 parameters.
+- W&B: project `ricochet-robots-rl`, run
+  `groundup-drc33-p1-12x12-planefree`, ID `pupnnpq8`.
+- Probe watcher: detached Screen session `drc33_p1_probes`, CPU priority
+  reduced with two BLAS/OpenMP threads. It will create the fixed 16,000-state
+  validation dataset, random-initialization control, and probe/collation
+  outputs as immutable 5M snapshots arrive.
+- Logs:
+  `artifacts/groundup/drc33_p1_12x12_planefree/train.log` and
+  `probe_daemon.log`.
+- Sealed test: not loaded by the trainer and not evaluated.
+- Next action: monitor first 1M evaluation/checkpoint health; do not
+  performance-stop before 60M.
