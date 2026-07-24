@@ -1044,3 +1044,32 @@ Use this template for each entry:
   power to avoid a harmless but time-consuming pause.
 - Next action: verify the first resumed 61M curve row, dense snapshot, probe,
   schedule, and W&B history before settling into 120M monitoring.
+
+### 2026-07-24 13:55 BST — Live probe W&B persistence repaired
+
+- Audit: dense probe snapshots, checkpoint JSONs, CSV, manifest, Markdown
+  table, and PNG had continued updating locally every 1M steps, reaching 68
+  checkpoints through t=71,000,064. The original probe daemon had no live
+  W&B writer; the 4–60M metrics and artifact on training run `pupnnpq8` were
+  a one-off review backfill, so the remote probe plots had correctly stopped
+  at 60M even while local probing continued.
+- Fix: added an incremental, restart-safe W&B writer to the probe daemon.
+  It records only previously unsynced checkpoints, refreshes the complete
+  trajectory chart and table after each new 1M probe, and versions the
+  checksum-backed probe artifact every 5M plus at final shutdown. Local
+  `.drc_probe_wandb_state.json` and the remote run summary both record the
+  last successful metric and artifact steps.
+- W&B topology: because the active trainer was not originally initialized
+  in W&B shared mode, a concurrent writer to that same run would be unsafe.
+  Live probes therefore use dedicated run
+  `groundup-drc33-p1-12x12-planefree-probes` (ID `bkvhg71c`), grouped under
+  parent training run `pupnnpq8`. The final review will also consolidate the
+  complete probe history back into the training run.
+- Remote verification: run `bkvhg71c` is `running`; summary reports 68
+  checkpoints and `probe/last_timesteps=71,000,064`; refreshed chart/table
+  are logged; artifact
+  `drc33_p1_12x12_planefree-probes:v1` has aliases `71m` and `latest` and
+  metadata through 71,000,064.
+- Validation: probe suite 7/7, DRC exact-resume suite 19/19, Ruff clean.
+  Only the CPU probe daemon was restarted; GPU training, exact continuation,
+  and the dense snapshot watcher were untouched.
