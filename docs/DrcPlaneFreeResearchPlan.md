@@ -1120,3 +1120,43 @@ Use this template for each entry:
   learning-rate schedule horizon; validation-only selection; sealed test
   remains unopened. Next operational check is the first post-resume 88M
   evaluation, retained snapshot, local probe, and W&B append.
+
+### 2026-07-24 22:56 BST — Value divergence diagnosed; trainer frozen at 91M
+
+- Trigger: user noticed a sharp W&B performance fall after the 87M battery
+  pause. Local artifacts confirmed a real collapse rather than a plotting
+  issue: deterministic validation was 75.5% at 88M, then 36.0%, 31.5%, and
+  27.5% at 89–91M. Curriculum frontier fell from 6 to 2 as a consequence.
+- Immediate containment: sent `SIGSTOP` to the trainer after the exact
+  t=91,004,928 checkpoint was atomically written. The trainer is frozen and
+  consumes no compute while the already-saved probes finish; it has not been
+  allowed to compound the failure.
+- Resume audit passed. `training_pause_87007232.pt` and
+  `probe_model_87007232.pt` have bit-identical model weights. Adam step
+  advanced continuously from 42,480 at 87M to 43,941 at 90M and 44,429 at
+  91M; learning rate followed the registered 200M horizon
+  (0.00019124, 0.00018749, 0.00018624). Parameters and optimizer moments are
+  finite, the 87M checkpoint contract is unchanged, and no W&B or runtime
+  errors occurred. This is not evidence of an exact-resume failure.
+- Pre-pause warning: value loss was 0.037 at 80M, then 0.306/0.711/1.718 at
+  84/85/86M and **19.18 at 87M before the pause**. It remained 16.01 at 88M
+  and jumped to 335.64 at the 89M task collapse, then 272.71/313.00 at
+  90/91M. Mean/max KL rose but stayed below the configured early-stop
+  threshold. The critic-driven gradients passed through the shared DRC trunk
+  and damaged policy behavior.
+- Diagnosis: genuine value-function divergence under the registered primary
+  config, which deliberately had `clip_range_vf: null`. The timing next to
+  the restart is coincidental; the exponential instability was already
+  established by 84–87M. Landing probes did not form the hypothesized
+  mid/long circuit during the collapse.
+- Preserved recovery points: validation-selected model remains the 79M
+  checkpoint at 83.0%. The latest exact training checkpoint before the
+  divergence is `training_80003072.pt` (80.0% validation, value loss 0.037).
+  The 85M checkpoint is not a clean rescue point because value loss had
+  already risen to 0.711.
+- Decision required: do not continue the corrupted 91M trajectory. Either
+  close the primary run as a numerical-instability result, or launch a
+  separately labelled rescue arm from the exact 80M state with the already
+  implemented PPO2 value-loss stabilization (`clip_range_vf: 0.2`). The
+  latter changes the optimizer contract and must not be represented as an
+  uninterrupted primary continuation. Sealed test remains unopened.
