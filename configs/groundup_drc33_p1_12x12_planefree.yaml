@@ -61,7 +61,7 @@ checkpoint_every: 5000000
 # Immutable exact-state checkpoint selected for the registered 60M -> 120M
 # continuation. This includes optimizer, schedule progress, curriculum,
 # environments, recurrent rollout state, and every relevant RNG.
-resume_from: artifacts/groundup/drc33_p1_12x12_planefree/training_60006400.pt
+resume_from: artifacts/groundup/drc33_p1_12x12_planefree/training_pause_87007232.pt
 device: auto
 wandb_project: ricochet-robots-rl
 wandb_run_name: groundup-drc33-p1-12x12-planefree

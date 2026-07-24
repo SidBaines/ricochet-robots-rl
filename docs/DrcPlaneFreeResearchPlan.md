@@ -1073,3 +1073,32 @@ Use this template for each entry:
 - Validation: probe suite 7/7, DRC exact-resume suite 19/19, Ruff clean.
   Only the CPU probe daemon was restarted; GPU training, exact continuation,
   and the dense snapshot watcher were untouched.
+
+### 2026-07-24 17:12 BST — Battery pause at 87M
+
+- User-requested pause: stopped the MPS trainer, dense-snapshot watcher, and
+  CPU probe workers; their Screen sessions and the `caffeinate` assertion are
+  gone. Process audit found no remaining experiment compute.
+- Exact restart point: `training_latest.pt` and immutable hard link
+  `training_pause_87007232.pt` contain the full algorithm, optimizer,
+  recurrent rollout, environment, curriculum, and RNG state at
+  t=87,007,232. The curve also ends at t=87,007,232 (87 rows). Checkpoint
+  SHA-256:
+  `91c8e8ae197f027c7da457c98265d66cc8074ab8324c83051a723169b23c691e`.
+- Last validation before pause: 77.0% deterministic on the fixed 200-puzzle
+  suite. The 80–86M window remained 78.5–80.5%; no sealed-test evaluation
+  was performed.
+- Probe state: local probes and the live probe W&B run are synchronized
+  through t=87,007,232. Both W&B clients flushed during shutdown.
+- Process hygiene: the audit also found the pre-W&B probe daemon orphaned
+  from the 13:55 restart. It had raced the replacement daemon on some
+  already-deterministic probe checkpoints but did not create a second result
+  file or change the fixed dataset. Both copies are now stopped; resume must
+  launch exactly one probe daemon.
+- Resume preparation: the config now points `resume_from` at
+  `training_pause_87007232.pt`; the 120M target, 200M learning-rate schedule
+  horizon, scientific contract, validation suites, and W&B run IDs remain
+  unchanged. On request, relaunch the trainer with `WANDB_RUN_ID=pupnnpq8`
+  and `WANDB_RESUME=must`, then one snapshot watcher and one probe daemon
+  attached to probe run `bkvhg71c`; verify the exact t=87,007,232 load before
+  leaving it unattended.
