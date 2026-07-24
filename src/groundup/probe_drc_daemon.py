@@ -14,6 +14,7 @@ from .collate_drc_probes import (
     write_machine_outputs,
     write_outputs,
 )
+from .drc_probe_wandb import ProbeWandbLogger
 from .probe_drc_landing import probe_checkpoint
 
 
@@ -110,28 +111,92 @@ def main() -> None:
     parser.add_argument("--p1-run-dir", default=None)
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--target-timesteps", type=int, default=None)
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--wandb-run-id", default=None)
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-parent-run-id", default=None)
+    parser.add_argument("--wandb-artifact-every", type=int, default=5_000_000)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     if args.poll_seconds < 1:
         raise ValueError("poll-seconds must be positive")
+    if args.wandb_project and not args.wandb_run_id:
+        raise ValueError("wandb-run-id is required when W&B logging is enabled")
 
     run_dir = Path(args.run_dir)
-    while True:
-        completed = process_available(
+    wandb_logger = None
+    if args.wandb_project:
+        wandb_logger = ProbeWandbLogger(
             run_dir,
-            dataset=args.dataset,
-            device=args.device,
-            n_states=args.n_states,
-            probe_epochs=args.probe_epochs,
-            p1_run_dir=args.p1_run_dir,
+            project=args.wandb_project,
+            run_name=args.wandb_run_name or f"{run_dir.name}-probes",
+            run_id=args.wandb_run_id,
+            entity=args.wandb_entity,
+            parent_run_id=args.wandb_parent_run_id,
+            artifact_every=args.wandb_artifact_every,
         )
-        if args.once:
-            break
-        if args.target_timesteps is not None and _curve_reached(run_dir, args.target_timesteps) and completed == 0:
-            break
-        if args.target_timesteps is None and (run_dir / "training_final.pt").exists() and completed == 0:
-            break
-        time.sleep(args.poll_seconds)
+    try:
+        while True:
+            completed = process_available(
+                run_dir,
+                dataset=args.dataset,
+                device=args.device,
+                n_states=args.n_states,
+                probe_epochs=args.probe_epochs,
+                p1_run_dir=args.p1_run_dir,
+            )
+            if wandb_logger is not None:
+                rows = load_probe_series(run_dir)
+                control_path = run_dir / "probe_control.json"
+                control = (
+                    json.loads(control_path.read_text())
+                    if control_path.exists()
+                    else None
+                )
+                try:
+                    synced = wandb_logger.sync(rows, control=control)
+                    if synced:
+                        print(
+                            f"[drc-probe] synced {synced} W&B rows "
+                            f"through t={wandb_logger.last_timesteps:,}",
+                            flush=True,
+                        )
+                except Exception as error:
+                    print(
+                        f"[drc-probe] W&B sync failed: {error!r}",
+                        flush=True,
+                    )
+            if args.once:
+                break
+            target_complete = (
+                args.target_timesteps is not None
+                and _curve_reached(run_dir, args.target_timesteps)
+                and completed == 0
+            )
+            final_complete = (
+                args.target_timesteps is None
+                and (run_dir / "training_final.pt").exists()
+                and completed == 0
+            )
+            if target_complete or final_complete:
+                if wandb_logger is not None:
+                    try:
+                        wandb_logger.sync(
+                            load_probe_series(run_dir),
+                            control=control,
+                            force_artifact=True,
+                        )
+                    except Exception as error:
+                        print(
+                            f"[drc-probe] final W&B sync failed: {error!r}",
+                            flush=True,
+                        )
+                break
+            time.sleep(args.poll_seconds)
+    finally:
+        if wandb_logger is not None:
+            wandb_logger.finish()
 
 
 if __name__ == "__main__":

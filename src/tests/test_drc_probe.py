@@ -14,6 +14,7 @@ from src.groundup.collate_drc_probes import (
 )
 from src.groundup.drc import DRCNet
 from src.groundup.drc_train import DRCTrainConfig, _save_model
+from src.groundup.drc_probe_wandb import artifact_due, build_wandb_payloads
 from src.groundup.probe_drc_landing import (
     _array_fingerprint,
     extract_zero_state_features,
@@ -246,3 +247,20 @@ def test_dataset_fingerprint_and_probe_collation(tmp_path):
     assert manifest["dataset_hash_count"] == 1
     assert manifest["series_csv"]["path"] == "drc_probe_series.csv"
     assert len(manifest["series_csv"]["sha256"]) == 64
+
+    payloads = build_wandb_payloads(run_dir, rows)
+    assert [payload["probe/timesteps"] for payload in payloads] == [
+        5_000_000,
+        10_000_000,
+    ]
+    assert payloads[0]["probe/tick_3/mid"] == 0.2
+    assert payloads[0]["probe/tick_3/mid_control"] is None
+    assert payloads[0]["probe/tick_3/mid_gain"] is None
+
+
+def test_probe_artifact_cadence():
+    assert artifact_due(70_000_640, 60_006_400, 5_000_000)
+    assert not artifact_due(71_000_064, 70_000_640, 5_000_000)
+    assert artifact_due(75_005_376, 70_000_640, 5_000_000)
+    assert artifact_due(1, 0, 5_000_000)
+    assert not artifact_due(10_000_000, 0, 0)
