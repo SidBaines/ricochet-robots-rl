@@ -1012,3 +1012,35 @@ Use this template for each entry:
   sealed test unopened.
 - Full review: `docs/DrcPlaneFree60MReview.md` and
   `docs/DrcPlaneFree60MReview.json`.
+
+### 2026-07-24 11:45 BST — Exact continuation launched to 120M
+
+- Status before: 60M review complete; repository clean at commit `fede440`;
+  immutable exact-state checkpoint `training_60006400.pt` verified at
+  algorithm step 60,006,400 with matching scientific contract.
+- Config: `total_steps: 120000000`,
+  `schedule_total_steps: 200000000`, and `resume_from` set to the immutable
+  60M checkpoint. Environment, model, optimizer, curriculum, rollout, probe,
+  validation, and checkpoint settings are otherwise unchanged.
+- Training launch: detached Screen `drc33_p1_120m`, wrapped in
+  `caffeinate -is`. `WANDB_RUN_ID=pupnnpq8` and `WANDB_RESUME=must` append
+  the continuation to the original W&B run rather than creating a fork.
+- Trainer verification: exact resume reported t=60,006,400; 39,713 training
+  puzzles; fixed 200/480 periodic/final validation suites; MPS DRC(3,3);
+  1,650,701 parameters. Run history records clean commit `fede440`, unchanged
+  scientific contract fingerprint
+  `af7aae4967d56957deedb11647b46045164efa437e51e885f789873e92611719`,
+  next evaluation 61M, and next registered snapshot 65M.
+- Probe launch: detached target-aware Screens
+  `drc33_p1_probe_snapshots_120m` and `drc33_p1_probes_120m`. They ignore the
+  old 60M final marker, retain/probe every new 1M evaluation, update the local
+  CSV/manifest/chart/table, and exit only after the 120M curve target and
+  pending probes are complete.
+- W&B verification: original run `pupnnpq8` is remotely `running`; the
+  verified 60M probe artifact remains attached.
+- Sealed test: still unopened.
+- Operational note: launch was on battery at 93%. `caffeinate` protects
+  against idle sleep but not clamshell sleep; keep the lid open and prefer AC
+  power to avoid a harmless but time-consuming pause.
+- Next action: verify the first resumed 61M curve row, dense snapshot, probe,
+  schedule, and W&B history before settling into 120M monitoring.
