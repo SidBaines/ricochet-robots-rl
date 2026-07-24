@@ -429,9 +429,13 @@ def test_primary_12x12_drc_config_is_helper_free_and_extension_safe():
         2048,
         1,
     )
-    assert config.total_steps == 60_000_000
+    assert config.total_steps == 120_000_000
     assert config.schedule_total_steps == 200_000_000
     assert config.checkpoint_every == 5_000_000
+    assert config.resume_from == (
+        "artifacts/groundup/drc33_p1_12x12_planefree/"
+        "training_60006400.pt"
+    )
     # 4 walls + goal + 3 robots + time; 3 robots x 4 directions.
     net = build_net(config, (9, 12, 12), 12)
     assert net.observation_shape == (9, 12, 12)

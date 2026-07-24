@@ -110,6 +110,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
+    parser.add_argument("--target-timesteps", type=int, default=None)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     if args.poll_seconds <= 0:
@@ -125,7 +126,12 @@ def main() -> None:
             )
         if args.once:
             break
-        if (run_dir / "training_final.pt").exists() and not pending_eval_timesteps(run_dir):
+        curve_steps = _curve_timesteps(run_dir / "curve.jsonl")
+        target_reached = (
+            args.target_timesteps is not None and bool(curve_steps) and curve_steps[-1] >= args.target_timesteps
+        )
+        legacy_final_reached = args.target_timesteps is None and (run_dir / "training_final.pt").exists()
+        if (target_reached or legacy_final_reached) and not pending_eval_timesteps(run_dir):
             break
         time.sleep(args.poll_seconds)
 

@@ -655,14 +655,14 @@ write-ups should be committed.
 ### Initial sweep
 
 - [x] Launch seed-11 run.
-- [ ] Monitor optimizer health and artifacts.
-- [ ] Probe every 5M snapshot.
-- [ ] Do not performance-stop before 60M.
-- [ ] Complete formal 60M review.
+- [x] Monitor optimizer health and artifacts.
+- [x] Probe every 5M snapshot, plus the added dense 1M series from 4M.
+- [x] Do not performance-stop before 60M.
+- [x] Complete formal 60M review.
 
 ### Extension and closeout
 
-- [ ] Record 60M extend/stop decision.
+- [x] Record 60M extend/stop decision.
 - [ ] If extended, complete 120M review.
 - [ ] Decide whether to extend toward 180-200M.
 - [ ] Freeze validation-selected checkpoint.
@@ -974,3 +974,41 @@ Use this template for each entry:
 - Decision: continue unchanged. Task evidence is strongly positive and probe
   evidence is currently negative, making the mandatory longer sweep and
   dense diagnostic trajectory informative.
+
+### 2026-07-24 11:41 BST — Formal 60M review and extension decision
+
+- Completion: the original run stopped normally at 60,006,400 steps and
+  wrote final model, exact-resume, validation report, curve, and provenance
+  artifacts. All 60 periodic validation rows and all 57 intended probe rows
+  from 4M through 60M are present.
+- Task result: best periodic validation was 76.5% at 56.001M, 57.008M, and
+  59.007M, versus P1's 66.5% near 60M. The validation-selected 56M weights
+  achieved 79.58% deterministic and 78.19% stochastic success on the larger
+  fixed validation suite. Deterministic one/two/three-robot success was
+  93.97/59.55/55.0%.
+- Probe result: there was no sustained trained-minus-random mid/long gain at
+  the encoder, recurrent ticks, or readout. The isolated best tick-1 gains
+  were only +0.04 percentage points and were not sustained; all 60M
+  mid/long comparisons were negative. Overall decoding gains were driven by
+  blocked and short slides.
+- Health: no non-finite values or KL early stops; median approximate KL
+  0.0040, maximum 0.0150; final explained variance 0.821. Two clamshell-sleep
+  pauses distorted wall-clock throughput but did not advance steps or
+  restart the process.
+- Sealed test: not evaluated.
+- Persistence: created a flat 57-row CSV and SHA-256 manifest locally.
+  Backfilled 57 `probe/*` history rows, a table, and a chart to original W&B
+  run `pupnnpq8`. Uploaded and remotely verified probe artifact
+  `drc33_p1_12x12_planefree-probes:v0` with aliases `60m` and `latest`;
+  it contains the fixed dataset, control, consolidated outputs, validation
+  context, and all checkpoint JSONs.
+- Interpretation: task-performance success at 60M; registered representation
+  hypothesis not supported. Recurrent benefit may rely on nonlinear,
+  distributed, action-specific, or carried-state computation not captured by
+  the local zero-state linear probe.
+- Decision: **extend the same run to 120M**. This is required because DRC
+  exceeds P1 at matched steps and continued to improve late in the sweep.
+  Preserve the 200M schedule horizon and validation-only selection; keep the
+  sealed test unopened.
+- Full review: `docs/DrcPlaneFree60MReview.md` and
+  `docs/DrcPlaneFree60MReview.json`.

@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "review": "structured_helper_free_drc_60m",
+  "decision": "extend_to_120m",
+  "sealed_test_evaluated": false,
+  "actual_timesteps": 60006400,
+  "selected_checkpoint_timesteps": 56000512,
+  "periodic_validation": {
+    "best_success_rate": 0.765,
+    "final_success_rate": 0.725,
+    "matched_59m": {
+      "drc_success_rate": 0.765,
+      "p1_success_rate": 0.665,
+      "difference": 0.1
+    }
+  },
+  "selected_checkpoint_validation": {
+    "deterministic": {
+      "success_rate": 0.7958,
+      "episodes": 480,
+      "by_length": {
+        "1": 1.0,
+        "2": 0.9333,
+        "3": 0.9333,
+        "4": 0.9,
+        "5": 0.6833,
+        "6": 0.7667,
+        "7": 0.6833,
+        "8": 0.4667
+      },
+      "by_robots_moved": {
+        "1": 0.9397,
+        "2": 0.5955,
+        "3": 0.55
+      }
+    },
+    "stochastic": {
+      "success_rate": 0.7819,
+      "episodes": 1440
+    }
+  },
+  "probe": {
+    "type": "drc_landing_zero_state",
+    "checkpoint_count": 57,
+    "first_timesteps": 4005888,
+    "last_timesteps": 60006400,
+    "dataset_sha256": "e97ef31a7e5c0bf133ee508b4ea8bbb27bf32a6a9a58893d9f41d1df5c48adfc",
+    "representation_success": false,
+    "sustained_mid_or_long_gain_over_random": false,
+    "wandb_artifact": "luke-sid-baines-blank/ricochet-robots-rl/drc33_p1_12x12_planefree-probes:v0",
+    "wandb_artifact_aliases": [
+      "60m",
+      "latest"
+    ]
+  },
+  "optimizer_health": {
+    "nonfinite_values": 0,
+    "target_kl_early_stops": 0,
+    "median_approx_kl": 0.004014565628040145,
+    "max_approx_kl": 0.014956387401980464,
+    "max_minibatch_kl": 0.02809075266122818,
+    "median_explained_variance": 0.7711692182376437,
+    "final_explained_variance": 0.8213682911866915
+  },
+  "extension": {
+    "target_timesteps": 120000000,
+    "schedule_total_steps": 200000000,
+    "resume_checkpoint": "artifacts/groundup/drc33_p1_12x12_planefree/training_60006400.pt"
+  }
+}

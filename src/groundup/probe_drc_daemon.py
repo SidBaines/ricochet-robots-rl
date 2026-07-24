@@ -9,7 +9,11 @@ import re
 import time
 from pathlib import Path
 
-from .collate_drc_probes import load_probe_series, write_outputs
+from .collate_drc_probes import (
+    load_probe_series,
+    write_machine_outputs,
+    write_outputs,
+)
 from .probe_drc_landing import probe_checkpoint
 
 
@@ -34,6 +38,16 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(payload, indent=2))
     os.replace(temporary, path)
+
+
+def _curve_reached(run_dir: Path, target_timesteps: int) -> bool:
+    curve = run_dir / "curve.jsonl"
+    if not curve.exists():
+        return False
+    rows = [line for line in curve.read_text().splitlines() if line.strip()]
+    if not rows:
+        return False
+    return int(json.loads(rows[-1])["timesteps"]) >= target_timesteps
 
 
 def process_available(
@@ -81,6 +95,7 @@ def process_available(
             control=control_payload,
             p1_run_dir=p1_run_dir,
         )
+        write_machine_outputs(run_dir, rows, control=control_payload)
         print(f"[drc-probe] completed t={steps:,}", flush=True)
     return completed
 
@@ -94,6 +109,7 @@ def main() -> None:
     parser.add_argument("--probe-epochs", type=int, default=30)
     parser.add_argument("--p1-run-dir", default=None)
     parser.add_argument("--poll-seconds", type=int, default=60)
+    parser.add_argument("--target-timesteps", type=int, default=None)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     if args.poll_seconds < 1:
@@ -111,7 +127,9 @@ def main() -> None:
         )
         if args.once:
             break
-        if (run_dir / "training_final.pt").exists() and completed == 0:
+        if args.target_timesteps is not None and _curve_reached(run_dir, args.target_timesteps) and completed == 0:
+            break
+        if args.target_timesteps is None and (run_dir / "training_final.pt").exists() and completed == 0:
             break
         time.sleep(args.poll_seconds)
 

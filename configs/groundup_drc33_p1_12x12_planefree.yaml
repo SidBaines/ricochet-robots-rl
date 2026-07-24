@@ -2,9 +2,10 @@
 #
 # Clean comparison with P1: same 12x12/3-robot bank and structured
 # wall/goal/robot/time observation, but a faithful recurrent DRC(3,3).
-# No stop-cell or distance helper planes. The current stop target is the
-# mandatory 60M review; LR progress is pre-registered against a 200M horizon
-# so a 120M/200M exact-resume extension does not restart or exhaust it.
+# No stop-cell or distance helper planes. The mandatory 60M review extended
+# the same run to 120M under the pre-registered rules. LR progress remains
+# anchored to the original 200M horizon, so exact resume neither restarts nor
+# exhausts the schedule.
 bank_path: artifacts/groundup_bank_12x12/size-12x12_numR3_ET2_CL2.parquet
 out_dir: artifacts/groundup
 run_name: drc33_p1_12x12_planefree
@@ -26,7 +27,7 @@ n_steps: 32
 batch_size: 2048
 n_epochs: 1
 
-total_steps: 60000000
+total_steps: 120000000
 schedule_total_steps: 200000000
 learning_rate: 3.0e-4
 learning_rate_final: 5.0e-5
@@ -57,7 +58,10 @@ final_eval_per_length: 60
 final_eval_episodes: 3
 eval_batch_size: 64
 checkpoint_every: 5000000
-resume_from: null
+# Immutable exact-state checkpoint selected for the registered 60M -> 120M
+# continuation. This includes optimizer, schedule progress, curriculum,
+# environments, recurrent rollout state, and every relevant RNG.
+resume_from: artifacts/groundup/drc33_p1_12x12_planefree/training_60006400.pt
 device: auto
 wandb_project: ricochet-robots-rl
 wandb_run_name: groundup-drc33-p1-12x12-planefree

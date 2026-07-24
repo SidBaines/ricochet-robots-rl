@@ -6,7 +6,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.groundup.collate_drc_probes import load_probe_series, write_outputs
+from src.groundup.collate_drc_probes import (
+    build_probe_records,
+    load_probe_series,
+    write_machine_outputs,
+    write_outputs,
+)
 from src.groundup.drc import DRCNet
 from src.groundup.drc_train import DRCTrainConfig, _save_model
 from src.groundup.probe_drc_landing import (
@@ -14,7 +19,7 @@ from src.groundup.probe_drc_landing import (
     extract_zero_state_features,
     load_drc_checkpoint,
 )
-from src.groundup.probe_drc_daemon import _available_snapshots
+from src.groundup.probe_drc_daemon import _available_snapshots, _curve_reached
 from src.groundup.probe_landing import train_probe
 from src.groundup.retain_drc_probe_snapshots import (
     pending_eval_timesteps,
@@ -150,6 +155,8 @@ def test_dense_retention_starts_at_first_available_model(tmp_path):
     retained = retain_available(run_dir)
     assert retained == run_dir / "probe_model_3006464.pt"
     assert pending_eval_timesteps(run_dir) == []
+    assert not _curve_reached(run_dir, 4_000_000)
+    assert _curve_reached(run_dir, 3_000_000)
 
 
 def test_linear_probe_recovers_synthetic_spatial_landing_code():
@@ -222,6 +229,20 @@ def test_dataset_fingerprint_and_probe_collation(tmp_path):
 
     rows = load_probe_series(run_dir)
     summary, chart = write_outputs(run_dir, rows)
+    csv_path, manifest_path = write_machine_outputs(run_dir, rows)
     assert len(rows) == 2
     assert "tick_3 long" in summary.read_text()
     assert chart.exists() and chart.stat().st_size > 0
+    records = build_probe_records(run_dir, rows)
+    assert records[0]["timesteps"] == 5_000_000
+    assert records[0]["tick_3_mid"] == 0.2
+    assert records[0]["tick_3_mid_control"] is None
+    assert records[0]["tick_3_mid_gain"] is None
+    assert csv_path.read_text().count("\n") == 3
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["checkpoint_count"] == 2
+    assert manifest["first_timesteps"] == 5_000_000
+    assert manifest["last_timesteps"] == 10_000_000
+    assert manifest["dataset_hash_count"] == 1
+    assert manifest["series_csv"]["path"] == "drc_probe_series.csv"
+    assert len(manifest["series_csv"]["sha256"]) == 64
