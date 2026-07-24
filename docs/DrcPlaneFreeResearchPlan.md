@@ -1102,3 +1102,21 @@ Use this template for each entry:
   and `WANDB_RESUME=must`, then one snapshot watcher and one probe daemon
   attached to probe run `bkvhg71c`; verify the exact t=87,007,232 load before
   leaving it unattended.
+
+### 2026-07-24 21:10 BST — Exact continuation resumed from 87M
+
+- Preflight: AC power connected, battery charged to 100%; repository clean at
+  commit `96fcbff`; immutable pause checkpoint reloaded and verified at
+  t=87,007,232 with scientific contract fingerprint
+  `af7aae4967d56957deedb11647b46045164efa437e51e885f789873e92611719`.
+- Trainer: detached Screen `drc33_p1_120m`, protected by `caffeinate -is`;
+  MPS DRC(3,3), 1,650,701 parameters, 39,713-puzzle training split, fixed
+  200/480 validation suites. W&B training run `pupnnpq8` resumed with
+  `WANDB_RESUME=must`.
+- Probes: launched exactly one dense-snapshot watcher and one CPU probe
+  daemon. Probe run `bkvhg71c` resumed from its persisted 87M cursor, so it
+  will append only new checkpoints rather than backfilling duplicates.
+- Scope remains unchanged: continue to 120M under the preserved 200M
+  learning-rate schedule horizon; validation-only selection; sealed test
+  remains unopened. Next operational check is the first post-resume 88M
+  evaluation, retained snapshot, local probe, and W&B append.
