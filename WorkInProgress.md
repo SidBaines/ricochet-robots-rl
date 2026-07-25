@@ -822,3 +822,23 @@ Third of the three reported defects (latent, not yet triggered).
 - Test `test_distance_map_cache_is_keyed_on_puzzle_identity_not_seed` builds two
   puzzles that share a layout *and* a seed but have different goals, and asserts
   `dmap[goal] == 0` for each. Pre-fix the second got the first's map (`2`, not 0).
+
+### Fix: refuse a silent cross-device "exact" resume
+
+- `device: auto` resolves to mps or cpu per machine while the config records only
+  `"auto"`, so the config-contract fingerprint is identical on an MPS box and a
+  CPU-only box — a cross-device resume passed every check while being measurably
+  non-exact (same 87M checkpoint: iteration-1 `value_loss` 18.1032 on cpu vs
+  19.8086 on mps). (`device` itself *is* in the contract, so an explicit change
+  was already caught; `auto` was the hole. Corrects an earlier note in the report.)
+- `RecurrentPPO.state_dict` now records the **resolved** device;
+  `load_state_dict` refuses a mismatch, with `allow_device_change=True` as an
+  explicit opt-out whose error message points at `model_*.pt` for genuine
+  migrations.
+- Backward compatible: pre-existing checkpoints have no `device` key and load
+  unchanged — verified on `training_pause_87007232.pt`, still resuming to
+  `net=586ae985b23e1afa`. Safe because `load_state_dict` reads `algo_state` by
+  name and only `contract` is compared for equality; the key was deliberately
+  **not** put in `contract`, which would have made every existing checkpoint
+  unloadable.
+- 207 passed, 9 skipped.

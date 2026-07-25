@@ -717,9 +717,14 @@ invalidated when it repointed the config at the pause checkpoint. Verified red a
   boundary by `test_exact_resume_survives_a_real_process_restart`.
 - **Across devices: no, and the term should never be used that way.** CPU and
   MPS diverge immediately from the same checkpoint (iteration-1 `value_loss`
-  18.1032 vs 19.8086). `device` is correctly excluded from the resume-mutable
-  field set, so the contract check does not currently prevent a CPU↔MPS resume
-  from being described as exact. Worth tightening.
+  18.1032 vs 19.8086). *Correction to an earlier draft of this section:*
+  `device` **is** part of the config contract (it is absent from
+  `_RESUME_MUTABLE_CONFIG_FIELDS`), so an explicit device change is caught. The
+  real hole was `device: auto`, which resolves to mps or cpu per machine while
+  the config records only the string `"auto"` — so the contract fingerprint is
+  identical on an MPS box and a CPU-only box and a cross-device resume passed
+  every check. **Fixed in §12.6:** the checkpoint now records the *resolved*
+  device and refuses a mismatch.
 - **Caveat (U1).** MPS determinism is an empirical property of this
   kernel/shape/driver combination, not a PyTorch guarantee. The claim should be
   re-verified after any torch or macOS upgrade; the new tests do exactly that
@@ -997,3 +1002,49 @@ each needs its own change and tests — flagged, not bundled:
    with different goals.
 3. **CPU↔MPS "exact resume"** (§10) — `device` is resume-mutable, so a CPU↔MPS
    resume passes the contract check while being non-exact.
+
+### 12.6 The other three defects, fixed
+
+All three items listed as "not fixed" in §12.5 were subsequently fixed, one
+commit each, each test-first.
+
+**1. `evaluate_drc` reseeded the global RNG** (`fix: evaluate_drc must not
+reseed the global RNG`). It called `torch.manual_seed(seed)`, reseeding the CPU
+*and* device generators; since a periodic eval runs immediately before every
+checkpoint, that produced the constant RNG state seen in every checkpoint (§3.2)
+and re-anchored the training action-sampling stream to seed 0 every `eval_every`
+steps. Now samples from a local `torch.Generator`; `Categorical.sample()` takes
+no `generator=`, so the stochastic branch draws via `torch.multinomial` on CPU,
+which also makes the eval action stream device-independent. Test asserts the CPU
+and (where available) MPS generator are byte-identical across an eval, and that
+results stay reproducible from the eval's own seed. Training trajectories after
+the first eval now differ from pre-fix runs, and new checkpoints no longer all
+store the same RNG constant — both intended.
+
+**2. `_dmap_cache` keyed on `puzzle.seed`** (`fix: key the shaping distance-map
+cache on puzzle identity, not seed`). Now keyed on the puzzle's index in the
+env's own table, a true unique identity resolved via `_puzzle_index_by_id`
+exactly as `reset` already does. The test builds two puzzles sharing a layout
+*and* a seed but with different goals and asserts `dmap[goal] == 0` for each —
+pre-fix the second received the first's map (2, not 0), silently corrupting the
+shaping reward. Two alternatives were rejected for reasons worth recording:
+`layout_hash` would be **worse** (layouts are shared across goals), and keying on
+the map's actual determinants (`h_walls`, `v_walls`, `goal`) is unconditionally
+correct and cheap in CPU (~140 ns/call, <0.05% of one core at the real ~3.4k
+calls/s) but its ~300-byte key would add on the order of **1 GB of RSS** across
+256 envs caching thousands of puzzles each. Verified value-neutral on the real
+bank: a 1-iteration replay from the 87M checkpoint reproduces
+`net=586ae985b23e1afa` / `opt=881ea2b955057fa1` bit-identically.
+
+**3. Cross-device resume** (`fix: refuse a silent cross-device exact resume`).
+`RecurrentPPO.state_dict` now records the **resolved** device and
+`load_state_dict` refuses a mismatch, with `allow_device_change=True` as an
+explicit opt-out and a message pointing at `model_*.pt` for genuine migrations.
+Backward compatible: checkpoints written before the field existed carry no
+`device` key and load unchanged — verified on `training_pause_87007232.pt`, which
+still resumes to `net=586ae985b23e1afa`. Adding a key to `algo_state` is safe
+because `load_state_dict` reads by name and only `contract` is compared for
+equality; the key was deliberately **not** added to `contract`, which would have
+made every existing checkpoint unloadable.
+
+`pytest src/tests/ -q` → **207 passed, 9 skipped**.

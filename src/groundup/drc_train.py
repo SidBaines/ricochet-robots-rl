@@ -523,6 +523,12 @@ class RecurrentPPO:
                 "batch_size": self.batch_size,
                 "n_epochs": self.n_epochs,
             },
+            # The RESOLVED device, not the config's ``device`` string. ``auto``
+            # resolves to mps or cpu per machine while the config records only
+            # "auto", so the config-contract fingerprint cannot distinguish them
+            # and a cross-device resume would otherwise pass every check while
+            # being measurably non-exact. Checked in ``load_state_dict``.
+            "device": str(self.device),
             "net_state_dict": self.net.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "minibatch_generator_state": self._gen.get_state(),
@@ -544,9 +550,27 @@ class RecurrentPPO:
             state["device_rng_state"] = ("mps", torch.mps.get_rng_state())
         return state
 
-    def load_state_dict(self, state: Dict[str, object]) -> None:
+    def load_state_dict(self, state: Dict[str, object], *, allow_device_change: bool = False) -> None:
         if int(state.get("schema_version", -1)) != 1:
             raise ValueError(f"Unsupported recurrent PPO checkpoint schema: {state.get('schema_version')}")
+        # This format's whole point is EXACT resume, and exactness holds only
+        # within a device: replaying the same 87M checkpoint gave iteration-1
+        # value_loss 18.1032 on cpu vs 19.8086 on mps. Absent on checkpoints
+        # written before this field existed, which stay loadable.
+        stored_device = state.get("device")
+        if (
+            not allow_device_change
+            and stored_device is not None
+            and str(stored_device) != str(self.device)
+        ):
+            raise ValueError(
+                f"Checkpoint was written on device '{stored_device}' but this run "
+                f"resolved to '{self.device}'; resume would not be exact. Note "
+                "device='auto' resolves per machine, so the config contract cannot "
+                "catch this. Set device explicitly, or pass "
+                "allow_device_change=True to accept an inexact resume (prefer "
+                "loading model_*.pt weights instead for a genuine migration)."
+            )
         expected = {
             "num_envs": self.num_envs,
             "obs_shape": self.obs_shape,
@@ -1073,6 +1097,7 @@ def _load_training_checkpoint(
     algo: RecurrentPPO,
     sampler: object,
     config: DRCTrainConfig,
+    allow_device_change: bool = False,
 ) -> Dict[str, object]:
     payload = torch.load(path, map_location=algo.device, weights_only=False)
     if payload.get("kind") != "drc_training_state" or int(payload.get("schema_version", -1)) != 1:
@@ -1089,7 +1114,7 @@ def _load_training_checkpoint(
     if not hasattr(sampler, "load_state_dict"):
         raise TypeError(f"Sampler {type(sampler).__name__} does not support exact resume")
     sampler.load_state_dict(payload["sampler_state"])
-    algo.load_state_dict(payload["algo_state"])
+    algo.load_state_dict(payload["algo_state"], allow_device_change=allow_device_change)
     return payload
 
 

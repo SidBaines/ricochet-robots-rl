@@ -921,6 +921,50 @@ def test_exact_resume_survives_a_real_process_restart(tmp_path):
     assert child["iterations"] == uninterrupted, "cross-process resume diverged"
 
 
+def test_exact_resume_refuses_a_device_change(tmp_path):
+    """"Exact" resume is only exact WITHIN a device, so a device change must fail.
+
+    ``device: auto`` resolves to mps or cpu depending on the machine, while the
+    config records the unresolved string -- so the config-contract fingerprint is
+    identical on an MPS box and a CPU-only box, and a cross-device resume used to
+    pass every check while being measurably non-exact (from the same 87M
+    checkpoint, CPU gave iteration-1 value_loss 18.1032 vs MPS 19.8086; see
+    docs/Drc87MRestartCollapseInvestigation.md 10).
+    """
+    sampler, algo = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    algo.update(algo.collect_rollout(), progress_remaining=0.9)
+    checkpoint = tmp_path / "training.pt"
+    _save_training_checkpoint(
+        algo, sampler, _RESUME_CONFIG, checkpoint,
+        run_state={"elapsed_s": 1.0}, metadata={"test": True},
+    )
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert payload["algo_state"]["device"] == "cpu", "resolved device must be recorded"
+
+    # Forge a checkpoint that was written on another device (works without a GPU).
+    payload["algo_state"]["device"] = "cuda"
+    forged = tmp_path / "forged.pt"
+    torch.save(payload, forged)
+    sampler2, algo2 = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    with pytest.raises(ValueError, match="device"):
+        _load_training_checkpoint(forged, algo=algo2, sampler=sampler2, config=_RESUME_CONFIG)
+
+    # Explicit opt-in still allows the migration.
+    algo2.load_state_dict(payload["algo_state"], allow_device_change=True)
+    assert algo2.num_timesteps == algo.num_timesteps
+
+    # Checkpoints written before this field existed must still load.
+    legacy = dict(payload)
+    legacy_algo = dict(payload["algo_state"])
+    legacy_algo.pop("device")
+    legacy["algo_state"] = legacy_algo
+    legacy_path = tmp_path / "legacy.pt"
+    torch.save(legacy, legacy_path)
+    sampler3, algo3 = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    _load_training_checkpoint(legacy_path, algo=algo3, sampler=sampler3, config=_RESUME_CONFIG)
+    assert algo3.num_timesteps == algo.num_timesteps
+
+
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
 def test_exact_resume_round_trips_device_rng_state_on_mps(tmp_path):
     """Exercise the mps ``device_rng_state`` branch of load_state_dict.
