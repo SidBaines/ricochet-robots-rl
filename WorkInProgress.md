@@ -775,3 +775,23 @@ answered, and it is a **bug in `drc_train.py`** (report §6.1).
   reintroduce the bug in the other trainer.
 - Still open, reported not fixed: `evaluate_drc` global reseed; `_dmap_cache`
   `puzzle.seed` key; CPU↔MPS "exact resume". 204 passed, 9 skipped.
+
+### Fix: `evaluate_drc` no longer reseeds the global RNG
+
+Second of the three defects reported alongside the truncation-bootstrap fix.
+
+- `evaluate_drc` called `torch.manual_seed(seed)`, which reseeds the CPU **and**
+  device generators. A periodic eval runs immediately before every checkpoint, so
+  this (a) made `torch_rng_state`/`device_rng_state` the same constant in every
+  checkpoint of the DRC run and (b) re-anchored the training action-sampling
+  stream to seed 0 every `eval_every` steps — exploration noise repeated instead
+  of continuing.
+- Now uses a local `torch.Generator`. `Categorical.sample()` accepts no
+  `generator=`, so the stochastic branch draws explicitly via `torch.multinomial`
+  on CPU, which also makes the action stream device-independent.
+- Test `test_evaluate_drc_leaves_the_callers_rng_untouched` asserts both the CPU
+  and (when available) MPS generator are byte-identical across an eval, and that
+  results stay reproducible from the eval's own seed.
+- **Consequence for future forensics:** checkpoints will no longer all carry the
+  same RNG constant, and training trajectories after the first eval differ from
+  pre-fix runs. Both are intended.

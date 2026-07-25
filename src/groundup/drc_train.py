@@ -807,9 +807,20 @@ def evaluate_drc(
     Mirrors ``evaluate.evaluate_policy`` (same protocol, same aggregate shape
     via ``_aggregate``) but threads a per-slot DRCState, zeroing a slot's
     state whenever a new puzzle is loaded into it.
+
+    RNG discipline: evaluation is a pure function of ``seed`` and must not
+    perturb the caller's generators. It therefore samples from a LOCAL
+    ``torch.Generator`` rather than reseeding the global one. The previous
+    ``torch.manual_seed(seed)`` reseeded the CPU *and* device generators, and
+    because a periodic eval runs immediately before every checkpoint it made the
+    stored RNG state the same constant in every checkpoint and re-anchored the
+    training action-sampling stream to seed 0 every ``eval_every`` steps -- so
+    exploration noise repeated rather than continuing. See
+    docs/Drc87MRestartCollapseInvestigation.md 3.2. Sampling is done on CPU so
+    the action stream is identical on every device.
     """
     device = next(net.parameters()).device
-    torch.manual_seed(seed)
+    generator = torch.Generator().manual_seed(seed)
     work = [(i, rep) for i in range(len(puzzles)) for rep in range(episodes_per_puzzle)]
     work.reverse()  # pop() consumes in order
     n_slots = min(batch_size, len(work))
@@ -849,7 +860,10 @@ def evaluate_drc(
             if deterministic:
                 actions = logits.argmax(dim=-1)
             else:
-                actions = Categorical(logits=logits).sample()
+                # Categorical.sample() takes no generator, so draw explicitly
+                # from the local one (on CPU: device-independent stream).
+                probs = torch.softmax(logits.float(), dim=-1).cpu()
+                actions = torch.multinomial(probs, 1, generator=generator).squeeze(-1)
             state_h[:, active] = new_state.h
             state_c[:, active] = new_state.c
             actions_np = actions.cpu().numpy()

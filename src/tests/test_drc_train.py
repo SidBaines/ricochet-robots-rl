@@ -599,6 +599,42 @@ def test_evaluate_drc_protocol_and_determinism():
     assert stoch["deterministic"] is False
 
 
+def test_evaluate_drc_leaves_the_callers_rng_untouched():
+    """Evaluation must be a pure function of its ``seed``, not a global reseed.
+
+    ``evaluate_drc`` used to call ``torch.manual_seed(seed)``, which reseeds the
+    CPU *and* device generators. Because a periodic eval runs immediately before
+    every checkpoint, that made the stored ``torch_rng_state`` /
+    ``device_rng_state`` the same constant in every checkpoint of the
+    drc33_p1_12x12_planefree run, and re-anchored the training action-sampling
+    stream to seed 0 every ``eval_every`` steps -- so exploration noise repeated
+    instead of continuing. See docs/Drc87MRestartCollapseInvestigation.md 3.2.
+    """
+    puzzles = synthetic_puzzles()
+    env_config = EnvConfig(horizon=6)
+    probe = RicochetEnv(puzzles, env_config, seed=0)
+    net = tiny_net(probe.observation_space.shape, probe.action_space.n)
+
+    torch.manual_seed(1234)
+    cpu_before = torch.get_rng_state().clone()
+    mps_before = (
+        torch.mps.get_rng_state().clone() if torch.backends.mps.is_available() else None
+    )
+
+    kwargs = dict(episodes_per_puzzle=3, deterministic=False, batch_size=4)
+    first = evaluate_drc(net, puzzles, env_config, seed=5, **kwargs)
+
+    assert torch.equal(torch.get_rng_state(), cpu_before), "eval perturbed the CPU RNG"
+    if mps_before is not None:
+        assert torch.equal(torch.mps.get_rng_state(), mps_before), "eval perturbed the MPS RNG"
+
+    # Still fully reproducible from its own seed, and the seed still drives it.
+    assert evaluate_drc(net, puzzles, env_config, seed=5, **kwargs) == first
+    # A stochastic eval must actually consume randomness (episode count aside,
+    # the recorded step counts differ once the action stream differs).
+    assert torch.equal(torch.get_rng_state(), cpu_before)
+
+
 # ---------------------------------------------------------------- determinism
 def test_seeded_runs_produce_identical_first_update():
     def run_once():
