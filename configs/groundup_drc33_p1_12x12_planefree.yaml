@@ -73,11 +73,12 @@ final_eval_per_length: 60
 final_eval_episodes: 3
 eval_batch_size: 64
 checkpoint_every: 5000000
-# Fresh run from step 0. Set to an immutable training_*.pt to continue exactly
-# (optimizer, schedule progress, curriculum, environments, recurrent rollout
-# state and every relevant RNG). Schema-1 checkpoints from the abandoned first
-# attempt are deliberately NOT resumable.
-resume_from: null
+# PAUSED 2026-07-25 18:42 BST at t=96,002,048 to conserve battery (9% left).
+# Resume is bit-exact: this is a true iteration boundary, verified coherent, and
+# the restart machinery was proven inert in
+# docs/Drc87MRestartCollapseInvestigation.md 4. Set back to null only to start a
+# genuinely new run.
+resume_from: artifacts/groundup/drc33_p1_12x12_planefree_v2/training_pause_96002048.pt
 device: auto
 wandb_project: ricochet-robots-rl
 wandb_run_name: groundup-drc33-p1-12x12-planefree-v2
