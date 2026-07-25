@@ -1368,3 +1368,68 @@ whereas `value_loss` did not: (1) `V` at time-channel 0 on a fixed probe set
   keying on `layout_hash` would be *worse* — layouts are shared across goals);
   the CPU↔MPS "exact resume" loophole.
 - `pytest src/tests/ -q` → **204 passed, 9 skipped**.
+
+## 2026-07-25 02:21 BST — first attempt scratched; clean run launched from step 0
+
+The 91M trajectory of the first attempt is abandoned, not rescued. Its processes
+(trainer PID 86950, snapshot watcher, probe daemon) were SIGKILLed — the trainer
+was still SIGSTOPped, and it was killed rather than SIGCONTed so it could not
+write anything on the way out. All 220 artifacts of that run are **preserved
+untouched** in `artifacts/groundup/drc33_p1_12x12_planefree/`, including
+`model_best.pt` (t=79,003,648, val_det 0.830,
+sha256 90cf56ea02a5e28c3f6a61d2e037bc707eb2c6ec7ad406d1e6dd591bcc1d511d).
+
+**Why from step 0 rather than Arm C from 80M.** The truncation bootstrap was
+active from the first gradient step: `V` at horizon expiry measured −1.87 at 5M
+and −4.18 at 10M against a `goal_reward` of 1.0, and was never near 0 anywhere in
+the run. So `training_80003072.pt` is not a clean rescue point either — its
+weights and Adam moments were shaped by inflated rewards throughout. There is no
+uncontaminated checkpoint to resume, which makes a fresh run the only honest
+option. It is also the first genuinely like-for-like comparison against the
+feed-forward P1 baseline, whose SB3 path never bootstrapped.
+
+Registered run:
+
+- config `configs/groundup_drc33_p1_12x12_planefree.yaml`, `run_name`
+  **`drc33_p1_12x12_planefree_v2`**, `resume_from: null`
+- config-contract fingerprint **`e7b3bf2186299ec0a75ff408f97eec03e38719c3866e9c171e92391fa3f7d4ee`**
+  (was `af7aae49…`; moved deliberately by the new `bootstrap_on_truncation`
+  contract field, which now pins the reward semantics)
+- `bootstrap_on_truncation: false` set **explicitly**, echoed in the startup
+  banner and recorded in `provenance` → `run_history.jsonl` and every snapshot
+- everything else unchanged from the registered design: seed 11, 256 envs,
+  n_steps 32, batch 2048, 1 epoch, `total_steps` 120M against a 200M LR horizon,
+  `clip_range_vf: null`, `target_kl: 0.05`, DRC(3,3), 1,650,701 params,
+  obs `(9, 12, 12)`, no stop/distance planes, horizon 24
+- W&B run **`yidjviev`** (`groundup-drc33-p1-12x12-planefree-v2`); the dead run
+  `pupnnpq8` is left as-is
+- bank sha256 `0103a7b9…` re-verified; preflight clean, splits disjoint, 100
+  stored plans replayed, 360 mask checks
+- **split fingerprints identical to the first attempt** (train
+  `86c69a75…`, val `a5029fe4…`, periodic suite `741960337e…`), so curves are
+  directly comparable
+- launched detached in screen `drc33_p1_v2` under **`caffeinate -dis`** (`-d`
+  added per the 2026-07-24 finding that `-is` does not block clamshell sleep),
+  plus screen `drc33_p1_v2_snapshots` running the per-1M snapshot watcher — those
+  retained snapshots are what made the 87M forensics possible
+- entrypoint smoke-tested first at `total_steps=24576` with W&B disabled:
+  checkpoints wrote at schema 2 with `device: mps`, provenance carried
+  `bootstrap_on_truncation: False`, and `value_loss` fell 1.379 → 0.428 over the
+  three iterations
+
+Not launched: the live probe daemon. It needs a probe dataset built against this
+run and adds CPU pressure; start it separately if the landing-cell probes are
+wanted again.
+
+Watch items, in order of usefulness:
+
+1. `value_loss` should now stay O(0.01–0.1) for the whole run. Post-fix it is a
+   meaningful alarm again, because the channel that inflated it is closed.
+2. `curriculum/frontier` should climb rather than collapse.
+3. `val_det` versus the first attempt at matched steps — the first attempt reached
+   0.75–0.83 between 60M and 87M *despite* corrupted rewards, so it is a real
+   baseline to beat, not a floor.
+
+Still not implemented: the extra telemetry recommended in report §11.2 (`V_mean`/
+`V_std` on a fixed probe set, and the policy-gradient share of the update). The
+`V`-at-expiry alarm is now moot, since `V` is no longer evaluated there.
