@@ -2,13 +2,23 @@
 #
 # Clean comparison with P1: same 12x12/3-robot bank and structured
 # wall/goal/robot/time observation, but a faithful recurrent DRC(3,3).
-# No stop-cell or distance helper planes. The mandatory 60M review extended
-# the same run to 120M under the pre-registered rules. LR progress remains
-# anchored to the original 200M horizon, so exact resume neither restarts nor
-# exhausts the schedule.
+# No stop-cell or distance helper planes. LR progress is anchored to a 200M
+# horizon while total_steps is the current stop/review target, so the
+# pre-registered extensions neither restart nor exhaust the schedule.
+#
+# 2026-07-25 -- RESTARTED FROM STEP 0 as `_v2`. The first attempt
+# (run_name drc33_p1_12x12_planefree, W&B pupnnpq8) is abandoned, not resumed:
+# its rewards were corrupted from step 0 by the truncation bootstrap
+# (docs/Drc87MRestartCollapseInvestigation.md 6.1), which added gamma*V(expiry)
+# to the reward on every truncated episode. V(expiry) is 0 by definition here --
+# time_channel puts the horizon in the observation -- but it was measured at
+# -1.87 by 5M steps and -12.3 by 87M against a goal_reward of 1.0, so EVERY
+# checkpoint of that run, including the 80M one, was shaped by inflated rewards.
+# There is no clean point to resume from, and this is also the first genuinely
+# like-for-like comparison with P1, whose SB3 path never bootstrapped.
 bank_path: artifacts/groundup_bank_12x12/size-12x12_numR3_ET2_CL2.parquet
 out_dir: artifacts/groundup
-run_name: drc33_p1_12x12_planefree
+run_name: drc33_p1_12x12_planefree_v2
 curriculum: reverse
 horizon: 24
 shaping_coef: 0.1
@@ -41,6 +51,11 @@ target_kl: 0.05
 adv_std_floor: 0.05
 adv_clip: 10.0
 clip_range_vf: null
+# Horizon expiry is a genuine terminal here: time_channel puts the remaining-step
+# fraction in the observation, so the MDP is finite-horizon and fully observed and
+# V(s, remaining=0) == 0 by definition. Set explicitly rather than left to
+# auto-detection so the config-contract fingerprint pins the reward semantics.
+bootstrap_on_truncation: false
 
 drc_depth: 3
 drc_ticks: 3
@@ -58,10 +73,11 @@ final_eval_per_length: 60
 final_eval_episodes: 3
 eval_batch_size: 64
 checkpoint_every: 5000000
-# Immutable exact-state checkpoint selected for the registered 60M -> 120M
-# continuation. This includes optimizer, schedule progress, curriculum,
-# environments, recurrent rollout state, and every relevant RNG.
-resume_from: artifacts/groundup/drc33_p1_12x12_planefree/training_pause_87007232.pt
+# Fresh run from step 0. Set to an immutable training_*.pt to continue exactly
+# (optimizer, schedule progress, curriculum, environments, recurrent rollout
+# state and every relevant RNG). Schema-1 checkpoints from the abandoned first
+# attempt are deliberately NOT resumable.
+resume_from: null
 device: auto
 wandb_project: ricochet-robots-rl
-wandb_run_name: groundup-drc33-p1-12x12-planefree
+wandb_run_name: groundup-drc33-p1-12x12-planefree-v2

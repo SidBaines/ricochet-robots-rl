@@ -179,6 +179,16 @@ class DRCTrainConfig:
     # state so value-loss spikes (0.45-0.50 observed pre-collapse) cannot
     # drive huge gradients through the shared ConvLSTM trunk.
     clip_range_vf: Optional[float] = None
+    # Whether a horizon truncation bootstraps V(final_obs) into the reward.
+    # ``None`` auto-detects from ``time_channel`` (bootstrap only when the
+    # horizon is hidden); an explicit value is validated against the envs and
+    # raises on the unsound combination. This is a CONTRACT field: it is part of
+    # the config fingerprint, so the fingerprint pins the reward semantics -- the
+    # earlier derived-only version left runs before and after the
+    # truncation-bootstrap fix sharing a fingerprint. Registered configs should
+    # set it explicitly. See the module docstring and
+    # docs/Drc87MRestartCollapseInvestigation.md 6.1.
+    bootstrap_on_truncation: Optional[bool] = None
     # DRC network (paper defaults: DRC(3,3), 32 channels)
     drc_depth: int = 3
     drc_ticks: int = 3
@@ -514,7 +524,10 @@ class RecurrentPPO:
                 raise TypeError(f"Environment {type(env).__name__} does not support exact resume")
             env_states.append(env.state_dict())
         state: Dict[str, object] = {
-            "schema_version": 1,
+            # v2 (2026-07-25): ``device`` is required. Schema 1 checkpoints are
+            # rejected outright rather than silently resumed without the
+            # cross-device check -- see load_state_dict.
+            "schema_version": 2,
             "contract": {
                 "num_envs": self.num_envs,
                 "obs_shape": self.obs_shape,
@@ -551,18 +564,19 @@ class RecurrentPPO:
         return state
 
     def load_state_dict(self, state: Dict[str, object], *, allow_device_change: bool = False) -> None:
-        if int(state.get("schema_version", -1)) != 1:
-            raise ValueError(f"Unsupported recurrent PPO checkpoint schema: {state.get('schema_version')}")
+        if int(state.get("schema_version", -1)) != 2:
+            raise ValueError(
+                f"Unsupported recurrent PPO checkpoint schema: "
+                f"{state.get('schema_version')} (this build writes and requires 2). "
+                "Schema 1 predates the truncation-bootstrap fix and the recorded "
+                "resolved device, so its training state cannot be resumed exactly; "
+                "load its weights from the matching model_*.pt instead."
+            )
         # This format's whole point is EXACT resume, and exactness holds only
         # within a device: replaying the same 87M checkpoint gave iteration-1
-        # value_loss 18.1032 on cpu vs 19.8086 on mps. Absent on checkpoints
-        # written before this field existed, which stay loadable.
-        stored_device = state.get("device")
-        if (
-            not allow_device_change
-            and stored_device is not None
-            and str(stored_device) != str(self.device)
-        ):
+        # value_loss 18.1032 on cpu vs 19.8086 on mps.
+        stored_device = state["device"]
+        if not allow_device_change and str(stored_device) != str(self.device):
             raise ValueError(
                 f"Checkpoint was written on device '{stored_device}' but this run "
                 f"resolved to '{self.device}'; resume would not be exact. Note "
@@ -570,6 +584,12 @@ class RecurrentPPO:
                 "catch this. Set device explicitly, or pass "
                 "allow_device_change=True to accept an inexact resume (prefer "
                 "loading model_*.pt weights instead for a genuine migration)."
+            )
+        if allow_device_change and str(stored_device) != str(self.device):
+            print(
+                f"[drc] WARNING: resuming a '{stored_device}' checkpoint on "
+                f"'{self.device}'; this resume is NOT exact.",
+                flush=True,
             )
         expected = {
             "num_envs": self.num_envs,
@@ -1226,6 +1246,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         adv_std_floor=config.adv_std_floor,
         adv_clip=config.adv_clip,
         clip_range_vf=config.clip_range_vf,
+        bootstrap_on_truncation=config.bootstrap_on_truncation,
         device=device,
         seed=config.seed,
     )

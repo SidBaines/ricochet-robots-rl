@@ -842,3 +842,25 @@ Third of the three reported defects (latent, not yet triggered).
   **not** put in `contract`, which would have made every existing checkpoint
   unloadable.
 - 207 passed, 9 skipped.
+
+### Hard break: pin the reward semantics in the fingerprint; drop schema-1 resume
+
+Both compatibility compromises made while the old run's checkpoints still
+mattered are now removed, since that run is being scratched.
+
+- **`bootstrap_on_truncation` is now a `DRCTrainConfig` contract field**
+  (`None` = auto-detect from `time_channel`), set explicitly to `false` in the
+  registered 12x12 config. Previously it was derived in code only, which left
+  runs before and after the truncation-bootstrap fix **sharing a config-contract
+  fingerprint despite different reward semantics**. Pinned by
+  `test_truncation_semantics_are_pinned_by_the_config_contract`.
+  Contract fingerprint moves `af7aae49…` → `e7b3bf21…` (intended).
+- **`algo_state` schema bumped 1 → 2, with `device` required.** Schema-1
+  checkpoints are now rejected with a message pointing at `model_*.pt` for
+  weights. They predate both the bootstrap fix and the recorded resolved device,
+  so their optimizer/weights were shaped by inflated rewards and cannot be
+  resumed exactly. `allow_device_change=True` now also prints a loud warning.
+- Not changed: `_dmap_cache`'s int index key. That choice was driven by RSS
+  (~1 GB across 256 envs for a content key), not compatibility, so the hard-break
+  permission doesn't alter it.
+- 209 passed, 9 skipped.

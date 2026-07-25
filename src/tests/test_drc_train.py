@@ -24,8 +24,10 @@ from src.groundup.drc import DRCNet, DRCState
 from src.groundup.drc_train import (
     DRCTrainConfig,
     RecurrentPPO,
+    _config_contract,
     _load_training_checkpoint,
     _save_training_checkpoint,
+    _sha256_json,
     build_and_train,
     build_net,
     clipped_value_loss,
@@ -550,13 +552,13 @@ def test_primary_12x12_drc_config_is_helper_free_and_extension_safe():
     assert config.total_steps == 120_000_000
     assert config.schedule_total_steps == 200_000_000
     assert config.checkpoint_every == 5_000_000
-    # Updated by the 2026-07-24 battery pause: the registered continuation now
-    # resumes from the immutable 87M pause checkpoint (commit 96fcbff changed
-    # the config but not this assertion).
-    assert config.resume_from == (
-        "artifacts/groundup/drc33_p1_12x12_planefree/"
-        "training_pause_87007232.pt"
-    )
+    # 2026-07-25: restarted from step 0 as _v2. The first attempt's rewards were
+    # corrupted from step 0 by the truncation bootstrap, so no checkpoint of it is
+    # a clean resume point (docs/Drc87MRestartCollapseInvestigation.md 6.1).
+    assert config.resume_from is None
+    assert config.run_name == "drc33_p1_12x12_planefree_v2"
+    # Explicit, so the contract fingerprint pins the reward semantics.
+    assert config.bootstrap_on_truncation is False
     # 4 walls + goal + 3 robots + time; 3 robots x 4 directions.
     net = build_net(config, (9, 12, 12), 12)
     assert net.observation_shape == (9, 12, 12)
@@ -940,6 +942,7 @@ def test_exact_resume_refuses_a_device_change(tmp_path):
     )
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     assert payload["algo_state"]["device"] == "cpu", "resolved device must be recorded"
+    assert payload["algo_state"]["schema_version"] == 2
 
     # Forge a checkpoint that was written on another device (works without a GPU).
     payload["algo_state"]["device"] = "cuda"
@@ -953,16 +956,50 @@ def test_exact_resume_refuses_a_device_change(tmp_path):
     algo2.load_state_dict(payload["algo_state"], allow_device_change=True)
     assert algo2.num_timesteps == algo.num_timesteps
 
-    # Checkpoints written before this field existed must still load.
-    legacy = dict(payload)
-    legacy_algo = dict(payload["algo_state"])
-    legacy_algo.pop("device")
-    legacy["algo_state"] = legacy_algo
-    legacy_path = tmp_path / "legacy.pt"
-    torch.save(legacy, legacy_path)
-    sampler3, algo3 = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
-    _load_training_checkpoint(legacy_path, algo=algo3, sampler=sampler3, config=_RESUME_CONFIG)
-    assert algo3.num_timesteps == algo.num_timesteps
+
+def test_schema_1_training_state_is_rejected(tmp_path):
+    """Hard break: pre-fix checkpoints must not resume, because they cannot be exact.
+
+    Schema 1 predates both the truncation-bootstrap fix (so its optimizer and
+    weights were shaped by rewards inflated with gamma*V(expiry)) and the recorded
+    resolved device. Silently accepting one would resume a run whose reward
+    semantics differ from the current code's.
+    """
+    sampler, algo = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    algo.update(algo.collect_rollout(), progress_remaining=0.9)
+    checkpoint = tmp_path / "training.pt"
+    _save_training_checkpoint(
+        algo, sampler, _RESUME_CONFIG, checkpoint,
+        run_state={"elapsed_s": 1.0}, metadata={"test": True},
+    )
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    old = dict(payload["algo_state"])
+    old["schema_version"] = 1
+    old.pop("device")
+    payload["algo_state"] = old
+    legacy = tmp_path / "legacy.pt"
+    torch.save(payload, legacy)
+
+    sampler2, algo2 = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    with pytest.raises(ValueError, match="schema"):
+        _load_training_checkpoint(legacy, algo=algo2, sampler=sampler2, config=_RESUME_CONFIG)
+
+
+def test_truncation_semantics_are_pinned_by_the_config_contract():
+    """`bootstrap_on_truncation` must be a contract field, not a derived value.
+
+    While it was derived from ``time_channel`` in code only, a run made before the
+    truncation-bootstrap fix and one made after shared a config-contract
+    fingerprint despite having different reward semantics. Now the fingerprint
+    changes with it.
+    """
+    base = dataclasses.replace(_RESUME_CONFIG, bootstrap_on_truncation=False)
+    flipped = dataclasses.replace(base, bootstrap_on_truncation=None)
+    assert "bootstrap_on_truncation" in _config_contract(base)
+    assert _sha256_json(_config_contract(base)) != _sha256_json(_config_contract(flipped))
+    # ... whereas a genuinely mutable bookkeeping field must NOT move it.
+    renamed = dataclasses.replace(base, run_name="something-else")
+    assert _sha256_json(_config_contract(base)) == _sha256_json(_config_contract(renamed))
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
