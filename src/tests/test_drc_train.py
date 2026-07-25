@@ -291,6 +291,124 @@ def test_truncation_bootstraps_final_value_and_termination_does_not():
     assert not torch.allclose(buf_trunc.returns[:2, 0], buf_term.returns[:2, 0])
 
 
+# ------------------------------- truncation bootstrap vs an observed horizon
+# Regression tests for the defect that drove the drc33_p1_12x12_planefree value
+# divergence (docs/Drc87MRestartCollapseInvestigation.md 6.1):
+#
+#   env.step increments _steps BEFORE building the observation, so at horizon
+#   expiry the returned observation has time channel exactly 0. collect_rollout
+#   fed that observation to the value head and added gamma*V to the reward, then
+#   discarded it -- it never enters buf.obs, so V is never trained there. And
+#   because time_channel=True puts the remaining horizon IN the observation, the
+#   MDP is finite-horizon and fully observed, so V(s, remaining=0) == 0 by
+#   definition. The bootstrap therefore injected an unpinned extrapolation
+#   straight into the returns: measured V at expiry reached -12.3 against
+#   goal_reward 1.0 by 87M, i.e. timing out "paid" twelve times more than
+#   solving the puzzle.
+
+
+class _RewardRecordingEnv(RicochetEnv):
+    """RicochetEnv that records exactly what ``step`` returned, for reward audits."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.rewards_returned: list[float] = []
+        self.truncations = 0
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+        self.rewards_returned.append(float(reward))
+        if truncated and not terminated:
+            self.truncations += 1
+        return obs, reward, terminated, truncated, info
+
+
+def _forced_truncation_setup(*, time_channel: bool, value: float = 5.0, n_steps: int = 4):
+    """Envs whose EVERY step truncates, and a net whose V is identically ``value``.
+
+    The puzzles need two optimal moves and the horizon is 1, so the goal is
+    unreachable and no episode can ever terminate -- every stored step is a
+    truncation. Pinning the critic to a constant makes any bootstrap term
+    exactly ``gamma * value``, so its presence or absence is unambiguous.
+    """
+    puzzles = [p for p in synthetic_puzzles() if p.optimal_length == 2]
+    assert len(puzzles) >= 2, "fixture must offer 2-move puzzles"
+    config = EnvConfig(horizon=1, time_channel=time_channel)
+    envs = [_RewardRecordingEnv(puzzles, config, seed=700 + rank) for rank in range(2)]
+    net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n, seed=9)
+    with torch.no_grad():
+        net.critic.weight.zero_()
+        net.critic.bias.fill_(value)
+    torch.manual_seed(31)
+    algo = make_algo(net, envs, n_steps=n_steps, batch_size=n_steps, n_epochs=1)
+    return envs, algo
+
+
+def test_no_truncation_bootstrap_when_the_horizon_is_in_the_observation():
+    """With time_channel=True, expiry is a real terminal: rewards must be untouched."""
+    envs, algo = _forced_truncation_setup(time_channel=True, value=5.0)
+    assert algo.bootstrap_on_truncation is False
+
+    buf = algo.collect_rollout()
+
+    # Non-vacuous: every single stored step really did truncate.
+    assert all(env.truncations == algo.n_steps for env in envs)
+    assert not bool(buf.episode_starts[1:].eq(False).any())  # every step ends an episode
+
+    # V is pinned to 5.0, so a bootstrap would inflate every reward by gamma*5.
+    for b, env in enumerate(envs):
+        assert buf.rewards[:, b].tolist() == pytest.approx(env.rewards_returned, abs=1e-5)
+
+
+def test_stored_observations_never_reach_horizon_expiry():
+    """Why bootstrapping at expiry is unsound: that input is never a training target."""
+    puzzles = synthetic_puzzles()
+    envs = [
+        RicochetEnv(puzzles, EnvConfig(horizon=3, time_channel=True), seed=700 + rank)
+        for rank in range(2)
+    ]
+    net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n, seed=9)
+    torch.manual_seed(31)
+    algo = make_algo(net, envs, n_steps=12, batch_size=12, n_epochs=1)
+    buf = algo.collect_rollout()
+    # Time channel is the last plane; remaining == 0 only ever occurs on the
+    # observation returned BY the truncating step, which is never stored.
+    assert float(buf.obs[:, :, -1].min()) > 0.0
+
+
+def test_truncation_bootstrap_still_applies_when_the_horizon_is_hidden():
+    """Guard against over-fixing: with time_channel=False the bootstrap is correct."""
+    envs, algo = _forced_truncation_setup(time_channel=False, value=5.0)
+    assert algo.bootstrap_on_truncation is True
+
+    buf = algo.collect_rollout()
+
+    assert all(env.truncations == algo.n_steps for env in envs)
+    expected = algo.gamma * 5.0
+    for b, env in enumerate(envs):
+        for t, raw in enumerate(env.rewards_returned):
+            assert float(buf.rewards[t, b]) == pytest.approx(raw + expected, abs=1e-5)
+
+
+def test_bootstrap_on_truncation_is_refused_when_the_horizon_is_observed():
+    """The inconsistent combination must fail loudly, not silently corrupt rewards."""
+    puzzles = synthetic_puzzles()
+    envs = [RicochetEnv(puzzles, EnvConfig(horizon=4, time_channel=True), seed=1)]
+    net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n)
+    with pytest.raises(ValueError, match="time_channel"):
+        make_algo(net, envs, n_steps=4, batch_size=4, bootstrap_on_truncation=True)
+
+
+def test_primary_drc_config_disables_the_truncation_bootstrap():
+    """The registered 12x12 config sets time_channel: true, so it must not bootstrap."""
+    config = DRCTrainConfig.from_yaml(PRIMARY_DRC_CONFIG)
+    assert config.time_channel is True
+    puzzles = synthetic_puzzles()
+    envs = [RicochetEnv(puzzles, EnvConfig(horizon=4, time_channel=True), seed=1)]
+    net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n)
+    assert make_algo(net, envs, n_steps=4, batch_size=4).bootstrap_on_truncation is False
+
+
 # ------------------------------------------------- post-convergence hardening
 def test_normalize_advantages_floor_caps_tiny_std_amplification():
     # Near-solved batch: residual advantages at 1e-3 scale.
@@ -432,9 +550,12 @@ def test_primary_12x12_drc_config_is_helper_free_and_extension_safe():
     assert config.total_steps == 120_000_000
     assert config.schedule_total_steps == 200_000_000
     assert config.checkpoint_every == 5_000_000
+    # Updated by the 2026-07-24 battery pause: the registered continuation now
+    # resumes from the immutable 87M pause checkpoint (commit 96fcbff changed
+    # the config but not this assertion).
     assert config.resume_from == (
         "artifacts/groundup/drc33_p1_12x12_planefree/"
-        "training_60006400.pt"
+        "training_pause_87007232.pt"
     )
     # 4 walls + goal + 3 robots + time; 3 robots x 4 directions.
     net = build_net(config, (9, 12, 12), 12)
@@ -578,6 +699,204 @@ def test_exact_resume_matches_uninterrupted_next_update(tmp_path):
     sampler3, algo3 = build(seed=5)
     with pytest.raises(ValueError, match="config contract changed"):
         _load_training_checkpoint(checkpoint, algo=algo3, sampler=sampler3, config=changed)
+
+
+# ------------------------------------------------- exact-resume hardening
+# Gaps in test_exact_resume_matches_uninterrupted_next_update that the 87M
+# restart investigation (docs/Drc87MRestartCollapseInvestigation.md) had to
+# close by hand: it resumes inside the SAME process, runs on CPU only (so the
+# ``device_rng_state`` mps branch of RecurrentPPO.load_state_dict was never
+# executed), compares only ONE post-resume iteration, never asserts the Adam
+# moments round-trip, and builds both sides from the same seed -- so a field
+# that silently failed to restore would still compare equal by accident.
+
+
+def _resume_digest(algo: RecurrentPPO, sampler) -> dict:
+    """Digest every piece of state that determines the future trajectory."""
+    import hashlib
+
+    state = algo.state_dict()
+
+    def dig(*chunks: bytes) -> str:
+        d = hashlib.sha256()
+        for chunk in chunks:
+            d.update(chunk)
+        return d.hexdigest()
+
+    def dig_tensors(mapping) -> str:
+        d = hashlib.sha256()
+        for key in sorted(mapping):
+            value = mapping[key]
+            d.update(key.encode())
+            d.update(value.detach().cpu().contiguous().numpy().tobytes())
+        return d.hexdigest()
+
+    optimizer = state["optimizer_state_dict"]
+    opt = hashlib.sha256()
+    for pid in sorted(optimizer["state"]):
+        entry = optimizer["state"][pid]
+        opt.update(str(pid).encode())
+        for key in ("step", "exp_avg", "exp_avg_sq"):
+            value = entry[key]
+            array = (
+                value.detach().cpu().contiguous().numpy()
+                if torch.is_tensor(value)
+                else np.asarray(value)
+            )
+            opt.update(np.ascontiguousarray(array).tobytes())
+    return {
+        "num_timesteps": state["num_timesteps"],
+        "net": dig_tensors(state["net_state_dict"]),
+        "optimizer": opt.hexdigest(),
+        "obs": dig(np.ascontiguousarray(state["obs"]).tobytes()),
+        "episode_start": dig(np.ascontiguousarray(state["episode_start"]).tobytes()),
+        "recurrent_h": dig(state["recurrent_state"]["h"].contiguous().numpy().tobytes()),
+        "recurrent_c": dig(state["recurrent_state"]["c"].contiguous().numpy().tobytes()),
+        "env_states": dig(json.dumps(state["env_states"], sort_keys=True, default=str).encode()),
+        "sampler": dig(
+            np.ascontiguousarray(sampler.state_dict()["ema"]).tobytes(),
+            np.ascontiguousarray(sampler.state_dict()["count"]).tobytes(),
+        ),
+        "minibatch_generator": dig(state["minibatch_generator_state"].numpy().tobytes()),
+        "torch_rng": dig(state["torch_rng_state"].numpy().tobytes()),
+        "device_rng": (
+            dig(state["device_rng_state"][1].cpu().numpy().tobytes())
+            if state.get("device_rng_state") is not None
+            else None
+        ),
+    }
+
+
+def _resume_fixture(*, device: str, env_seed: int, net_seed: int, algo_seed: int):
+    puzzles = synthetic_puzzles()
+    sampler = ReverseFrontierSampler(puzzles, min_episodes=2)
+    envs = [
+        RicochetEnv(puzzles, EnvConfig(horizon=4), sampler=sampler, seed=env_seed + rank)
+        for rank in range(2)
+    ]
+    net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n, seed=net_seed)
+    torch.manual_seed(31)
+    algo = make_algo(
+        net, envs, n_steps=6, batch_size=6, n_epochs=2, seed=algo_seed, device=device
+    )
+    return sampler, algo
+
+
+_RESUME_CONFIG = DRCTrainConfig(
+    num_envs=2,
+    n_steps=6,
+    batch_size=6,
+    n_epochs=2,
+    schedule_total_steps=1000,
+    drc_depth=1,
+    drc_ticks=1,
+    drc_hidden_channels=8,
+    drc_encoder_channels=(8, 8),
+    drc_encoder_kernels=(3, 3),
+    drc_mlp_hidden=32,
+    device="cpu",
+)
+
+# Body of the child process used by the real-process-restart test. Kept as a
+# string so the child is a genuinely fresh interpreter (a same-process resume
+# cannot detect state that leaks through module globals or the device context).
+_RESTART_CHILD = """
+import json, sys
+from src.groundup.drc_train import _load_training_checkpoint
+from src.tests.test_drc_train import _RESUME_CONFIG, _resume_digest, _resume_fixture
+
+checkpoint, iters, device, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+sampler, algo = _resume_fixture(device=device, env_seed=901, net_seed=77, algo_seed=13)
+fresh = _resume_digest(algo, sampler)
+_load_training_checkpoint(checkpoint, algo=algo, sampler=sampler, config=_RESUME_CONFIG)
+restored = _resume_digest(algo, sampler)
+digests = []
+for _ in range(iters):
+    buf = algo.collect_rollout()
+    algo.update(buf, progress_remaining=0.8)
+    digests.append(_resume_digest(algo, sampler))
+json.dump({"fresh": fresh, "restored": restored, "iterations": digests}, open(out, "w"))
+"""
+
+
+def _run_resume_arms(device: str, tmp_path: Path, iters: int = 3) -> tuple[dict, dict, list, list]:
+    """Uninterrupted arm vs same-process resumed arm, both from one checkpoint."""
+    sampler_a, algo_a = _resume_fixture(device=device, env_seed=700, net_seed=9, algo_seed=5)
+    algo_a.update(algo_a.collect_rollout(), progress_remaining=0.9)
+    checkpoint = tmp_path / f"training_{device}.pt"
+    _save_training_checkpoint(
+        algo_a, sampler_a, _RESUME_CONFIG, checkpoint,
+        run_state={"elapsed_s": 1.0}, metadata={"test": True},
+    )
+    uninterrupted = []
+    for _ in range(iters):
+        algo_a.update(algo_a.collect_rollout(), progress_remaining=0.8)
+        uninterrupted.append(_resume_digest(algo_a, sampler_a))
+
+    # Deliberately DIFFERENT seeds: the resumed arm's pre-restore state cannot
+    # coincide with the checkpoint, so every equality below is load-bearing.
+    sampler_b, algo_b = _resume_fixture(device=device, env_seed=901, net_seed=77, algo_seed=13)
+    fresh = _resume_digest(algo_b, sampler_b)
+    _load_training_checkpoint(checkpoint, algo=algo_b, sampler=sampler_b, config=_RESUME_CONFIG)
+    restored = _resume_digest(algo_b, sampler_b)
+    resumed = []
+    for _ in range(iters):
+        algo_b.update(algo_b.collect_rollout(), progress_remaining=0.8)
+        resumed.append(_resume_digest(algo_b, sampler_b))
+    return fresh, restored, uninterrupted, resumed
+
+
+def test_exact_resume_overwrites_every_field_of_a_differently_seeded_process(tmp_path):
+    """Restore must replace ALL state, and hold over several iterations.
+
+    Building the resumed arm from different seeds makes every comparison
+    meaningful: a field left at its fresh-construction value would show up both
+    as a ``fresh``/``restored`` collision and as a trajectory divergence.
+    """
+    fresh, restored, uninterrupted, resumed = _run_resume_arms("cpu", tmp_path)
+
+    # num_timesteps starts at 0 on both sides; device_rng is None on CPU.
+    collisions = [
+        key
+        for key in fresh
+        if key != "num_timesteps" and fresh[key] is not None and fresh[key] == restored[key]
+    ]
+    assert collisions == [], f"restore left these at the fresh-construction value: {collisions}"
+    assert resumed == uninterrupted, "resumed trajectory diverged from the uninterrupted one"
+    # Optimizer moments specifically (the original test only checked weights).
+    assert restored["optimizer"] != fresh["optimizer"]
+    assert resumed[-1]["optimizer"] == uninterrupted[-1]["optimizer"]
+
+
+def test_exact_resume_survives_a_real_process_restart(tmp_path):
+    """A fresh interpreter resuming the checkpoint must match the same-process arm."""
+    import subprocess
+    import sys
+
+    _fresh, restored, uninterrupted, _resumed = _run_resume_arms("cpu", tmp_path)
+    out = tmp_path / "child.json"
+    subprocess.run(
+        [sys.executable, "-c", _RESTART_CHILD,
+         str(tmp_path / "training_cpu.pt"), "3", "cpu", str(out)],
+        cwd=Path(__file__).resolve().parents[2], check=True, capture_output=True, text=True,
+    )
+    child = json.loads(out.read_text())
+    assert child["restored"] == restored, "cross-process restore differs from in-process restore"
+    assert child["iterations"] == uninterrupted, "cross-process resume diverged"
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_exact_resume_round_trips_device_rng_state_on_mps(tmp_path):
+    """Exercise the mps ``device_rng_state`` branch of load_state_dict.
+
+    Actions are sampled with ``torch.multinomial`` on the device, so on MPS the
+    action stream depends on the MPS generator, not the CPU one. Without this
+    test that save/restore branch is never executed.
+    """
+    fresh, restored, uninterrupted, resumed = _run_resume_arms("mps", tmp_path)
+    assert restored["device_rng"] is not None, "mps device_rng_state was not captured"
+    assert restored["device_rng"] != fresh["device_rng"]
+    assert resumed == uninterrupted, "resumed trajectory diverged from uninterrupted on MPS"
 
 
 # ---------------------------------------------------------------------- smoke

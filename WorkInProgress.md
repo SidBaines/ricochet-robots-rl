@@ -669,3 +669,109 @@ nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py
 - Artifacts: artifacts/groundup/p1_12x12_planefree/ (curve, 35 probe JSONs,
   probe_curve.png, probe_summary.md, test_eval_best112M.json, snapshots).
   W&B: groundup-p1-12x12-planefree + groundup-p1_12x12_planefree-probes.
+
+## 2026-07-25 — DRC 87M restart: adversarial investigation says the restart was bit-exactly inert
+
+Independent investigation of whether pausing/restoring the exact-state 87M
+checkpoint caused the DRC(3,3) plane-free collapse at 89M
+(`artifacts/groundup/drc33_p1_12x12_planefree`, W&B `pupnnpq8`). Brief:
+`docs/Drc87MRestartCollapseInvestigationBrief.md`. Report:
+`docs/Drc87MRestartCollapseInvestigation.md`. Forensics:
+`artifacts/forensics/drc87m_restart/`. Sealed test unopened; frozen trainer
+(PID 86950) not signalled; no primary artifact touched.
+
+- **Answer: no.** Not "probably coincidental" — measured inert. A restart split
+  10+10 across two processes from the 87M checkpoint reproduces the continuous
+  run bit-for-bit (1,520 field-value comparisons, 0 differences), and the loop
+  is bit-deterministic on MPS (5 processes, identical iteration-1 digests).
+- **Harness validated against production**: replaying the full 87M→88M window
+  (122 iterations) in a fresh process reproduces `probe_model_88006656.pt`
+  bit-identically and every recorded 88M metric to the last digit. So the
+  production resume was exact and the resumed 87→91M trajectory *is* the
+  uninterrupted counterfactual — the planned 80M Arm U/Arm R replay is moot.
+- **Cause**: value-target scale runaway from ~82M, and `max_grad_norm=0.5`
+  renormalises the *combined* gradient, so the exploding value term crowds the
+  policy gradient out. Policy share of the update: 98.8% (80M) → 64.1% (85M) →
+  **3.7% (87M)** → 0.14% (90M); `‖g_policy‖` never weakens (1.72→3.06), only its
+  share. `clip_range_vf: null` left no brake.
+- **New lessons worth keeping** (all in the report):
+  - `evaluate_drc` calls `torch.manual_seed(0)`, which reseeds CPU **and** MPS.
+    Consequence: every checkpoint stores the *same* RNG constant, and the
+    exploration noise stream re-anchors every `eval_every` steps. Fix it.
+  - `value_loss` is a terrible alarm here: it swings 13.7↔71.3 across 122
+    consecutive iterations, and `explained_variance` stayed 0.81–0.84 while the
+    loss grew 10⁴×. Use `V_mean`/`V_std` on a fixed probe set instead — `V_mean`
+    had already gone *negative* (−2.66) by the pause.
+  - `caffeinate -is` does not prevent clamshell sleep (machine slept
+    16:37→21:08 on battery). Use `-dis`, and treat low battery as a stop, not a
+    pause. Not implicated in the collapse: the 88→89M window ran awake at
+    9.6 min/1M vs 9.8 pre-pause.
+- **Tests**: the old exact-resume test resumed in-process, CPU-only (so the MPS
+  `device_rng_state` branch was never executed), one iteration, no Adam-moment
+  assertion, and same-seeded arms. Added 3 tests incl. a real `subprocess`
+  restart and an MPS-gated `device_rng_state` test; fixed a pre-existing red
+  assertion left by commit `96fcbff`. `pytest src/tests/test_drc_train.py -q`:
+  22 passed.
+- **Recovery point**: `model_best.pt` (t=79,003,648) is bit-identical to
+  `probe_model_79003648.pt` and to the `best_state_dict` in all five
+  checkpoints; re-evaluates to `val_det` 0.830. Rescue arms should start from
+  `training_80003072.pt` (0.800, value loss 0.037, policy share 98.8%).
+
+### Addendum — root cause of the DRC value divergence (same day)
+
+The 87M investigation left "why did the value scale run away" open; it is now
+answered, and it is a **bug in `drc_train.py`** (report §6.1).
+
+- At horizon expiry the env returns an observation with **time channel = 0**.
+  `collect_rollout` runs the value head on it and adds `0.99 × V` to the reward,
+  then throws the observation away — so it is **never a regression target**, and
+  `remaining == 0` appears in no stored observation (87M checkpoint `steps`
+  histogram: 0…23, never 24). With `time_channel: true` the MDP is finite-horizon
+  and fully observed, so `V(s, remaining=0) ≡ 0` — but nothing pins it there.
+- Measured (fixed 16k probe set, time channel zeroed; `goal_reward` = 1.0):
+  `V(expiry)` = −1.87 (5M), +0.35 (70M), **+0.71 (80M)**, −1.25 (85M),
+  **−12.28 (87M)**, −91.9 (89M), −139.0 (91M). **Never near zero anywhere in the
+  run**, and it tracks `value_loss` throughout. At 80M *timing out paid almost as
+  well as solving the puzzle*; by 87M it was a 12× penalty.
+- **The P1 feed-forward baseline never had this**: `src/groundup/env.py` emits no
+  `TimeLimit.truncated`, and SB3 only bootstraps when both that key and
+  `terminal_observation` are present. `drc_train.py:586` hand-rolled the
+  bootstrap citing SB3 semantics it never received — a DRC-trainer regression,
+  so P1-vs-DRC was not like-for-like on reward semantics.
+- **Fix**: delete the `trunc_slots`/`trunc_obs` bootstrap in `collect_rollout`.
+  Correct for `time_channel: true`, doesn't change the optimal policy. Insurance:
+  Huber value loss so no value error can eat the whole `max_grad_norm` budget.
+- **New telemetry for every run**: `V` at time-channel 0 (should be ~0 — the best
+  and cheapest alarm), `V_mean`/`V_std` on a fixed probe set, and the
+  policy-gradient share. All three led `val_det` by 5–20M steps; `value_loss` did
+  not (it swings 13.7↔71.3 iteration-to-iteration).
+
+### Truncation-bootstrap bug fixed, test-first (report §12)
+
+- **Failing test first**: 2-move puzzles at `horizon=1` (every stored step
+  truncates) with the critic pinned to a constant → pre-fix, **4.95 was injected
+  into rewards of true magnitude ~0.01**, a ~600× corruption of every truncated
+  step.
+- **Fix**: `RecurrentPPO(bootstrap_on_truncation=None)` auto-detects from
+  `EnvConfig.time_channel` — bootstrap only when the horizon is *hidden*.
+  Requesting the bootstrap with `time_channel=True` now raises. Recorded in
+  `provenance`/`run_history.jsonl`. **Not** a new config field, so the contract
+  fingerprint `af7aae49…` is unchanged and all existing checkpoints still resume
+  (87M pause checkpoint verified 16/16 post-fix).
+- **It reverses the divergence, not just prevents it.** From the corrupted 87M
+  state: `value_loss` 53.9 → 0.163 by iteration 10 → 0.115 at 60;
+  `ret_absmax` ±38.9 → ±1.6 (the task's true scale); `approx_kl` → 0.004.
+  Pre-fix the same checkpoint climbed to 336 by 89M. Policy-gradient share
+  recovers 3.67% → 65.6%. So the run may be salvageable from 87M, not only 80M.
+- **Watch the transient**: right after the fix the *instantaneous* value error
+  rises before it falls (targets drop while V is still inflated) — iterations 1–5
+  are the re-fit. `approx_kl` briefly reaches ~0.081 (> `1.5 × target_kl`), so a
+  rescue from a late corrupted checkpoint can trip the early stop. Prefer 80M.
+- **Similar-error audit**: `drc_train.py:600` was the only place a learned value
+  entered the rewards. The SB3 paths are both correct — the groundup env emits
+  neither key SB3 needs (so expiry is terminal), and the legacy env sets
+  `TimeLimit.truncated` but has a clock-free observation (so its bootstrap is
+  right). Both pairings are now pinned by tests, since breaking either would
+  reintroduce the bug in the other trainer.
+- Still open, reported not fixed: `evaluate_drc` global reseed; `_dmap_cache`
+  `puzzle.seed` key; CPU↔MPS "exact resume". 204 passed, 9 skipped.

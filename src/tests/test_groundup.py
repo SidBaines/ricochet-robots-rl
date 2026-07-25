@@ -229,6 +229,35 @@ def test_time_channel_and_truncation(puzzles16):
     assert np.allclose(obs[-1], 0.0)
 
 
+def test_env_does_not_advertise_timelimit_truncated(puzzles16):
+    """The SB3/MaskablePPO path must keep treating horizon expiry as terminal.
+
+    SB3 bootstraps a truncated episode's value only when the info dict carries
+    BOTH ``terminal_observation`` and ``TimeLimit.truncated``
+    (stable_baselines3/common/on_policy_algorithm.py). This env emits neither, so
+    ``train.py`` correctly treats expiry as a real terminal -- which is the only
+    sound choice while ``time_channel=True`` puts the remaining horizon in the
+    observation, making V(s, remaining=0) == 0 by definition.
+
+    Adding either key would silently reintroduce the defect that drove the DRC
+    87M value divergence: the expiry observation is never stored in the rollout
+    buffer, so V is never trained there, and bootstrapping injects an unpinned
+    extrapolation straight into the reward. See
+    docs/Drc87MRestartCollapseInvestigation.md 6.1.
+    """
+    config = EnvConfig(time_channel=True, horizon=2)
+    env = RicochetEnv(puzzles16, config)
+    # optimal_length >= 3 with horizon 2 makes success impossible.
+    hard = next(i for i, p in enumerate(puzzles16) if p.optimal_length >= 3)
+    env.reset(options={"puzzle_index": hard})
+    for _ in range(2):
+        mask = env.action_masks()
+        _obs, _reward, term, trunc, info = env.step(int(np.flatnonzero(mask)[0]))
+    assert trunc and not term
+    assert "TimeLimit.truncated" not in info
+    assert "terminal_observation" not in info
+
+
 @needs_bank8
 def test_8x8_bank_loads():
     puzzles = load_puzzles(BANK_8, "train")

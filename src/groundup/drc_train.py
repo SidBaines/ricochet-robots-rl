@@ -25,9 +25,33 @@ Recurrence (the part the legacy stack botched):
   logprobs/values equal the collected ones exactly (tested).
 - Action masks flow into ``DRCNet.forward`` during collection, evaluation,
   AND the replayed policy/value computation (masks are stored in the buffer).
-- On TimeLimit truncation the value of the final observation -- evaluated
-  under the post-step recurrent state -- is discounted into the step reward,
-  the same semantics SB3 implements via ``TimeLimit.truncated`` infos.
+- Truncation handling depends on whether the horizon is OBSERVABLE
+  (``bootstrap_on_truncation``, auto-detected from ``EnvConfig.time_channel``):
+
+  * ``time_channel=False`` -- the step limit is invisible to the agent, so it
+    is a training artifact and the episode "would have continued". The value of
+    the final observation, evaluated under the post-step recurrent state, is
+    discounted into the step reward; this is what SB3 does when an env reports
+    ``TimeLimit.truncated``.
+  * ``time_channel=True`` -- the remaining-step fraction is IN the observation,
+    so the horizon is part of the MDP: the episode genuinely ends and
+    ``V(s, remaining=0) == 0`` by definition. Truncation is treated as a real
+    terminal and NO bootstrap is applied.
+
+  Applying the bootstrap while the horizon is observed is not a tuning choice,
+  it is a bug, and combining the two raises. ``env.step`` increments ``_steps``
+  before building the observation, so the expiry observation has time channel
+  exactly 0 -- and it is never stored in the buffer, hence never a regression
+  target. Bootstrapping there injects an unpinned extrapolation straight into
+  the returns, with no contraction guarantee. That is what destroyed the
+  ``drc33_p1_12x12_planefree`` run: ``V`` at expiry reached -12.3 against a
+  ``goal_reward`` of 1.0 by 87M steps (timing out "paid" twelve times better
+  than solving the puzzle), the return scale ran away, and because
+  ``max_grad_norm`` renormalizes the COMBINED gradient the value term crowded
+  the policy out of the update (share 98.8% -> 3.7% -> 0.14%) until the policy
+  collapsed. Full forensics: docs/Drc87MRestartCollapseInvestigation.md 6.1.
+  Note ``src/groundup/env.py`` emits no ``TimeLimit.truncated``, so the
+  feed-forward ``train.py``/SB3 path never had this defect.
 - Shaping consistency: every env's ``EnvConfig.gamma`` must equal the PPO
   discount (checked at construction), otherwise the potential-based shaping
   is not policy-invariant.
@@ -391,6 +415,7 @@ class RecurrentPPO:
         adv_std_floor: float = 0.05,
         adv_clip: Optional[float] = 10.0,
         clip_range_vf: Optional[float] = None,
+        bootstrap_on_truncation: Optional[bool] = None,
         device: str = "cpu",
         seed: int = 0,
     ) -> None:
@@ -413,6 +438,34 @@ class RecurrentPPO:
                     f"env shaping gamma ({env_gamma}) != PPO gamma ({gamma}); "
                     "potential-based shaping is only policy-invariant when they match"
                 )
+        # Truncation bootstrapping is sound ONLY when the step limit is invisible
+        # to the agent. See the module docstring: with time_channel=True the
+        # horizon is part of the observation, V(s, remaining=0) == 0 by
+        # definition, and the expiry observation is never a regression target --
+        # so bootstrapping injects an unpinned extrapolation into the reward.
+        # Envs that expose no ``config.time_channel`` (duck-typed/foreign envs)
+        # are assumed to hide their limit, which is the SB3-compatible default.
+        observes_horizon = {
+            getattr(getattr(env, "config", None), "time_channel", None) for env in envs
+        }
+        if len(observes_horizon) > 1:
+            raise ValueError(
+                f"Envs disagree on time_channel ({sorted(map(str, observes_horizon))}); "
+                "truncation semantics must be identical across envs"
+            )
+        horizon_is_observed = observes_horizon.pop() is True
+        if bootstrap_on_truncation is None:
+            bootstrap_on_truncation = not horizon_is_observed
+        elif bootstrap_on_truncation and horizon_is_observed:
+            raise ValueError(
+                "bootstrap_on_truncation=True is invalid when the env exposes the "
+                "remaining horizon (time_channel=True): the MDP is then "
+                "finite-horizon and fully observed, so V(s, remaining=0) == 0 by "
+                "definition, and the expiry observation is never stored in the "
+                "buffer -- bootstrapping there injects an untrained extrapolation "
+                "into the reward (see docs/Drc87MRestartCollapseInvestigation.md)"
+            )
+        self.bootstrap_on_truncation = bool(bootstrap_on_truncation)
         self.envs = list(envs)
         self.num_envs = len(self.envs)
         self.obs_shape = tuple(self.envs[0].observation_space.shape)
@@ -581,9 +634,12 @@ class RecurrentPPO:
                     obs_b, reward, terminated, truncated, _info = env.step(int(actions_np[b]))
                     rewards[b] = reward
                     if terminated or truncated:
-                        if truncated and not terminated:
-                            # Bootstrap the value of the final observation
-                            # (SB3's TimeLimit.truncated semantics).
+                        if truncated and not terminated and self.bootstrap_on_truncation:
+                            # Hidden step limit: the episode "would have
+                            # continued", so bootstrap the value of the final
+                            # observation (SB3's TimeLimit.truncated semantics).
+                            # Skipped when the horizon is observable -- expiry is
+                            # then a real terminal with value 0 by definition.
                             trunc_slots.append(b)
                             trunc_obs.append(obs_b)
                         obs_b, _info = env.reset()
@@ -1153,10 +1209,17 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         "observation_shape": tuple(net.observation_shape),
         "n_actions": int(net.n_actions),
         "policy_params": int(n_params),
+        # Derived from time_channel rather than a config field of its own, so the
+        # contract fingerprint is unchanged and existing checkpoints stay
+        # resumable. That means the fingerprint alone does NOT distinguish runs
+        # made before and after the truncation-bootstrap fix -- record it here so
+        # run_history.jsonl and every snapshot carry the semantics explicitly.
+        "bootstrap_on_truncation": bool(algo.bootstrap_on_truncation),
     }
     print(
         f"[drc] device={device} DRC({config.drc_depth},{config.drc_ticks}) "
-        f"policy_params={n_params:,}",
+        f"policy_params={n_params:,} "
+        f"bootstrap_on_truncation={algo.bootstrap_on_truncation}",
         flush=True,
     )
 

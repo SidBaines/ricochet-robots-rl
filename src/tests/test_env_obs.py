@@ -66,3 +66,30 @@ def test_terminated_truncated_exclusive():
     noop_action = env.action_space.n - 1
     _, _, term, trunc, _ = env.step(noop_action)
     assert (term and not trunc) or (trunc and not term) or (not term and not trunc)
+
+
+def test_timelimit_truncated_is_paired_with_a_hidden_horizon():
+    """Advertising ``TimeLimit.truncated`` obliges the observation to hide the clock.
+
+    SB3 bootstraps ``gamma * V(final_obs)`` into the reward whenever an env
+    reports ``TimeLimit.truncated``. That is only sound while the step limit is
+    INVISIBLE to the agent: if remaining time were in the observation, the MDP
+    would be finite-horizon and fully observed, so ``V(s, remaining=0) == 0`` by
+    definition -- and because the expiry observation is never stored in the
+    rollout buffer, ``V`` is never trained there, so the bootstrap would inject an
+    unpinned extrapolation straight into the reward. That combination destroyed
+    the DRC 87M run; see docs/Drc87MRestartCollapseInvestigation.md 6.1.
+
+    This env advertises the key, so its observation must stay clock-free: 4 wall
+    channels + goal + target + one plane per robot, and nothing else.
+    """
+    layout = make_layout_two_robots()
+    env = RicochetRobotsEnv(fixed_layout=layout, channels_first=True, max_steps=1)
+    obs, _ = env.reset()
+    assert obs.shape[0] == 4 + 2 + env.num_robots, "unexpected channel added to the obs"
+
+    noop_action = env.action_space.n - 1
+    _, _, term, trunc, info = env.step(noop_action)
+    assert trunc and not term
+    assert info.get("TimeLimit.truncated") is True  # SB3 will bootstrap here
+    # If this pairing is ever broken, fix the bootstrap too -- not just this test.

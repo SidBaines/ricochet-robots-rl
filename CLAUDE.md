@@ -40,6 +40,34 @@ SB3 PPO on MPS. Reference environment: `.venv-phase2` (see README for setup).
   curriculum (`curriculum_stage_max_lengths`) with the stall safety-valve
   (`curriculum_max_episodes_per_stage`) rather than training on lengths 1–8
   uniformly.
+- **Never bootstrap on truncation when the horizon is in the observation.**
+  (Fixed 2026-07-25 in `RecurrentPPO`, which now auto-detects this from
+  `EnvConfig.time_channel` and raises on the inconsistent combination; the
+  lesson stays because the same trap exists in any new trainer.)
+  `EnvConfig.time_channel=True` puts remaining time in the obs, so the MDP is
+  finite-horizon and fully observed and `V(s, remaining=0) ≡ 0`. The env
+  increments `_steps` before building the obs, so the truncation observation has
+  time channel exactly 0 — and it is never stored in the buffer, so it is never
+  a regression target. `drc_train.py`'s `collect_rollout` nonetheless fed it to
+  the value head and added `gamma*V` to the reward: an untrained extrapolation
+  injected straight into the returns, with no contraction guarantee. Measured on
+  `drc33_p1_12x12_planefree`, `V(expiry)` was **+0.71 at 80M and −12.3 at 87M**
+  against `goal_reward=1.0` (timing out paid better than solving), and it drove
+  the 89M value/policy collapse. `src/groundup/env.py` emits no
+  `TimeLimit.truncated`, so SB3/`train.py` never did this — it was a DRC-trainer
+  regression. See `docs/Drc87MRestartCollapseInvestigation.md` §6.1.
+  Diagnostic: evaluate `V` with the time channel zeroed; it must be ~0.
+- **`value_loss` is a bad alarm; `explained_variance` is worse.** In the same
+  run `value_loss` swung 13.7↔71.3 between consecutive iterations while
+  `explained_variance` held 0.81–0.84 as the loss grew 10⁴×. Use `V_mean`/`V_std`
+  on a fixed probe set, plus the policy-gradient share of the update. Both led
+  `val_det` by 5–20M steps.
+- **`max_grad_norm` couples the value and policy gradients.** One
+  `clip_grad_norm_` over the combined loss means an exploding value term
+  starves the policy: share of the update fell 98.8% (80M) → 3.7% (87M) → 0.14%
+  (90M) while `‖g_policy‖` itself *grew*. Huber value loss bounds this cheaply.
+- **`caffeinate -is` does not prevent clamshell (lid-close) sleep.** Use
+  `caffeinate -dis`, and treat low battery as a stop condition, not a pause.
 - **SB3's default Tanh MLP heads saturate on CNN features.** Unbounded ReLU
   features (observed O(1000) at 16×16) drive every Tanh pre-activation past
   ±2 → the value head collapses to a literally constant output and learning
