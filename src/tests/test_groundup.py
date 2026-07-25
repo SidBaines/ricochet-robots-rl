@@ -229,6 +229,46 @@ def test_time_channel_and_truncation(puzzles16):
     assert np.allclose(obs[-1], 0.0)
 
 
+def test_distance_map_cache_is_keyed_on_puzzle_identity_not_seed():
+    """The shaping distance map must never be served for the wrong puzzle.
+
+    ``_dmap_cache`` was keyed on ``puzzle.seed``, a *proxy* for identity. It is
+    correct today only because every train-split seed happens to be unique; a
+    bank with colliding seeds would silently hand one puzzle another's
+    distance map, corrupting the potential-based shaping reward with no error
+    anywhere. (Keying on ``layout_hash`` instead would be worse -- many puzzles
+    share a layout but have different goals.)
+    """
+    h_walls = np.zeros((9, 8), dtype=bool)
+    v_walls = np.zeros((8, 9), dtype=bool)
+
+    def make(goal, actions):
+        return Puzzle(
+            h_walls=h_walls,
+            v_walls=v_walls,
+            robots=((3, 0), (3, 4)),
+            goal=goal,
+            target=0,
+            optimal_length=len(actions),
+            actions=actions,
+            robots_moved=1,
+            layout_hash="shared-layout",  # same layout ...
+            seed=99,  # ... and a COLLIDING seed, with different goals
+        )
+
+    left, right = make((3, 3), ((0, 3),)), make((0, 0), ((0, 0),))
+    env = RicochetEnv([left, right], EnvConfig(shaping_coef=0.1))
+
+    for puzzle in (left, right):
+        dmap = env._distance_map(puzzle)
+        assert dmap[puzzle.goal] == 0, "cache served another puzzle's distance map"
+        assert np.array_equal(
+            dmap, relaxed_distance_map(puzzle.h_walls, puzzle.v_walls, puzzle.goal)
+        )
+    # Distinct goals must yield distinct maps even under a seed collision.
+    assert not np.array_equal(env._distance_map(left), env._distance_map(right))
+
+
 def test_env_does_not_advertise_timelimit_truncated(puzzles16):
     """The SB3/MaskablePPO path must keep treating horizon expiry as terminal.
 

@@ -84,6 +84,9 @@ class RicochetEnv(gym.Env):
         self.config = config
         self.sampler = sampler
         self._rng = np.random.default_rng(seed)
+        # Keyed on the puzzle's index in self.puzzles (see _distance_map), NOT on
+        # puzzle.seed. self.puzzles holds strong references, so every id in
+        # _puzzle_index_by_id belongs to a live object this env owns.
         self._dmap_cache: Dict[int, np.ndarray] = {}
         self._puzzle_index_by_id = {id(puzzle): i for i, puzzle in enumerate(self.puzzles)}
 
@@ -127,10 +130,32 @@ class RicochetEnv(gym.Env):
 
     # ------------------------------------------------------------- helpers
     def _distance_map(self, puzzle: Puzzle) -> np.ndarray:
-        cached = self._dmap_cache.get(puzzle.seed)
+        """Relaxed distance-to-goal map, memoized per puzzle.
+
+        Keyed on the puzzle's index in this env's own table, which is a true
+        unique identity for every puzzle the env is allowed to see (``reset``
+        already resolves and range-checks it the same way). It was previously
+        keyed on ``puzzle.seed`` -- a *proxy* for identity, correct only while
+        every seed in the bank happens to be unique. A seed collision would
+        silently serve one puzzle another's distance map and corrupt the
+        potential-based shaping reward, with no error raised anywhere.
+
+        ``layout_hash`` would be a worse key still: many puzzles share a layout
+        but differ in goal. Keying on the map's actual determinants
+        (``h_walls``, ``v_walls``, ``goal``) is unconditionally correct and costs
+        only ~140 ns/call, but the ~300-byte key would add on the order of a
+        gigabyte of RSS across 256 envs caching thousands of puzzles each, so the
+        int index is preferred.
+        """
+        key = self._puzzle_index_by_id.get(id(puzzle))
+        if key is None:
+            # Puzzle outside this env's table (no stable identity): correctness
+            # over caching. Reachable only via direct calls, not the gym API.
+            return relaxed_distance_map(puzzle.h_walls, puzzle.v_walls, puzzle.goal)
+        cached = self._dmap_cache.get(key)
         if cached is None:
             cached = relaxed_distance_map(puzzle.h_walls, puzzle.v_walls, puzzle.goal)
-            self._dmap_cache[puzzle.seed] = cached
+            self._dmap_cache[key] = cached
         return cached
 
     def _static_planes(self, puzzle: Puzzle) -> np.ndarray:

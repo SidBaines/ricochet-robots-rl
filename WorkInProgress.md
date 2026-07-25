@@ -795,3 +795,30 @@ Second of the three defects reported alongside the truncation-bootstrap fix.
 - **Consequence for future forensics:** checkpoints will no longer all carry the
   same RNG constant, and training trajectories after the first eval differ from
   pre-fix runs. Both are intended.
+
+### Fix: `_dmap_cache` keyed on puzzle identity, not `puzzle.seed`
+
+Third of the three reported defects (latent, not yet triggered).
+
+- `RicochetEnv._distance_map` cached the shaping distance map under
+  `puzzle.seed`, a **proxy** for identity. Correct only while every seed in the
+  bank is unique (they are today, all 39,713). A collision would silently serve
+  one puzzle another's distance map and corrupt the potential-based shaping
+  reward with no error anywhere.
+- Now keyed on the puzzle's index in the env's own table — a true unique identity
+  for every puzzle the env may see, resolved via `_puzzle_index_by_id` exactly as
+  `reset` already does. `self.puzzles` holds strong references, so those ids are
+  pinned for the env's lifetime.
+- **Rejected alternatives, both recorded because the reasoning is non-obvious:**
+  `layout_hash` would be *worse* (many puzzles share a layout but differ in goal);
+  keying on the map's actual determinants (`h_walls`, `v_walls`, `goal`) is
+  unconditionally correct and cheap in CPU (~140 ns/call, <0.05% of a core at the
+  real 3.4k calls/s) but its ~300-byte key would add on the order of **1 GB of
+  RSS** across 256 envs caching thousands of puzzles each — the dmap caches are
+  already a large share of the observed 2.1 GB.
+- Value-neutral on the real bank, verified: a 1-iteration replay from the 87M
+  checkpoint reproduces the pre-change digests bit-identically
+  (`net=586ae985b23e1afa`, `opt=881ea2b955057fa1`, `value_loss=53.9287`).
+- Test `test_distance_map_cache_is_keyed_on_puzzle_identity_not_seed` builds two
+  puzzles that share a layout *and* a seed but have different goals, and asserts
+  `dmap[goal] == 0` for each. Pre-fix the second got the first's map (`2`, not 0).
