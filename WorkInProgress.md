@@ -907,3 +907,43 @@ Full review: `docs/DrcPlaneFree120MReview.md`. Plan: `docs/DrcAuxLandingLossPlan
   head so the main Adam state resumes exactly, and additive config-contract
   evolution. Log the policy-gradient share first — a new shared-trunk loss under
   `max_grad_norm` is exactly the failure mode we just diagnosed.
+
+## 2026-07-26 (overnight) — aux landing-cell loss: mid-training screen
+
+Arms A0 (control, no aux), A1 (lambda=1.0), A2 (lambda=0.3), all resuming the
+identical v2 120M checkpoint `training_120004608.pt` and differing ONLY in
+`aux_landing_coef`. Run concurrently so that a truncated night still leaves a
+valid paired comparison at matched steps. Plan: `docs/DrcAuxLandingLossPlan.md`.
+
+**Headline so far: the bottleneck hypothesis looks FALSIFIED, in its strong form.**
+The aux loss installs the missing knowledge easily, and the policy gets *worse*.
+
+- lambda sweep (`artifacts/forensics/aux/`): aux loss starts at **5.053** vs
+  chance ln(144)=4.969 — the trunk reads at exactly chance, independently
+  confirming the 120M probe result by a different route. Policy share of the
+  trunk gradient: 93.3% (0.1) / 92.4% (0.3) / 87.2% (1.0) / 65.4% (3.0) /
+  27.8% (10), against 98.8% healthy and 3.7% at the dying 87M. lambda=3 disrupts
+  the policy (entropy 0.24→0.39); lambda=1 chosen.
+- **A1 learns the aux task extremely well**: cross-entropy 5.05 → 2.02 → 1.33 →
+  0.93 over 3M steps (~39% average probability on the true cell out of 144).
+- **Decodability flips from below-control to clearly positive** (readout, A1 at
+  122M vs A0 at 125M): mid **0.010 → 0.187** (gain −0.032 → **+0.144**), long
+  0.005 → 0.073 (gain −0.062 → +0.006), short 0.240 → 0.804. So the knowledge the
+  120M review found missing is installable, and quickly.
+- **And val_det drops ~15pp and stays down**: 0.615 / 0.650 / 0.625 against A0's
+  0.790 / 0.765 / 0.800 at matched steps, with the training-side curriculum
+  frontier stuck at 4 vs A0's 7–8. No recovery over 3M steps.
+
+Caveats being tested / to state:
+
+1. Single lambda. **A2 (lambda=0.3) added mid-experiment** to test whether the
+   disruption is strength-dependent — an adaptive addition to the pre-registered
+   design, flagged as such.
+2. **No head warmup**: the aux head is randomly initialised and attached at full
+   lambda, so it backpropagates structured noise into the shared trunk early.
+   Argues for a transient — but the drop persisted 3M steps after the head became
+   accurate (aux 0.93), which argues against noise and for genuine interference.
+3. `long` only reached gain +0.006, so the test is strong for mid, weaker for long.
+4. A fourth outcome the plan did not pre-register: "decodability up, val_det
+   DOWN". The plan anticipated up/flat. Down is a stronger falsification but also
+   more consistent with capacity interference than with "knowledge is irrelevant".
