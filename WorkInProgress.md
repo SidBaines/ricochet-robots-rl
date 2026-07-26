@@ -947,3 +947,37 @@ Caveats being tested / to state:
 4. A fourth outcome the plan did not pre-register: "decodability up, val_det
    DOWN". The plan anticipated up/flat. Down is a stronger falsification but also
    more consistent with capacity interference than with "knowledge is irrelevant".
+
+### Aux-loss screen: RESULT — bottleneck hypothesis falsified (branch 2)
+
+A2 (lambda=0.3) settles it, and corrects the premature reading I recorded above
+from A1 alone.
+
+At t=127M, A2 reaches nearly the same decodability as A1 did at 124M, at a
+fraction of the policy cost (readout gain vs random-init control):
+
+| arm | blocked | short | mid | long | val_det vs control |
+|---|---|---|---|---|---|
+| A0 (lambda=0) | +0.591 | +0.177 | **-0.033** | -0.062 | — |
+| A2 (lambda=0.3) | +0.787 | +0.833 | **+0.279** | +0.025 | **-0.013** |
+| A1 (lambda=1.0) | +0.785 | +0.858 | +0.365 | +0.031 | -0.150 |
+
+- A2's mid-band raw accuracy rises monotonically **0.028 -> 0.322 (11.4x)** over
+  6M steps, a swing of +0.31 in gain, while `val_det` stays within ~1pp of the
+  control (mean -0.0125 over 8 matched evals, SD 0.0167, SE 0.0059).
+- A0's decodability is **flat to +-0.001 over 14 evals / 14M steps**, so the
+  120M probe result is a stable property, not drift. Strong control.
+- So the missing knowledge is installable, cheaply, to a large degree — and
+  performance does not improve. That is branch 2 of the pre-registered decision
+  rule: **hypothesis falsified; the 20h from-scratch arm is not justified.**
+- The lambda=1.0 arm adds that pushing harder does not help either: same
+  knowledge, 15pp worse policy. There is no dose at which this pays.
+- The cost is about gradient STRENGTH, not amount of knowledge acquired: both
+  arms reached similar aux mastery (A1 0.713 at 124M, A2 0.789 at 128M) but paid
+  15pp vs 1.25pp. Gentle installation is nearly free.
+
+Corrections I made during the night, both recorded because they changed the
+conclusion: (1) I called the hypothesis falsified off A1 alone when the 15pp drop
+was in fact a lambda artefact — A2 shows the cost is avoidable; (2) the plan
+pre-registered "decodability up + val flat/up" and A1 produced "up + down", which
+I initially read as a stronger falsification when it was really a dose effect.
