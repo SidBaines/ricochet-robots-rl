@@ -1,0 +1,60 @@
+# Aux-loss experiment ARM A0 (CONTROL) -- docs/DrcAuxLandingLossPlan.md
+# Continues the completed 120M v2 run for 15M steps with NO auxiliary loss.
+# Mandatory control: v2 had not converged (+1.4pp per 20M), so any gain in the
+# aux arm must be measured against plain continued training, not against 120M.
+# Differs from A1 ONLY in the aux term.
+bank_path: artifacts/groundup_bank_12x12/size-12x12_numR3_ET2_CL2.parquet
+out_dir: artifacts/groundup
+run_name: drc33_p1_aux_A0_control
+curriculum: reverse
+horizon: 24
+shaping_coef: 0.1
+time_channel: true
+canonical_identity: true
+stop_planes: false
+distance_plane: false
+seed: 11
+num_envs: 256
+n_steps: 32
+batch_size: 2048
+n_epochs: 1
+total_steps: 135000000
+schedule_total_steps: 200000000
+learning_rate: 0.0003
+learning_rate_final: 5.0e-05
+ent_coef: 0.01
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.2
+vf_coef: 0.5
+max_grad_norm: 0.5
+target_kl: 0.05
+adv_std_floor: 0.05
+adv_clip: 10.0
+clip_range_vf: null
+bootstrap_on_truncation: false
+drc_depth: 3
+drc_ticks: 3
+drc_hidden_channels: 32
+drc_cell_kernel: 3
+drc_encoder_channels:
+- 32
+- 32
+drc_encoder_kernels:
+- 4
+- 4
+drc_encoder_strides:
+- 1
+- 1
+drc_encoder_relu: false
+drc_mlp_hidden: 256
+eval_every: 1000000
+eval_per_length: 25
+final_eval_per_length: 60
+final_eval_episodes: 3
+eval_batch_size: 64
+checkpoint_every: 5000000
+resume_from: artifacts/groundup/drc33_p1_12x12_planefree_v2/training_120004608.pt
+device: auto
+wandb_project: ricochet-robots-rl
+wandb_run_name: groundup-drc33-aux-A0-control

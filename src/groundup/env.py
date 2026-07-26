@@ -363,6 +363,24 @@ class RicochetEnv(gym.Env):
                 self.sampler.record(self._start_distance, success, self._puzzle)
         return self._obs(), float(reward), terminated, truncated, info
 
+    def landing_targets(self) -> np.ndarray:
+        """Flat cell index each (robot, direction) would slide to, as int64.
+
+        Supervision targets for the auxiliary landing-cell loss
+        (docs/DrcAuxLandingLossPlan.md). Deliberately a query method rather than
+        an observation channel: the landing cells must stay a TARGET, never an
+        input, or the run stops being plane-free and leaves the helper-removal
+        ladder (docs/GroundUpRLRedesign.md section 4). Ordering matches
+        ``stop_planes`` and the action encoding: index ``rid * 4 + direction``,
+        value ``row * width + col``.
+        """
+        out = np.empty(4 * self.num_robots, dtype=np.int64)
+        for rid in range(self.num_robots):
+            for direction in range(4):
+                row, col = self._slide_from(self._robots, rid, direction, self._puzzle)
+                out[rid * 4 + direction] = row * self.width + col
+        return out
+
     def action_masks(self) -> np.ndarray:
         """True where the action moves its robot at least one cell."""
         mask = np.zeros(self.action_space.n, dtype=bool)

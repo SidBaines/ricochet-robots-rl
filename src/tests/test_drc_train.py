@@ -411,6 +411,105 @@ def test_primary_drc_config_disables_the_truncation_bootstrap():
     assert make_algo(net, envs, n_steps=4, batch_size=4).bootstrap_on_truncation is False
 
 
+# ------------------------------------- auxiliary landing-cell loss (aux arm)
+def test_landing_targets_match_the_stop_planes_the_env_can_render():
+    """Aux labels must agree with the env's own slide dynamics, cell for cell."""
+    puzzles = synthetic_puzzles()
+    plain = RicochetEnv(puzzles, EnvConfig(horizon=8), seed=3)
+    withplanes = RicochetEnv(puzzles, EnvConfig(horizon=8, stop_planes=True), seed=3)
+    plain.reset(options={"puzzle_index": 2})
+    obs, _ = withplanes.reset(options={"puzzle_index": 2})
+
+    targets = plain.landing_targets()
+    assert targets.shape == (4 * plain.num_robots,) and targets.dtype == np.int64
+    # The observation must be untouched: labels are a TARGET, never an input.
+    assert plain.observation_space.shape[0] == 5 + plain.num_robots + 1
+
+    stops = obs[withplanes.stop_planes_offset : withplanes.stop_planes_offset + targets.size]
+    for pair, plane in enumerate(stops):
+        row, col = divmod(int(targets[pair]), plain.width)
+        assert plane[row, col] == 1.0, f"pair {pair} disagrees with the stop plane"
+        assert plane.sum() == 1.0
+
+
+def test_aux_landing_loss_is_bit_identical_to_disabled_when_coef_is_zero():
+    """The aux feature must be provably inert when off.
+
+    The control arm A0 ran under a build without this code at all; it is only a
+    valid control for A1 if switching the feature off reproduces that build
+    exactly. Same seeds, so any leaked RNG draw or extra parameter shows up.
+    """
+    def run(**extra):
+        puzzles = synthetic_puzzles()
+        sampler = ReverseFrontierSampler(puzzles, min_episodes=2)
+        envs = [
+            RicochetEnv(puzzles, EnvConfig(horizon=4), sampler=sampler, seed=700 + r)
+            for r in range(2)
+        ]
+        net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n, seed=9)
+        torch.manual_seed(31)
+        algo = make_algo(net, envs, n_steps=6, batch_size=6, n_epochs=2, seed=5, **extra)
+        metrics = algo.update(algo.collect_rollout(), progress_remaining=0.8)
+        weights = {k: v.detach().clone() for k, v in algo.net.state_dict().items()}
+        return metrics, weights
+
+    off_metrics, off_weights = run()
+    zero_metrics, zero_weights = run(aux_landing_coef=0.0)
+    assert off_metrics == zero_metrics
+    for key, value in zero_weights.items():
+        assert torch.equal(value, off_weights[key]), key
+    assert off_metrics["aux_landing_loss"] == 0.0
+
+
+def test_aux_landing_loss_trains_and_reaches_the_shared_trunk():
+    """With the coefficient on, the aux loss must fall AND move the trunk."""
+    puzzles = synthetic_puzzles()
+    sampler = ReverseFrontierSampler(puzzles, min_episodes=2)
+    envs = [
+        RicochetEnv(puzzles, EnvConfig(horizon=4), sampler=sampler, seed=700 + r)
+        for r in range(2)
+    ]
+    net = tiny_net(envs[0].observation_space.shape, envs[0].action_space.n, seed=9)
+    torch.manual_seed(31)
+    algo = make_algo(
+        net, envs, n_steps=6, batch_size=6, n_epochs=2, seed=5, aux_landing_coef=1.0
+    )
+    assert algo.aux_head is not None and algo.aux_optimizer is not None
+    # The head is NOT part of net.state_dict(), so a checkpoint written without
+    # it still round-trips (this is what lets A1 resume the 120M control state).
+    assert not any(k.startswith("aux") for k in algo.net.state_dict())
+
+    trunk_before = algo.net.encoder[0].weight.detach().clone()
+    first = algo.update(algo.collect_rollout(), progress_remaining=0.8)
+    losses = [first["aux_landing_loss"]]
+    for _ in range(6):
+        losses.append(algo.update(algo.collect_rollout(), progress_remaining=0.8)["aux_landing_loss"])
+
+    assert all(np.isfinite(losses))
+    assert losses[-1] < losses[0], f"aux loss did not fall: {losses}"
+    # chance level for a 12x12 grid is -log(1/64)... the fixture is 8x8 -> 64 cells
+    assert losses[0] <= np.log(64) + 1.0
+    assert not torch.equal(algo.net.encoder[0].weight, trunk_before), "aux grads never reached the trunk"
+
+
+def test_config_contract_allows_additive_fields_at_their_default_only():
+    """New config fields must not orphan existing checkpoints -- unless actually set.
+
+    Adding aux_landing_coef would otherwise have made every pre-existing
+    checkpoint unresumable, including the 120M one both aux arms start from.
+    """
+    from src.groundup.drc_train import _contract_differences
+
+    current = _config_contract(_RESUME_CONFIG)
+    older = {k: v for k, v in current.items() if k != "aux_landing_coef"}
+    assert _contract_differences(older, current) == []  # field absent, at default
+
+    enabled = _config_contract(dataclasses.replace(_RESUME_CONFIG, aux_landing_coef=1.0))
+    assert _contract_differences(older, enabled) == ["aux_landing_coef"]
+    # ... and a genuine mismatch on a shared field is still caught.
+    assert "horizon" in _contract_differences({**older, "horizon": 999}, current)
+
+
 # ------------------------------------------------- post-convergence hardening
 def test_normalize_advantages_floor_caps_tiny_std_amplification():
     # Near-solved batch: residual advantages at 1e-3 scale.
@@ -552,11 +651,16 @@ def test_primary_12x12_drc_config_is_helper_free_and_extension_safe():
     assert config.total_steps == 120_000_000
     assert config.schedule_total_steps == 200_000_000
     assert config.checkpoint_every == 5_000_000
-    # 2026-07-25: restarted from step 0 as _v2. The first attempt's rewards were
-    # corrupted from step 0 by the truncation bootstrap, so no checkpoint of it is
-    # a clean resume point (docs/Drc87MRestartCollapseInvestigation.md 6.1).
-    assert config.resume_from is None
+    # 2026-07-25: restarted from step 0 as _v2. The durable invariant is that the
+    # config never resumes the abandoned first attempt, whose rewards were
+    # corrupted from step 0 by the truncation bootstrap
+    # (docs/Drc87MRestartCollapseInvestigation.md 6.1). resume_from itself is
+    # legitimately mutable -- a battery pause sets it -- so pinning it to None
+    # made this test fail the moment the run was paused.
     assert config.run_name == "drc33_p1_12x12_planefree_v2"
+    assert config.resume_from is None or config.resume_from.startswith(
+        "artifacts/groundup/drc33_p1_12x12_planefree_v2/"
+    ), f"must not resume the abandoned first attempt: {config.resume_from}"
     # Explicit, so the contract fingerprint pins the reward semantics.
     assert config.bootstrap_on_truncation is False
     # 4 walls + goal + 3 robots + time; 3 robots x 4 directions.

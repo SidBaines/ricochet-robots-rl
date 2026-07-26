@@ -511,6 +511,8 @@ class DRCNet(nn.Module):
         obs: Tensor,
         state: Optional[DRCState] = None,
         action_mask: Optional[Tensor] = None,
+        *,
+        return_map: bool = False,
     ) -> Tuple[Tensor, Tensor, DRCState]:
         """One environment step: N ticks of the D-module stack plus readout.
 
@@ -521,9 +523,13 @@ class DRCNet(nn.Module):
             action_mask: optional (B, n_actions) bool tensor, True = legal.
                 Masked logits are set to ``LOGIT_MASK_VALUE``.  This is an
                 environment adaptation, not part of [G19].
+            return_map: also return the spatial ``readout_map`` the heads read
+                from, so an auxiliary head can attach to it without duplicating
+                the readout.  Purely additive: the default return is unchanged.
 
         Returns:
-            ``(policy_logits (B, n_actions), value (B,), new_state)``.
+            ``(policy_logits (B, n_actions), value (B,), new_state)``, plus
+            ``readout_map (B, C, H, W)`` when ``return_map``.
         """
         _encoded, _ticks, readout_map, new_state = self.recurrent_trace(obs, state)
         hidden = F.relu(self.mlp(readout_map.flatten(1)))
@@ -533,6 +539,8 @@ class DRCNet(nn.Module):
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask, LOGIT_MASK_VALUE)
 
+        if return_map:
+            return logits, value, new_state, readout_map
         return logits, value, new_state
 
 

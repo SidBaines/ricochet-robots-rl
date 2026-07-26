@@ -189,6 +189,11 @@ class DRCTrainConfig:
     # set it explicitly. See the module docstring and
     # docs/Drc87MRestartCollapseInvestigation.md 6.1.
     bootstrap_on_truncation: Optional[bool] = None
+    # Auxiliary landing-cell loss (docs/DrcAuxLandingLossPlan.md). 0.0 = off, and
+    # off is bit-identical to a build without the feature (regression-tested).
+    # Supervises where each robot would stop per direction, from labels the env
+    # computes for free; the observation stays plane-free.
+    aux_landing_coef: float = 0.0
     # DRC network (paper defaults: DRC(3,3), 32 channels)
     drc_depth: int = 3
     drc_ticks: int = 3
@@ -343,6 +348,8 @@ def replay_sequences(
     masks: torch.Tensor,
     episode_starts: torch.Tensor,
     initial_state: DRCState,
+    *,
+    return_maps: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Replay stored sequences through the net (BPTT over the whole segment).
 
@@ -358,16 +365,26 @@ def replay_sequences(
         initial_state: DRCState with batch dim B (pre-reset segment state).
 
     Returns:
-        (logits (T, B, A), values (T, B)).
+        (logits (T, B, A), values (T, B)), plus the spatial readout maps
+        (T, B, C, H, W) when ``return_maps`` (for the auxiliary head).
     """
     state = initial_state
     logits_seq: List[torch.Tensor] = []
     values_seq: List[torch.Tensor] = []
+    maps_seq: List[torch.Tensor] = []
     for t in range(obs.shape[0]):
         state = DRCNet.reset_state(state, episode_starts[t])
-        logits, values, state = net(obs[t], state, action_mask=masks[t])
+        if return_maps:
+            logits, values, state, readout_map = net(
+                obs[t], state, action_mask=masks[t], return_map=True
+            )
+            maps_seq.append(readout_map)
+        else:
+            logits, values, state = net(obs[t], state, action_mask=masks[t])
         logits_seq.append(logits)
         values_seq.append(values)
+    if return_maps:
+        return torch.stack(logits_seq), torch.stack(values_seq), torch.stack(maps_seq)
     return torch.stack(logits_seq), torch.stack(values_seq)
 
 
@@ -389,6 +406,9 @@ class RolloutBuffer:
         self.values = torch.zeros((n_steps, num_envs), dtype=torch.float32, device=device)
         self.rewards = torch.zeros((n_steps, num_envs), dtype=torch.float32, device=device)
         self.episode_starts = torch.zeros((n_steps, num_envs), dtype=torch.bool, device=device)
+        # Auxiliary landing-cell targets: flat cell index per (robot, direction).
+        # Only filled when the aux loss is enabled.
+        self.landing: Optional[torch.Tensor] = None
         self.advantages: Optional[torch.Tensor] = None
         self.returns: Optional[torch.Tensor] = None
         # DRCState at the START of the segment, before any episode_starts[0]
@@ -426,6 +446,7 @@ class RecurrentPPO:
         adv_clip: Optional[float] = 10.0,
         clip_range_vf: Optional[float] = None,
         bootstrap_on_truncation: Optional[bool] = None,
+        aux_landing_coef: float = 0.0,
         device: str = "cpu",
         seed: int = 0,
     ) -> None:
@@ -506,6 +527,27 @@ class RecurrentPPO:
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=learning_rate)
         self._gen = torch.Generator().manual_seed(seed)  # minibatch shuffling
         self.num_timesteps = 0
+
+        # --- auxiliary landing-cell head (docs/DrcAuxLandingLossPlan.md) ------
+        # Supervises "where would each robot stop if it slid this way", the
+        # knowledge the 120M probes showed is NOT encoded (mid/long decodability
+        # sits BELOW a random-init control and declines through training).
+        # Labels come free from the env; the observation is untouched.
+        #
+        # The head lives OUTSIDE self.net with its OWN optimizer, deliberately:
+        # a mid-training arm must resume a checkpoint written without it, and
+        # this keeps net.state_dict() and the main Adam state byte-identical to
+        # the control arm's. Aux gradients still reach the shared trunk.
+        self.aux_landing_coef = float(aux_landing_coef)
+        self.aux_head: Optional[torch.nn.Module] = None
+        self.aux_optimizer: Optional[torch.optim.Optimizer] = None
+        if self.aux_landing_coef > 0.0:
+            self.aux_head = torch.nn.Conv2d(
+                net.hidden_channels, self.n_actions, kernel_size=1
+            ).to(self.device)
+            self.aux_optimizer = torch.optim.Adam(
+                self.aux_head.parameters(), lr=learning_rate
+            )
 
         obs0 = []
         for env in self.envs:
@@ -651,6 +693,10 @@ class RecurrentPPO:
         buf.initial_state = DRCState(
             h=self._state.h.detach().clone(), c=self._state.c.detach().clone()
         )
+        if self.aux_landing_coef > 0.0:
+            buf.landing = torch.zeros(
+                (self.n_steps, self.num_envs, self.n_actions), dtype=torch.long, device=self.device
+            )
         with torch.no_grad():
             for t in range(self.n_steps):
                 masks_np = np.stack([env.action_masks() for env in self.envs])
@@ -660,6 +706,11 @@ class RecurrentPPO:
                 buf.obs[t] = obs_t
                 buf.masks[t] = mask_t
                 buf.episode_starts[t] = ep_start_t
+                if buf.landing is not None:
+                    buf.landing[t] = torch.as_tensor(
+                        np.stack([env.landing_targets() for env in self.envs]),
+                        device=self.device,
+                    )
 
                 state_in = DRCNet.reset_state(self._state, ep_start_t)
                 logits, values, new_state = net(obs_t, state_in, action_mask=mask_t)
@@ -733,6 +784,7 @@ class RecurrentPPO:
         entropies: List[float] = []
         approx_kls: List[float] = []
         clip_fracs: List[float] = []
+        aux_losses: List[float] = []
         n_grad_updates = 0
         continue_training = True
 
@@ -743,9 +795,17 @@ class RecurrentPPO:
                 init = DRCState(
                     h=buf.initial_state.h[:, idx], c=buf.initial_state.c[:, idx]
                 )
-                logits, values = replay_sequences(
-                    self.net, buf.obs[:, idx], buf.masks[:, idx], buf.episode_starts[:, idx], init
-                )
+                want_maps = self.aux_head is not None
+                if want_maps:
+                    logits, values, maps = replay_sequences(
+                        self.net, buf.obs[:, idx], buf.masks[:, idx],
+                        buf.episode_starts[:, idx], init, return_maps=True,
+                    )
+                else:
+                    logits, values = replay_sequences(
+                        self.net, buf.obs[:, idx], buf.masks[:, idx],
+                        buf.episode_starts[:, idx], init,
+                    )
                 dist = Categorical(logits=logits.reshape(-1, self.n_actions))
                 actions = buf.actions[:, idx].reshape(-1)
                 new_log_prob = dist.log_prob(actions)
@@ -771,6 +831,22 @@ class RecurrentPPO:
                 )
                 loss = policy_loss - self.ent_coef * entropy + self.vf_coef * value_loss
 
+                aux_loss_value = 0.0
+                if self.aux_head is not None:
+                    # Per (robot, direction) pair, classify the landing cell over
+                    # the H*W grid -- the same formulation the landing probes
+                    # score, so aux loss and probe accuracy are comparable.
+                    t_len, n_seq = maps.shape[0], maps.shape[1]
+                    flat_maps = maps.reshape(t_len * n_seq, *maps.shape[2:])
+                    cell_logits = self.aux_head(flat_maps).flatten(2)  # (N, pairs, H*W)
+                    targets = buf.landing[:, idx].reshape(t_len * n_seq, self.n_actions)
+                    aux_loss = torch.nn.functional.cross_entropy(
+                        cell_logits.reshape(-1, cell_logits.shape[-1]), targets.reshape(-1)
+                    )
+                    loss = loss + self.aux_landing_coef * aux_loss
+                    aux_loss_value = float(aux_loss.detach())
+                aux_losses.append(aux_loss_value)
+
                 with torch.no_grad():
                     approx_kl = float(((ratio - 1.0) - log_ratio).mean())
                     clip_frac = float(((ratio - 1.0).abs() > self.clip_range).float().mean())
@@ -786,9 +862,16 @@ class RecurrentPPO:
                     break
 
                 self.optimizer.zero_grad()
+                if self.aux_optimizer is not None:
+                    self.aux_optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+                if self.aux_optimizer is not None:
+                    # Clipped separately: the head is not in net.parameters(), and
+                    # its own gradient must not eat the trunk's budget.
+                    torch.nn.utils.clip_grad_norm_(self.aux_head.parameters(), self.max_grad_norm)
+                    self.aux_optimizer.step()
                 n_grad_updates += 1
             if not continue_training:
                 break
@@ -812,6 +895,7 @@ class RecurrentPPO:
             "explained_variance": explained_variance,
             "n_grad_updates": n_grad_updates,
             "early_stop": not continue_training,
+            "aux_landing_loss": float(np.mean(aux_losses)) if aux_losses else 0.0,
         }
 
     # ------------------------------------------------------------------- learn
@@ -1004,6 +1088,31 @@ def _config_contract(config: DRCTrainConfig) -> Dict[str, object]:
     return {key: value for key, value in values.items() if key not in _RESUME_MUTABLE_CONFIG_FIELDS}
 
 
+def _contract_differences(stored: Dict[str, object], expected: Dict[str, object]) -> List[str]:
+    """Fields in which a stored config contract is incompatible with the current one.
+
+    Additive evolution is allowed: a field that did not exist when the checkpoint
+    was written is compatible **iff** the current config leaves it at its
+    default, i.e. the run behaves exactly as the checkpoint's build did. Set it
+    to anything else and the resume is refused, so the contract still pins the
+    semantics. Without this, adding any config field would make every existing
+    checkpoint unresumable -- which would have blocked the aux-loss arms from
+    continuing the 120M run at all.
+    """
+    defaults = {field.name: field.default for field in dataclasses.fields(DRCTrainConfig)}
+    changed: List[str] = []
+    for key in set(stored) | set(expected):
+        if key in stored and key in expected:
+            if stored[key] != expected[key]:
+                changed.append(key)
+        elif key not in stored:
+            if expected[key] != defaults.get(key):
+                changed.append(key)  # new field, actively set -> semantics differ
+        else:
+            changed.append(key)  # field removed from the config class
+    return sorted(changed)
+
+
 def _file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -1123,13 +1232,8 @@ def _load_training_checkpoint(
     if payload.get("kind") != "drc_training_state" or int(payload.get("schema_version", -1)) != 1:
         raise ValueError(f"Not a supported DRC training-state checkpoint: {path}")
     expected_contract = _config_contract(config)
-    if payload.get("config_contract") != expected_contract:
-        stored = payload.get("config_contract", {})
-        changed = sorted(
-            key
-            for key in set(stored) | set(expected_contract)
-            if stored.get(key) != expected_contract.get(key)
-        )
+    changed = _contract_differences(payload.get("config_contract", {}), expected_contract)
+    if changed:
         raise ValueError(f"Resume config contract changed in fields: {changed}")
     if not hasattr(sampler, "load_state_dict"):
         raise TypeError(f"Sampler {type(sampler).__name__} does not support exact resume")
@@ -1247,6 +1351,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         adv_clip=config.adv_clip,
         clip_range_vf=config.clip_range_vf,
         bootstrap_on_truncation=config.bootstrap_on_truncation,
+        aux_landing_coef=config.aux_landing_coef,
         device=device,
         seed=config.seed,
     )
