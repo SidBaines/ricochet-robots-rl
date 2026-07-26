@@ -194,6 +194,13 @@ class DRCTrainConfig:
     # Supervises where each robot would stop per direction, from labels the env
     # computes for free; the observation stays plane-free.
     aux_landing_coef: float = 0.0
+    # Contract fields this run may deliberately change relative to the checkpoint
+    # it resumes, e.g. ["aux_landing_coef"] to branch an experiment arm off a
+    # control checkpoint with a changed objective. Anything NOT listed here still
+    # refuses to load, so semantics can never drift silently -- but a declared,
+    # audited change is permitted. The resulting run is a BRANCH, not an exact
+    # continuation, and the trainer says so loudly at startup.
+    resume_allow_contract_change: Optional[Sequence[str]] = None
     # DRC network (paper defaults: DRC(3,3), 32 channels)
     drc_depth: int = 3
     drc_ticks: int = 3
@@ -1072,6 +1079,9 @@ _RESUME_MUTABLE_CONFIG_FIELDS = {
     "eval_batch_size",
     "wandb_project",
     "wandb_run_name",
+    # An operational declaration about THIS launch, not a property of the
+    # algorithm, so it must not move the contract fingerprint.
+    "resume_allow_contract_change",
 }
 
 
@@ -1233,8 +1243,21 @@ def _load_training_checkpoint(
         raise ValueError(f"Not a supported DRC training-state checkpoint: {path}")
     expected_contract = _config_contract(config)
     changed = _contract_differences(payload.get("config_contract", {}), expected_contract)
+    declared = set(config.resume_allow_contract_change or ())
+    undeclared = [key for key in changed if key not in declared]
+    if undeclared:
+        raise ValueError(
+            f"Resume config contract changed in fields: {undeclared}. If this is a "
+            "deliberate experiment branch rather than a resume, declare them in "
+            "resume_allow_contract_change."
+        )
     if changed:
-        raise ValueError(f"Resume config contract changed in fields: {changed}")
+        print(
+            "[drc] BRANCH, not an exact continuation: deliberately changed contract "
+            f"fields {sorted(changed)} relative to {path}. Curves before and after "
+            "this point are NOT the same experiment.",
+            flush=True,
+        )
     if not hasattr(sampler, "load_state_dict"):
         raise TypeError(f"Sampler {type(sampler).__name__} does not support exact resume")
     sampler.load_state_dict(payload["sampler_state"])

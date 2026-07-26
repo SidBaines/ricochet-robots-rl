@@ -508,6 +508,45 @@ def test_config_contract_allows_additive_fields_at_their_default_only():
     assert _contract_differences(older, enabled) == ["aux_landing_coef"]
     # ... and a genuine mismatch on a shared field is still caught.
     assert "horizon" in _contract_differences({**older, "horizon": 999}, current)
+    # The declaration itself is operational, not semantic: it must not move the
+    # fingerprint, or every branch would need its own contract.
+    declared = dataclasses.replace(_RESUME_CONFIG, resume_allow_contract_change=["x"])
+    assert _sha256_json(_config_contract(declared)) == _sha256_json(current)
+
+
+def test_deliberate_contract_change_requires_an_explicit_declaration(tmp_path):
+    """Branching an arm off a checkpoint with a changed objective must be declared.
+
+    A1 (aux loss) continues A0's checkpoint with a different objective. That is a
+    legitimate branch, but it is NOT an exact resume, so it has to be stated
+    rather than slipped through -- otherwise the contract stops meaning anything.
+    """
+    sampler, algo = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    algo.update(algo.collect_rollout(), progress_remaining=0.9)
+    checkpoint = tmp_path / "control.pt"
+    _save_training_checkpoint(
+        algo, sampler, _RESUME_CONFIG, checkpoint,
+        run_state={"elapsed_s": 1.0}, metadata={"test": True},
+    )
+    branched = dataclasses.replace(_RESUME_CONFIG, aux_landing_coef=1.0)
+
+    sampler2, algo2 = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    with pytest.raises(ValueError, match="resume_allow_contract_change"):
+        _load_training_checkpoint(checkpoint, algo=algo2, sampler=sampler2, config=branched)
+
+    declared = dataclasses.replace(branched, resume_allow_contract_change=["aux_landing_coef"])
+    sampler3, algo3 = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    _load_training_checkpoint(checkpoint, algo=algo3, sampler=sampler3, config=declared)
+    assert algo3.num_timesteps == algo.num_timesteps
+
+    # Declaring one field must not wave through a different one.
+    sneaky = dataclasses.replace(
+        branched, horizon=_RESUME_CONFIG.horizon + 1,
+        resume_allow_contract_change=["aux_landing_coef"],
+    )
+    sampler4, algo4 = _resume_fixture(device="cpu", env_seed=700, net_seed=9, algo_seed=5)
+    with pytest.raises(ValueError, match="horizon"):
+        _load_training_checkpoint(checkpoint, algo=algo4, sampler=sampler4, config=sneaky)
 
 
 # ------------------------------------------------- post-convergence hardening
