@@ -981,3 +981,39 @@ conclusion: (1) I called the hypothesis falsified off A1 alone when the 15pp dro
 was in fact a lambda artefact — A2 shows the cost is avoidable; (2) the plan
 pre-registered "decodability up + val flat/up" and A1 produced "up + down", which
 I initially read as a stronger falsification when it was really a dose effect.
+
+### Aux-loss screen COMPLETE — full result in docs/DrcAuxLandingLossResult.md
+
+Both A0 (control) and A2 (lambda=0.3) completed the full 15M arm to
+t=135,004,160. A1 (lambda=1.0) stopped early at 124,002,304 once its answer was
+clear.
+
+**Bottleneck hypothesis falsified.** A2 raised readout mid-band decodability by
+**+0.588** over the control (−0.032 → **+0.555**, raw accuracy 0.028 → ~0.60, aux
+cross-entropy 4.969 chance → 0.395) and performance did not improve: −0.0104 on
+the 480-suite endpoint (0.56 SE) and −0.0220 over 15 matched periodic evals
+(SE 0.0062). No systematic long-puzzle gain, which was the central prediction.
+
+**The control was load-bearing.** A0 gained **+2.7pp from plain training alone**
+(0.7708 → 0.7979; best periodic 0.81 → 0.84). Without it, A2's 0.7875 against the
+120M baseline would have read as the aux loss *helping by +1.7pp* when it is 1pp
+*behind* plain training. Exactly the false positive the plan warned about.
+
+**Dose response**: A2 ended with MORE knowledge installed than A1 (+0.555 vs
++0.365) at ~1/12 the cost (−0.01 vs −0.150). So the 15pp collapse at lambda=1.0
+is an optimisation transient from pushing a big auxiliary gradient through a
+shared trunk, not the price of the knowledge.
+
+**Harness trap found (§8 of the result doc, worth fixing):** a resumed branch that
+never beats its parent's `best_val_det` inherits `best_state_dict` via `run_state`
+and, with `report_eval_weights=best`, silently reports the PARENT's weights as its
+own final result. A2 wrote no `model_best.pt` at all and its report.json quoted
+v2's 118M number. Taken at face value that gave a spurious A2−A0 gap of −3.1pp,
+3x the real one. Fixed in analysis by evaluating each arm's own model_final.pt.
+
+**Retires** linear landing-cell decodability as a progress metric: it can be
+driven near ceiling without touching task performance.
+
+**Next**: extend the control to 200M (still improving, LR schedule 68% consumed);
+do NOT run the from-scratch aux arm; fix the keep-best inheritance trap before
+further branch arms.
