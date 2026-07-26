@@ -864,3 +864,46 @@ mattered are now removed, since that run is being scratched.
   (~1 GB across 256 envs for a content key), not compatibility, so the hard-break
   permission doesn't alter it.
 - 209 passed, 9 skipped.
+
+## 2026-07-26 — DRC plane-free v2 completed at 120M; aux-loss experiment planned
+
+Full review: `docs/DrcPlaneFree120MReview.md`. Plan: `docs/DrcAuxLandingLossPlan.md`.
+
+- **120,004,608 steps, 20.4 h.** Final validation (480 puzzles): **0.7667 det /
+  0.7743 stoch**; baselines random 0.141, target-only 0.243. Sealed test
+  **unopened**.
+- **The truncation-bootstrap fix held for the whole run.** `value_loss` stayed in
+  [0.076, 0.155] across all 120 eval rows; `explained_variance` rose 0.257 →
+  0.677; 3 target_kl early stops out of 46,876 updates. It ran 31M steps past the
+  point the corrupted attempt destroyed itself. The 96M battery pause is
+  invisible in the curve.
+- **Read 0.767, not the 0.810 `best_val_det`** — that is the max of ~120 draws on
+  a 200-puzzle suite (SE 0.031), i.e. selection bias; the independent 480-suite
+  scores those same weights at 0.767, matching the run's mean.
+- **Not converged at the stop**: window means still climbing (0.743 → 0.753 →
+  0.767, last-10 mean 0.776), LR schedule only 60% consumed. An extension is
+  defensible on the curve alone.
+- **vs P1**: 0.767 (val) vs 0.692 (P1 sealed test) — *different splits, not a
+  like-for-like headline*. But the shape is informative: v2 is slightly worse at
+  lengths 1–4 and much better at 6–8 (+18pp, +12pp, **+30pp at length 8**).
+  That is where recurrence should help.
+- **Probes: the ray-tracing circuit still does not form.** Blocked +0.586 and
+  short +0.168 over random-init control, but mid **−0.033** and long **−0.063** —
+  *below* control at every depth and tick, declining monotonically through
+  training (long readout 0.054 → 0.004). Replicates and strengthens the P1
+  finding. Same fixed 16k dataset (`e97ef31a…`) as P1 and the dead run.
+- **Tension to keep in view**: v2 is far better than P1 at long puzzles while
+  having *less* linearly-decodable long-slide knowledge than a random net. The
+  decodability→performance link is unestablished; the aux-loss arm tests it.
+- **Correction to my own earlier analysis**: I described the ConvLSTM as "fully
+  saturated" from abs-max. Wrong — abs-max is a 0.4% tail. Median |c| is 0.20,
+  mean tanh'(c) 0.82, only 2.7% of units effectively dead. The network is
+  **plastic**. Annotated in the investigation report; it does not affect the
+  causal conclusion there.
+- **Aux-loss plan**: mid-training screen (A0 control + A1 aux, 120M→135M, ~2.5 h
+  each) *before* any fresh 120M run, justified by the plasticity measurement. The
+  control arm is mandatory because the run had not converged. Prerequisites:
+  landing targets that don't change the obs, a separate optimizer for the new
+  head so the main Adam state resumes exactly, and additive config-contract
+  evolution. Log the policy-gradient share first — a new shared-trunk loss under
+  `max_grad_norm` is exactly the failure mode we just diagnosed.

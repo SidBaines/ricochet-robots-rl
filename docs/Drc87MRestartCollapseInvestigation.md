@@ -416,10 +416,19 @@ fit a diverging value target.
 
 This also explains the timing puzzle: `val_det` held at 0.755 through 88M (3.7%
 share is small but non-zero) and then fell off a cliff once the share reached
-~0.1%. And it explains the ConvLSTM saturation visible in the checkpoints —
-recurrent `c` absmax 27.9 (80M) → 33.6 (85M) → 52.6 (87M) → 44.3 (90M), with `h`
-absmax pinned at 0.99998, i.e. `tanh(c)` fully saturated, growing smoothly across
-the pause.
+~0.1%. The recurrent cell state also grows across the pause — `c` abs-max 27.9
+(80M) → 33.6 (85M) → 52.6 (87M) → 44.3 (90M) — smoothly, with no kink.
+
+> **Correction (2026-07-26).** An earlier version of this paragraph read that
+> abs-max as "`tanh(c)` fully saturated". That was an over-read of a tail
+> statistic. Measuring the *distribution* at 87M: median `|c|` is 0.263, mean
+> `tanh'(c)` is 0.819, and only **1.2%** of cell units are effectively dead
+> (`tanh'(c) < 0.01`). The healthy v2 run at 120M looks the same (median 0.200,
+> mean `tanh'` 0.816, 2.7% dead) despite a *larger* abs-max of 65.5. So abs-max
+> growth is a small tail, the bulk of the cell state stays in the high-gradient
+> regime, and saturation is **not** part of the failure mechanism. This does not
+> affect the causal conclusion, which rests on the reward corruption (§6.1) and
+> the measured gradient budget (§6 table), neither of which involves saturation.
 
 `clip_range_vf: null` means nothing bounds the per-update value change, so there
 is no brake anywhere in this loop. The module docstring already records this
