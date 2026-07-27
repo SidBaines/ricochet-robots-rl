@@ -1,8 +1,27 @@
-# Aux-loss experiment ARM A0 (CONTROL) -- docs/DrcAuxLandingLossPlan.md
-# Continues the completed 120M v2 run for 15M steps with NO auxiliary loss.
-# Mandatory control: v2 had not converged (+1.4pp per 20M), so any gain in the
-# aux arm must be measured against plain continued training, not against 120M.
-# Differs from A1 ONLY in the aux term.
+# PRIMARY LINE, continued to the pre-registered 200M horizon.
+#
+# History: v2 ran 0 -> 120M (docs/DrcPlaneFree120MReview.md). This run began as
+# arm A0, the no-aux CONTROL for the auxiliary landing-cell experiment
+# (docs/DrcAuxLandingLossResult.md), and continued 120M -> 135M unchanged. Since
+# the aux arms were not adopted, A0 IS the primary line and simply continues:
+# same run directory, one continuous curve.jsonl and probe series from 120M on.
+#
+# NOTE on the fingerprint: it reads d0932a4407a20f0b... here, not the v2-era
+# e7b3bf2186299ec0..., because adding aux_landing_coef to DRCTrainConfig widened
+# the contract's field set. The lineage is nonetheless a pure continuation --
+# _contract_differences reports NO differing fields, since the new field sits at
+# its default. This is the known cost of additive contract evolution: the check
+# is exact, but the fingerprint STRING is only comparable within one code
+# version. Compare fingerprints across commits only via _contract_differences.
+#
+# 2026-07-27: extended 135M -> 200M. Justification (review section 3, result
+# section 9): the run has not converged. A0 gained +2.7pp over its last 15M
+# (0.7708 -> 0.7979 on the 480-puzzle suite; best periodic 0.81 -> 0.84) and
+# schedule_total_steps has always been 200M, so the LR anneal now completes
+# exactly at the stop rather than being truncated at 68%.
+#
+# The run_name is kept as drc33_p1_aux_A0_control despite now being the primary
+# line: renaming would fork curve.jsonl and the retained snapshot series.
 bank_path: artifacts/groundup_bank_12x12/size-12x12_numR3_ET2_CL2.parquet
 out_dir: artifacts/groundup
 run_name: drc33_p1_aux_A0_control
@@ -18,7 +37,7 @@ num_envs: 256
 n_steps: 32
 batch_size: 2048
 n_epochs: 1
-total_steps: 135000000
+total_steps: 200000000
 schedule_total_steps: 200000000
 learning_rate: 0.0003
 learning_rate_final: 5.0e-05
@@ -54,7 +73,7 @@ final_eval_per_length: 60
 final_eval_episodes: 3
 eval_batch_size: 64
 checkpoint_every: 5000000
-resume_from: artifacts/groundup/drc33_p1_12x12_planefree_v2/training_120004608.pt
+resume_from: artifacts/groundup/drc33_p1_aux_A0_control/training_135004160.pt
 device: auto
 wandb_project: ricochet-robots-rl
 wandb_run_name: groundup-drc33-aux-A0-control
