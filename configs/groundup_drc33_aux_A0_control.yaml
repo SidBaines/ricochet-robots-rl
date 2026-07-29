@@ -73,7 +73,10 @@ final_eval_per_length: 60
 final_eval_episodes: 3
 eval_batch_size: 64
 checkpoint_every: 5000000
-resume_from: artifacts/groundup/drc33_p1_aux_A0_control/training_135004160.pt
+# PAUSED at t=190,005,248 (95% of the 200M target, ~1.8h of compute left).
+# Verified coherent iteration boundary; resume is bit-exact
+# (docs/Drc87MRestartCollapseInvestigation.md section 4).
+resume_from: artifacts/groundup/drc33_p1_aux_A0_control/training_pause_190005248.pt
 device: auto
 wandb_project: ricochet-robots-rl
 wandb_run_name: groundup-drc33-aux-A0-control
