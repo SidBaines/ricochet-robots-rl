@@ -17,7 +17,7 @@ import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -27,8 +27,8 @@ from .env import DOWN, LEFT, RIGHT, UP, EnvConfig, RicochetEnv
 from .puzzles import Puzzle
 
 
-DATASET_SCHEMA_VERSION = 1
-CAPTURE_PROTOCOL_VERSION = "drc-carry-trajectory-v1"
+DATASET_SCHEMA_VERSION = 2
+CAPTURE_PROTOCOL_VERSION = "drc-carry-trajectory-v2"
 SOLVER_PROTOCOL_VERSION = "canonical-unit-slide-bfs-first-action-union-v1"
 
 
@@ -475,6 +475,7 @@ def capture_carry_trajectories(
     rollout_seed: int = 0,
     recent_action_lags: int = 3,
     carry_dtype: np.dtype | type = np.float16,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, object]]:
     """Capture one masked deterministic full-start episode per puzzle.
 
@@ -564,7 +565,10 @@ def capture_carry_trajectories(
 
     try:
         with torch.no_grad():
+            progress_interval = max(1, (len(puzzles) + 9) // 10)
             for episode_id, puzzle in enumerate(puzzles):
+                if progress is not None and episode_id % progress_interval == 0:
+                    progress(f"Capturing puzzle {episode_id + 1}/{len(puzzles)}")
                 obs, _info = env.reset(
                     options={
                         "puzzle_index": episode_id,
@@ -759,6 +763,7 @@ def capture_carry_trajectories(
 
     known = arrays["exact_label_known"]
     reducing_known = arrays["reducing_label_known"]
+    random_architecture_signature = _network_signature(random_net)
     metadata: Dict[str, object] = {
         "schema_version": DATASET_SCHEMA_VERSION,
         "capture_protocol": CAPTURE_PROTOCOL_VERSION,
@@ -813,7 +818,8 @@ def capture_carry_trajectories(
         },
         "random_control": {
             "seed": getattr(random_net, "_carry_control_seed", None),
-            "architecture_fingerprint": _sha256_json(_network_signature(random_net)),
+            "architecture_fingerprint": _sha256_json(random_architecture_signature),
+            "architecture_signature": random_architecture_signature,
             "state_dict_sha256": _state_dict_fingerprint(random_net),
             "matched_to_trained": True,
             "trajectory_source": "trained_policy",
@@ -880,6 +886,50 @@ def _contract_differences(
 
 def validate_carry_dataset(arrays: Mapping[str, np.ndarray], metadata: Mapping[str, object]) -> None:
     """Validate row alignment and the strongest cheap capture invariants."""
+
+    try:
+        schema_version = int(metadata.get("schema_version", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Carry dataset schema_version is not an integer") from exc
+    if schema_version != DATASET_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported carry dataset schema {schema_version}; expected {DATASET_SCHEMA_VERSION}")
+    capture_protocol = metadata.get("capture_protocol")
+    if capture_protocol != CAPTURE_PROTOCOL_VERSION:
+        raise ValueError(
+            f"Unsupported carry capture protocol {capture_protocol!r}; expected {CAPTURE_PROTOCOL_VERSION!r}"
+        )
+    random_control = metadata.get("random_control")
+    if not isinstance(random_control, Mapping):
+        raise ValueError("Carry dataset random_control metadata is missing")
+    random_seed = random_control.get("seed")
+    if not isinstance(random_seed, int) or isinstance(random_seed, bool):
+        raise ValueError("Carry dataset random-control seed is missing")
+    architecture_signature = random_control.get("architecture_signature")
+    if not isinstance(architecture_signature, Mapping):
+        raise ValueError("Carry dataset random-control architecture signature is missing")
+    if random_control.get("architecture_fingerprint") != _sha256_json(architecture_signature):
+        raise ValueError("Carry dataset random-control architecture fingerprint is inconsistent")
+    state_dict_sha256 = random_control.get("state_dict_sha256")
+    if not isinstance(state_dict_sha256, str) or len(state_dict_sha256) != 64:
+        raise ValueError("Carry dataset random-control state_dict SHA-256 is missing")
+    try:
+        int(state_dict_sha256, 16)
+    except ValueError as exc:
+        raise ValueError("Carry dataset random-control state_dict SHA-256 is invalid") from exc
+    contract = metadata.get("contract")
+    if isinstance(contract, Mapping) and "random_control" in contract:
+        expected_random = contract["random_control"]
+        if not isinstance(expected_random, Mapping):
+            raise ValueError("Carry dataset contract.random_control is not an object")
+        differences = _contract_differences(
+            random_control,
+            expected_random,
+            prefix="contract.random_control",
+        )
+        if differences:
+            raise ValueError(
+                "Carry dataset random-control metadata disagrees with its contract: " + "; ".join(differences)
+            )
 
     required = {
         "obs",

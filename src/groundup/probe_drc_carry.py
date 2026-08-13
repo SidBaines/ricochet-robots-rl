@@ -16,17 +16,20 @@ Example::
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import warnings
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Sequence
+from typing import Callable, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -38,6 +41,8 @@ from .drc_carry import (
     CAPTURE_PROTOCOL_VERSION,
     DATASET_SCHEMA_VERSION,
     SolverContract,
+    _network_signature,
+    _state_dict_fingerprint,
     capture_carry_trajectories,
     load_carry_dataset,
     save_carry_dataset,
@@ -53,8 +58,12 @@ from .env import EnvConfig
 from .puzzles import Puzzle, joint_stratified_subset, load_puzzles
 
 
-RESULT_SCHEMA_VERSION = 1
-PROBE_PROTOCOL_VERSION = "drc-carry-controlled-probes-v1"
+RESULT_SCHEMA_VERSION = 2
+PROBE_PROTOCOL_VERSION = "drc-carry-controlled-probes-v2"
+RESULT_FINGERPRINT_PROTOCOL = "drc-carry-result-canonical-json-v1"
+DEFAULT_MAX_CARRY_BYTES = 1 << 30
+_CARRY_ARRAY_COUNT = 8  # trained/random x carry-in/out x h/c
+ProgressCallback = Optional[Callable[[str], None]]
 
 
 def _stable_seed(seed: int, *parts: str) -> int:
@@ -63,41 +72,9 @@ def _stable_seed(seed: int, *parts: str) -> int:
 
 
 def _network_architecture_contract(net: DRCNet) -> Dict[str, object]:
-    return {
-        "class": f"{type(net).__module__}.{type(net).__qualname__}",
-        "observation_shape": list(net.observation_shape),
-        "n_actions": int(net.n_actions),
-        "depth": int(net.depth),
-        "ticks": int(net.ticks),
-        "hidden_channels": int(net.hidden_channels),
-        "encoder_relu": bool(net.encoder_relu),
-        "encoder_skip": bool(net.encoder_skip),
-        "encoder": [
-            {
-                "in_channels": int(layer.in_channels),
-                "out_channels": int(layer.out_channels),
-                "kernel_size": list(layer.kernel_size),
-                "stride": list(layer.stride),
-            }
-            for layer in net.encoder
-        ],
-        "cells": [
-            {
-                "input_channels": int(cell.input_channels),
-                "hidden_channels": int(cell.hidden_channels),
-                "kernel_size": int(cell.kernel_size),
-                "pool_and_inject": bool(cell.pool_and_inject),
-                "pool_projection": str(cell.pool_projection),
-                "output_activation": str(cell.output_activation),
-                "forget_bias": float(cell.forget_bias),
-                "fence": str(cell.fence),
-            }
-            for cell in net.cells
-        ],
-        "mlp_in_features": int(net.mlp.in_features),
-        "mlp_out_features": int(net.mlp.out_features),
-        "state_dict_shapes": {name: list(value.shape) for name, value in net.state_dict().items()},
-    }
+    # Capture and orchestration deliberately share one exact architecture
+    # signature implementation so their fingerprints cannot drift.
+    return _network_signature(net)
 
 
 def build_random_control(
@@ -118,6 +95,103 @@ def build_random_control(
     net.to(torch.device(device))
     net._carry_control_seed = int(seed)  # provenance only; not part of state_dict
     return net
+
+
+def _random_control_contract(net: DRCNet, *, seed: int) -> Dict[str, object]:
+    """Return the freshly measured random-network identity used for reuse."""
+
+    recorded_seed = getattr(net, "_carry_control_seed", None)
+    if recorded_seed is None or int(recorded_seed) != int(seed):
+        raise ValueError("random_network_seed does not match the realized random control's provenance seed")
+    signature = _network_architecture_contract(net)
+    return {
+        "seed": int(seed),
+        "architecture_fingerprint": _sha256_json(signature),
+        "architecture_signature": signature,
+        "state_dict_sha256": _state_dict_fingerprint(net),
+    }
+
+
+def _human_bytes(value: int) -> str:
+    amount = float(value)
+    for suffix in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024.0 or suffix == "TiB":
+            return f"{amount:.2f} {suffix}"
+        amount /= 1024.0
+    raise AssertionError("unreachable")
+
+
+def carry_payload_preflight(
+    net: DRCNet,
+    *,
+    puzzle_count: int,
+    horizon: int,
+    carry_dtype: str,
+    max_carry_bytes: int = DEFAULT_MAX_CARRY_BYTES,
+    allow_large_dataset: bool = False,
+) -> Dict[str, object]:
+    """Estimate the eight carry arrays' upper-bound payload and enforce a cap.
+
+    The estimate intentionally uses ``puzzle_count * horizon`` rows, even when
+    deterministic episodes are likely to terminate earlier. It covers only
+    trained/random carry-in/out h/c arrays; observations, labels, compression,
+    probe tensors, concatenated representations, and transient peaks are extra.
+    """
+
+    if puzzle_count < 1 or horizon < 1:
+        raise ValueError("puzzle_count and horizon must both be positive")
+    if max_carry_bytes < 1:
+        raise ValueError("max_carry_bytes must be positive")
+    if carry_dtype not in {"float16", "float32"}:
+        raise ValueError("carry_dtype must be float16 or float32")
+    device = next(net.parameters()).device
+    state = net.initial_state(1, device=device)
+    if state.h.shape != state.c.shape or state.h.ndim != 5 or state.h.shape[1] != 1:
+        raise ValueError("DRC initial state must have matching (D,1,C,H,W) h/c tensors")
+    per_row_shape = [int(state.h.shape[0]), *map(int, state.h.shape[2:])]
+    upper_bound_rows = int(puzzle_count) * int(horizon)
+    scalar_count = int(np.prod(per_row_shape, dtype=np.int64))
+    itemsize = int(np.dtype(carry_dtype).itemsize)
+    estimated_bytes = upper_bound_rows * scalar_count * itemsize * _CARRY_ARRAY_COUNT
+    exceeds_limit = estimated_bytes > int(max_carry_bytes)
+    override_used = bool(exceeds_limit and allow_large_dataset)
+    estimate: Dict[str, object] = {
+        "protocol": "carry-eight-array-upper-bound-v1",
+        "upper_bound_rows": upper_bound_rows,
+        "puzzle_count": int(puzzle_count),
+        "horizon": int(horizon),
+        "carry_shape_per_row": per_row_shape,
+        "carry_array_count": _CARRY_ARRAY_COUNT,
+        "carry_dtype": carry_dtype,
+        "bytes_per_scalar": itemsize,
+        "estimated_carry_bytes": int(estimated_bytes),
+        "estimated_carry_human": _human_bytes(estimated_bytes),
+        "max_carry_bytes": int(max_carry_bytes),
+        "max_carry_human": _human_bytes(max_carry_bytes),
+        "within_limit": not exceeds_limit,
+        "override_used": override_used,
+        "scope": (
+            "Upper bound for trained/random carry-in/out h/c arrays only; "
+            "observations, labels, compression, probes, and transient peaks are excluded."
+        ),
+    }
+    if exceeds_limit and not allow_large_dataset:
+        raise ValueError(
+            "Estimated carry payload "
+            f"{_human_bytes(estimated_bytes)} exceeds --max-carry-bytes "
+            f"{_human_bytes(max_carry_bytes)}; reduce the suite/horizon, raise the cap, "
+            "or pass --allow-large-dataset explicitly"
+        )
+    if override_used:
+        warnings.warn(
+            "Estimated carry payload "
+            f"{_human_bytes(estimated_bytes)} exceeds the configured "
+            f"{_human_bytes(max_carry_bytes)} limit; continuing because "
+            "--allow-large-dataset was supplied",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return estimate
 
 
 def load_schema2_checkpoint(
@@ -531,39 +605,32 @@ def shuffle_training_labels(
     }
 
 
-class _MultiTaskProbe(nn.Module):
+class _TargetProbe(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        targets: Mapping[str, ProbeTarget],
+        target: ProbeTarget,
         *,
         family: str,
         hidden_size: int,
     ) -> None:
         super().__init__()
+        output_dim = target.n_outputs if target.kind in {"multiclass", "multilabel"} else 1
         if family == "linear":
-            self.backbone = nn.Identity()
-            width = input_dim
+            self.network = nn.Linear(input_dim, output_dim)
         elif family == "mlp":
             if hidden_size < 1:
                 raise ValueError("hidden_size must be positive")
-            self.backbone = nn.Sequential(nn.Linear(input_dim, hidden_size), nn.ReLU())
-            width = hidden_size
+            self.network = nn.Sequential(
+                nn.Linear(input_dim, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, output_dim),
+            )
         else:
             raise ValueError(f"Probe family must be 'linear' or 'mlp', got {family!r}")
-        self.heads = nn.ModuleDict(
-            {
-                name: nn.Linear(
-                    width,
-                    target.n_outputs if target.kind in {"multiclass", "multilabel"} else 1,
-                )
-                for name, target in targets.items()
-            }
-        )
 
-    def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
-        hidden = self.backbone(features)
-        return {name: head(hidden) for name, head in self.heads.items()}
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.network(features)
 
 
 def _metric(value: Optional[float], reason: Optional[str] = None) -> Dict[str, object]:
@@ -576,10 +643,10 @@ def _metric(value: Optional[float], reason: Optional[str] = None) -> Dict[str, o
 
 def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, object]:
     if len(y_true) < 2:
-        return _metric(None, "fewer than two applicable test rows")
+        return _metric(None, "fewer than two applicable evaluation rows")
     total = float(np.sum((y_true - y_true.mean()) ** 2))
     if total <= 0.0:
-        return _metric(None, "test target has zero variance")
+        return _metric(None, "evaluation target has zero variance")
     residual = float(np.sum((y_true - y_pred) ** 2))
     return _metric(1.0 - residual / total)
 
@@ -587,7 +654,7 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, object]:
 def _balanced_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, object]:
     classes = np.unique(y_true)
     if len(classes) < 2:
-        return _metric(None, "test target contains only one class")
+        return _metric(None, "evaluation target contains only one class")
     recalls = [float(np.mean(y_pred[y_true == cls] == cls)) for cls in classes]
     return _metric(float(np.mean(recalls)))
 
@@ -596,7 +663,7 @@ def _roc_auc(y_true: np.ndarray, scores: np.ndarray) -> Dict[str, object]:
     y_true = y_true.astype(bool)
     positives, negatives = int(y_true.sum()), int((~y_true).sum())
     if positives == 0 or negatives == 0:
-        return _metric(None, "ROC-AUC requires both test classes")
+        return _metric(None, "ROC-AUC requires both evaluation classes")
     order = np.argsort(scores, kind="mergesort")
     sorted_scores = scores[order]
     ranks = np.empty(len(scores), dtype=np.float64)
@@ -642,7 +709,7 @@ def _target_metrics(
         top_in_set = truth[np.arange(len(truth)), top]
         top_metric = _metric(float(top_in_set[positive_rows].mean()))
     else:
-        top_metric = _metric(None, "no test row has a positive action in its exact set")
+        top_metric = _metric(None, "no evaluated row has a positive action in its exact set")
     true_positive = int(np.sum(prediction & truth))
     false_positive = int(np.sum(prediction & ~truth))
     false_negative = int(np.sum(~prediction & truth))
@@ -671,6 +738,189 @@ def _undefined_metrics(target: ProbeTarget, reason: str) -> Dict[str, Dict[str, 
     return {name: _metric(None, reason) for name in names}
 
 
+def _class_histogram(values: np.ndarray, *, classes: int) -> Dict[str, int]:
+    flattened = np.asarray(values, dtype=np.int64).reshape(-1)
+    return {str(label): int(np.sum(flattened == label)) for label in range(classes)}
+
+
+def _target_summary(target: ProbeTarget, values: np.ndarray) -> Dict[str, object]:
+    values = np.asarray(values)
+    n_rows = int(len(values))
+    if target.kind in {"binary", "multiclass"}:
+        classes = 2 if target.kind == "binary" else target.n_outputs
+        histogram = _class_histogram(values, classes=classes)
+        return {
+            "n_applicable": n_rows,
+            "class_histogram": histogram,
+            "observed_class_count": int(sum(count > 0 for count in histogram.values())),
+        }
+    if target.kind == "regression":
+        reason = "no applicable finite rows"
+        flattened = values.astype(np.float64).reshape(-1)
+        if n_rows:
+            mean = _metric(float(np.mean(flattened)))
+            std = _metric(float(np.std(flattened)))
+            median = _metric(float(np.median(flattened)))
+        else:
+            mean = _metric(None, reason)
+            std = _metric(None, reason)
+            median = _metric(None, reason)
+        return {
+            "n_applicable_finite": n_rows,
+            "mean": mean,
+            "std": std,
+            "median": median,
+        }
+
+    matrix = values.astype(bool).reshape(n_rows, target.n_outputs)
+    if n_rows:
+        positive_count = matrix.sum(axis=0, dtype=np.int64)
+        prevalence = positive_count.astype(np.float64) / n_rows
+        cardinality = matrix.sum(axis=1, dtype=np.int64).astype(np.float64)
+        prevalence_reason = None
+        cardinality_summary = {
+            "mean": _metric(float(np.mean(cardinality))),
+            "std": _metric(float(np.std(cardinality))),
+            "median": _metric(float(np.median(cardinality))),
+        }
+    else:
+        positive_count = np.zeros(target.n_outputs, dtype=np.int64)
+        prevalence = np.full(target.n_outputs, np.nan)
+        prevalence_reason = "no applicable rows"
+        cardinality_summary = {
+            statistic: _metric(None, "no applicable rows") for statistic in ("mean", "std", "median")
+        }
+    return {
+        "n_applicable": n_rows,
+        "positive_count": {str(label): int(positive_count[label]) for label in range(target.n_outputs)},
+        "prevalence": {str(label): (float(prevalence[label]) if n_rows else None) for label in range(target.n_outputs)},
+        "prevalence_reason": prevalence_reason,
+        "cardinality": cardinality_summary,
+    }
+
+
+def _no_skill_baseline(
+    target: ProbeTarget,
+    train_values: np.ndarray,
+    test_values: np.ndarray,
+) -> Dict[str, object]:
+    train_values = np.asarray(train_values)
+    test_values = np.asarray(test_values)
+    if target.kind in {"binary", "multiclass"}:
+        reason = "no applicable training rows"
+        if len(train_values):
+            classes = 2 if target.kind == "binary" else target.n_outputs
+            histogram = _class_histogram(train_values, classes=classes)
+            majority_class = min(
+                range(classes),
+                key=lambda label: (-histogram[str(label)], label),
+            )
+            if len(test_values):
+                truth = test_values.astype(np.int64).reshape(-1)
+                prediction = np.full(len(truth), majority_class, dtype=np.int64)
+                metrics = {
+                    "accuracy": _metric(float(np.mean(prediction == truth))),
+                    "balanced_accuracy": _balanced_accuracy(truth, prediction),
+                }
+            else:
+                metrics = {name: _metric(None, "no applicable test rows") for name in ("accuracy", "balanced_accuracy")}
+            majority_reason = None
+        else:
+            majority_class = None
+            majority_reason = reason
+            metrics = {name: _metric(None, reason) for name in ("accuracy", "balanced_accuracy")}
+        return {
+            "strategy": "training_majority_class",
+            "majority_class": majority_class,
+            "majority_class_reason": majority_reason,
+            "tie_break": "smallest numeric class",
+            "metrics": metrics,
+            "test_data_used_for_selection": False,
+        }
+
+    if target.kind == "regression":
+        if len(train_values):
+            train_mean = float(np.mean(train_values.astype(np.float64)))
+            predicted_value = _metric(train_mean)
+            if len(test_values):
+                truth = test_values.astype(np.float64).reshape(-1)
+                prediction = np.full(len(truth), train_mean, dtype=np.float64)
+                metrics = _target_metrics(target, truth, prediction)
+            else:
+                metrics = _undefined_metrics(target, "no applicable test rows")
+        else:
+            predicted_value = _metric(None, "no applicable training rows")
+            metrics = _undefined_metrics(target, "no applicable training rows")
+        return {
+            "strategy": "training_mean",
+            "predicted_value": predicted_value,
+            "metrics": metrics,
+            "test_data_used_for_selection": False,
+        }
+
+    if len(train_values):
+        prevalence = train_values.astype(np.float64).mean(axis=0)
+        predicted_prevalence = {str(label): float(prevalence[label]) for label in range(target.n_outputs)}
+        prevalence_reason = None
+        if len(test_values):
+            # _target_metrics thresholds at zero and uses argmax. Centered
+            # prevalence therefore implements a fixed >=0.5 prediction while
+            # retaining the most prevalent label for top-1.
+            scores = np.broadcast_to(prevalence - 0.5, (len(test_values), target.n_outputs))
+            metrics = _target_metrics(target, test_values, scores)
+        else:
+            metrics = _undefined_metrics(target, "no applicable test rows")
+    else:
+        predicted_prevalence = {str(label): None for label in range(target.n_outputs)}
+        prevalence_reason = "no applicable training rows"
+        metrics = _undefined_metrics(target, prevalence_reason)
+    return {
+        "strategy": "per_label_training_prevalence",
+        "predicted_prevalence": predicted_prevalence,
+        "predicted_prevalence_reason": prevalence_reason,
+        "decision_threshold": 0.5,
+        "top1_tie_break": "smallest label index",
+        "metrics": metrics,
+        "test_data_used_for_selection": False,
+    }
+
+
+def _prediction_sha256(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(np.asarray(value))
+    digest = hashlib.sha256()
+    digest.update(array.dtype.str.encode("ascii"))
+    digest.update(json.dumps(list(array.shape), separators=(",", ":")).encode("ascii"))
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _target_loss(target: ProbeTarget, prediction: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+    if target.kind == "regression":
+        return F.mse_loss(prediction.squeeze(-1), truth)
+    if target.kind == "multiclass":
+        return F.cross_entropy(prediction, truth)
+    if target.kind == "binary":
+        return F.binary_cross_entropy_with_logits(prediction.squeeze(-1), truth)
+    return F.binary_cross_entropy_with_logits(prediction, truth)
+
+
+def _validate_target_values(target: ProbeTarget, applicable: np.ndarray) -> None:
+    values = np.asarray(target.values)
+    selected = values[applicable]
+    if target.kind == "regression":
+        return
+    if target.kind == "multiclass":
+        if len(selected) and (int(selected.min()) < 0 or int(selected.max()) >= target.n_outputs):
+            raise ValueError(f"Target {target.name!r} has a class outside its vocabulary")
+        return
+    if target.kind == "binary":
+        if len(selected) and not np.isin(selected, [0, 1]).all():
+            raise ValueError(f"Binary target {target.name!r} contains a value outside 0/1")
+        return
+    if len(selected) and not np.isin(selected, [0, 1, False, True]).all():
+        raise ValueError(f"Multilabel target {target.name!r} contains a value outside 0/1")
+
+
 def fit_probe_family(
     features: np.ndarray,
     targets: Mapping[str, ProbeTarget],
@@ -684,8 +934,16 @@ def fit_probe_family(
     seed: int = 0,
     device: str = "cpu",
     evaluation_targets: Optional[Mapping[str, ProbeTarget]] = None,
+    training_label_source: str = "provided_labels",
+    evaluation_label_source: str = "provided_labels",
 ) -> Dict[str, object]:
-    """Fit one shared representation with separate typed heads."""
+    """Fit one wholly independent model and optimizer per target.
+
+    Feature normalization is shared immutable input preprocessing. Parameters,
+    gradients, optimizers, minibatch permutations, and losses are target-local.
+    A target's derived seed depends only on the fit seed and target name, making
+    same-target controls exactly paired and target iteration order irrelevant.
+    """
 
     if epochs < 1 or batch_size < 1 or learning_rate <= 0:
         raise ValueError("Probe epochs/batch_size/lr must all be positive")
@@ -723,96 +981,93 @@ def fit_probe_family(
     normalised = (x - mean) / std
     target_device = torch.device(device)
     x_tensor = torch.as_tensor(normalised, device=target_device)
-    train_tensors: Dict[str, torch.Tensor] = {}
-    applicable_tensors: Dict[str, torch.Tensor] = {}
-    regression_scale: Dict[str, tuple[float, float]] = {}
+    target_results: Dict[str, object] = {}
     for name, target in targets.items():
-        values = np.asarray(target.values)
-        applicable = np.asarray(target.applicable, dtype=bool)
-        applicable_train = train[applicable[train]]
+        eval_target = evaluation_targets[name]
+        train_applicable = np.asarray(target.applicable, dtype=bool).copy()
+        test_applicable = np.asarray(eval_target.applicable, dtype=bool).copy()
         if target.kind == "regression":
-            finite = applicable & np.isfinite(values)
-            applicable = finite
-            applicable_train = train[applicable[train]]
-            if len(applicable_train):
-                centre = float(np.mean(values[applicable_train]))
-                scale = float(np.std(values[applicable_train]))
+            train_applicable &= np.isfinite(np.asarray(target.values))
+            test_applicable &= np.isfinite(np.asarray(eval_target.values))
+        _validate_target_values(target, train_applicable)
+        _validate_target_values(eval_target, test_applicable)
+        train_rows = train[train_applicable[train]]
+        test_rows = test[test_applicable[test]]
+        n_train, n_test = int(len(train_rows)), int(len(test_rows))
+
+        values = np.asarray(target.values)
+        if target.kind == "regression":
+            if n_train:
+                centre = float(np.mean(values[train_rows]))
+                scale = float(np.std(values[train_rows]))
                 if scale < 1e-6:
                     scale = 1.0
             else:
                 centre, scale = 0.0, 1.0
-            regression_scale[name] = (centre, scale)
             encoded = (values.astype(np.float32) - centre) / scale
             encoded[~np.isfinite(encoded)] = 0.0
-            train_tensors[name] = torch.as_tensor(encoded, device=target_device)
-        elif target.kind == "multilabel":
-            train_tensors[name] = torch.as_tensor(values.astype(np.float32), device=target_device)
-        elif target.kind == "binary":
-            train_tensors[name] = torch.as_tensor(values.astype(np.float32), device=target_device)
+            truth_tensor = torch.as_tensor(encoded, device=target_device)
+        elif target.kind == "multiclass":
+            centre, scale = 0.0, 1.0
+            truth_tensor = torch.as_tensor(values.astype(np.int64), device=target_device)
         else:
-            if applicable.any() and (
-                int(values[applicable].min()) < 0 or int(values[applicable].max()) >= target.n_outputs
-            ):
-                raise ValueError(f"Target {name!r} has a class outside its vocabulary")
-            train_tensors[name] = torch.as_tensor(values.astype(np.int64), device=target_device)
-        applicable_tensors[name] = torch.as_tensor(applicable, device=target_device)
+            centre, scale = 0.0, 1.0
+            truth_tensor = torch.as_tensor(values.astype(np.float32), device=target_device)
 
-    with torch.random.fork_rng(devices=[]):
-        torch.random.default_generator.manual_seed(int(seed))
-        model = _MultiTaskProbe(x.shape[1], targets, family=family, hidden_size=hidden_size)
-    model.to(target_device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    rng = np.random.default_rng(int(seed))
-    final_losses: list[float] = []
-    model.train()
-    for _epoch in range(epochs):
-        epoch_losses: list[float] = []
-        order = rng.permutation(train)
-        for start in range(0, len(order), batch_size):
-            batch_np = order[start : start + batch_size]
-            batch = torch.as_tensor(batch_np, device=target_device)
-            outputs = model(x_tensor[batch])
-            losses: list[torch.Tensor] = []
-            for name, target in targets.items():
-                applicable = applicable_tensors[name][batch]
-                if not bool(applicable.any()):
-                    continue
-                prediction = outputs[name][applicable]
-                truth = train_tensors[name][batch][applicable]
-                if target.kind == "regression":
-                    loss = F.mse_loss(prediction.squeeze(-1), truth)
-                elif target.kind == "multiclass":
-                    loss = F.cross_entropy(prediction, truth)
-                elif target.kind == "binary":
-                    loss = F.binary_cross_entropy_with_logits(prediction.squeeze(-1), truth)
-                else:
-                    loss = F.binary_cross_entropy_with_logits(prediction, truth)
-                losses.append(loss)
-            if not losses:
-                continue
-            total_loss = torch.stack(losses).mean()
-            optimizer.zero_grad(set_to_none=True)
-            total_loss.backward()
-            optimizer.step()
-            epoch_losses.append(float(total_loss.detach().cpu()))
-        final_losses = epoch_losses
-    if final_losses and not np.isfinite(final_losses).all():
-        raise RuntimeError("Probe training produced a non-finite loss")
+        target_seed = _stable_seed(seed, "isolated-target", name)
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(target_seed)
+            model = _TargetProbe(
+                x.shape[1],
+                target,
+                family=family,
+                hidden_size=hidden_size,
+            )
+        initial_state_sha256 = _state_dict_fingerprint(model)
+        model.to(target_device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        rng = np.random.default_rng(target_seed)
+        order_digest = hashlib.sha256()
+        order_digest.update(b"isolated-target-minibatches-v1")
+        losses: list[float] = []
+        model.train()
+        if n_train:
+            for epoch in range(epochs):
+                order = rng.permutation(train_rows)
+                order_digest.update(np.asarray([epoch, len(order)], dtype="<i8").tobytes())
+                order_digest.update(np.asarray(order, dtype="<i8").tobytes())
+                for start in range(0, len(order), batch_size):
+                    batch = torch.as_tensor(order[start : start + batch_size], device=target_device)
+                    prediction = model(x_tensor[batch])
+                    loss = _target_loss(target, prediction, truth_tensor[batch])
+                    loss_value = float(loss.detach().cpu())
+                    if not np.isfinite(loss_value):
+                        raise RuntimeError(f"Probe target {name!r} produced a non-finite training loss")
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+                    losses.append(loss_value)
+        final_state_sha256 = _state_dict_fingerprint(model)
 
-    model.eval()
-    with torch.no_grad():
-        raw = {name: value.detach().cpu().numpy() for name, value in model(x_tensor[test]).items()}
-    if any(not np.isfinite(value).all() for value in raw.values()):
-        raise RuntimeError("Probe training produced non-finite test predictions")
-    target_results: Dict[str, object] = {}
-    for name, target in targets.items():
-        eval_target = evaluation_targets[name]
-        train_mask = np.asarray(target.applicable, dtype=bool)[train]
-        test_mask = np.asarray(eval_target.applicable, dtype=bool)[test]
+        model.eval()
+        with torch.no_grad():
+            raw_train = model(x_tensor[train_rows]).detach().cpu().numpy()
+            raw_test = model(x_tensor[test_rows]).detach().cpu().numpy()
+        if not np.isfinite(raw_train).all() or not np.isfinite(raw_test).all():
+            raise RuntimeError(f"Probe target {name!r} produced non-finite predictions")
         if target.kind == "regression":
-            train_mask &= np.isfinite(np.asarray(target.values)[train])
-            test_mask &= np.isfinite(np.asarray(eval_target.values)[test])
-        n_train, n_test = int(train_mask.sum()), int(test_mask.sum())
+            train_prediction = raw_train.reshape(-1) * scale + centre
+            test_prediction = raw_test.reshape(-1) * scale + centre
+        else:
+            train_prediction = raw_train
+            test_prediction = raw_test
+
+        train_values = np.asarray(target.values)[train_rows]
+        test_values = np.asarray(eval_target.values)[test_rows]
+        if n_train:
+            train_metrics = _target_metrics(target, train_values, train_prediction)
+        else:
+            train_metrics = _undefined_metrics(target, "no applicable training rows")
         if n_train == 0:
             status, reason = "skipped", "no applicable training rows"
             metrics = _undefined_metrics(target, reason)
@@ -821,14 +1076,7 @@ def fit_probe_family(
             metrics = _undefined_metrics(target, reason)
         else:
             status, reason = "fitted", None
-            prediction = raw[name][test_mask]
-            if target.kind == "regression":
-                centre, scale = regression_scale[name]
-                prediction = prediction * scale + centre
-            truth = np.asarray(eval_target.values)[test][test_mask]
-            metrics = _target_metrics(target, truth, prediction)
-        train_values = np.asarray(target.values)[train][train_mask]
-        test_values = np.asarray(eval_target.values)[test][test_mask]
+            metrics = _target_metrics(target, test_values, test_prediction)
         if target.kind in {"binary", "multiclass"}:
             train_class_count = int(len(np.unique(train_values))) if n_train else 0
             test_class_count = int(len(np.unique(test_values))) if n_test else 0
@@ -845,7 +1093,38 @@ def fit_probe_family(
             "test_coverage": float(n_test / len(test)),
             "train_class_count": train_class_count,
             "test_class_count": test_class_count,
+            "label_sources": {
+                "train": training_label_source,
+                "test": evaluation_label_source,
+            },
+            "target_summary": {
+                "train": _target_summary(target, train_values),
+                "test": _target_summary(eval_target, test_values),
+            },
+            "no_skill_baseline": _no_skill_baseline(target, train_values, test_values),
+            "train_metrics": train_metrics,
             "metrics": metrics,
+            "final_training_loss": float(losses[-1]) if losses else None,
+            "training_diagnostics": {
+                "isolation": "independent_model_optimizer_batches_and_loss",
+                "seed": int(target_seed),
+                "optimizer": "Adam",
+                "initial_state_sha256": initial_state_sha256,
+                "final_state_sha256": final_state_sha256,
+                "minibatch_order_sha256": order_digest.hexdigest(),
+                "train_prediction_sha256": _prediction_sha256(train_prediction),
+                "test_prediction_sha256": _prediction_sha256(test_prediction),
+                "loss_curve_summary": {
+                    "initial": float(losses[0]) if losses else None,
+                    "final": float(losses[-1]) if losses else None,
+                    "best": float(min(losses)) if losses else None,
+                    "finite": bool(np.isfinite(losses).all()),
+                    "epochs": int(epochs if n_train else 0),
+                    "requested_epochs": int(epochs),
+                    "batches": int(len(losses)),
+                    "reason": None if losses else "no applicable training rows",
+                },
+            },
         }
     return {
         "family": family,
@@ -855,7 +1134,8 @@ def fit_probe_family(
         "batch_size": int(batch_size),
         "learning_rate": float(learning_rate),
         "seed": int(seed),
-        "final_training_loss": (float(np.mean(final_losses)) if final_losses else None),
+        "target_isolation": "one complete model and optimizer per target",
+        "epoch_selection": "fixed epochs; no test data used for selection",
         "targets": target_results,
     }
 
@@ -891,6 +1171,7 @@ def run_controlled_probes(
     learning_rate: float,
     hidden_size: int,
     device: str,
+    progress: ProgressCallback = None,
 ) -> tuple[Dict[str, object], Dict[str, object], Dict[str, object]]:
     targets = build_probe_targets(arrays, metadata)
     for name, target in targets.items():
@@ -926,17 +1207,30 @@ def run_controlled_probes(
             results[representation][family] = {}
             fit_manifest[representation][family] = {}
             controls = {
-                "trained": (trained_features, targets, targets),
-                "random_network": (random_features, targets, targets),
+                "trained": (trained_features, targets, targets, "original_labels"),
+                "random_network": (random_features, targets, targets, "original_labels"),
                 # The explicit evaluation target map makes untouched test
                 # labels a call-site contract, not merely a shuffle helper detail.
-                "shuffled_labels": (trained_features, shuffled_targets, targets),
+                "shuffled_labels": (
+                    trained_features,
+                    shuffled_targets,
+                    targets,
+                    "shuffled_training_labels",
+                ),
             }
-            for control, (features, training_targets, evaluation_targets) in controls.items():
-                # Controls with the same representation/family use identical
-                # probe initialization and minibatch order; only the declared
-                # feature/label control differs.
+            for control, (
+                features,
+                training_targets,
+                evaluation_targets,
+                training_label_source,
+            ) in controls.items():
+                # Target-specific seeds are derived inside fit_probe_family.
+                # Thus the same representation/family/target is initialized
+                # and batched identically across all three controls, while no
+                # target shares a model, optimizer, gradient, batch, or loss.
                 local_seed = _stable_seed(probe_seed, representation, family)
+                if progress is not None:
+                    progress(f"Fitting {representation}/{family}/{control}: {len(training_targets)} isolated targets")
                 fit = fit_probe_family(
                     features,
                     training_targets,
@@ -949,6 +1243,8 @@ def run_controlled_probes(
                     hidden_size=hidden_size,
                     seed=local_seed,
                     device=device,
+                    training_label_source=training_label_source,
+                    evaluation_label_source="original_labels",
                 )
                 # Keep the required machine-readable path exact:
                 # representation -> family -> control -> target.
@@ -985,6 +1281,70 @@ def _git_provenance() -> Dict[str, object]:
     }
 
 
+_RESULT_FINGERPRINT_EXCLUDED_PATHS = (
+    "result_content_fingerprint",
+    "runtime",
+    "dataset.content_sha256",
+    "git.tracked_worktree_dirty",
+    "dataset.generation_git.tracked_worktree_dirty",
+)
+
+
+def _result_fingerprint_payload(result: Mapping[str, object]) -> Dict[str, object]:
+    """Copy the deterministic scientific payload covered by the result hash."""
+
+    payload = copy.deepcopy(dict(result))
+    payload.pop("result_content_fingerprint", None)  # self-excluding
+    payload.pop("runtime", None)
+    git = payload.get("git")
+    if isinstance(git, dict):
+        git.pop("tracked_worktree_dirty", None)
+    dataset = payload.get("dataset")
+    if isinstance(dataset, dict):
+        # The NPZ content hash covers generation runtime/dirty metadata, so it
+        # is deliberately omitted here. Its deterministic capture contract
+        # hash, suite identity, code hashes, and all probe results remain.
+        dataset.pop("content_sha256", None)
+        generation_git = dataset.get("generation_git")
+        if isinstance(generation_git, dict):
+            generation_git.pop("tracked_worktree_dirty", None)
+    return payload
+
+
+def _result_content_fingerprint(result: Mapping[str, object]) -> str:
+    """Hash canonical JSON of the documented deterministic result payload."""
+
+    canonical = json.dumps(
+        _result_fingerprint_payload(result),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _with_result_content_fingerprint(result: Mapping[str, object]) -> Dict[str, object]:
+    """Return a copy carrying its self-excluding canonical content hash."""
+
+    finalized = copy.deepcopy(dict(result))
+    fingerprint = _result_content_fingerprint(finalized)
+    existing = finalized.get("result_content_fingerprint")
+    declaration = {
+        "protocol": RESULT_FINGERPRINT_PROTOCOL,
+        "canonicalization": "UTF-8 JSON with sorted keys and compact separators",
+        "scope": (
+            "All result fields except the fingerprint object itself and the "
+            "explicitly listed volatile/transitively volatile paths"
+        ),
+        "excluded_paths": list(_RESULT_FINGERPRINT_EXCLUDED_PATHS),
+        "sha256": fingerprint,
+    }
+    if existing is not None and existing != declaration:
+        raise ValueError("Existing result_content_fingerprint does not verify")
+    finalized["result_content_fingerprint"] = declaration
+    return finalized
+
+
 def _dataset_contract(
     *,
     checkpoint: Mapping[str, object],
@@ -994,6 +1354,7 @@ def _dataset_contract(
     solver_contract: SolverContract,
     rollout_seed: int,
     random_network_seed: int,
+    random_control: Mapping[str, object],
     recent_action_lags: int,
     carry_dtype: str,
 ) -> Dict[str, object]:
@@ -1026,6 +1387,7 @@ def _dataset_contract(
         "solver": solver_contract.as_dict(),
         "rollout_seed": int(rollout_seed),
         "random_network_seed": int(random_network_seed),
+        "random_control": dict(random_control),
         "recent_action_lags": int(recent_action_lags),
         "carry_dtype": carry_dtype,
     }
@@ -1047,8 +1409,10 @@ def load_or_capture_dataset(
     recent_action_lags: int,
     carry_dtype: str,
     force: bool,
+    progress: ProgressCallback = None,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, object]]:
     dataset_path = Path(path)
+    random_control = _random_control_contract(random_net, seed=random_network_seed)
     contract = _dataset_contract(
         checkpoint=checkpoint_provenance,
         bank=bank_provenance,
@@ -1057,12 +1421,18 @@ def load_or_capture_dataset(
         solver_contract=solver_contract,
         rollout_seed=rollout_seed,
         random_network_seed=random_network_seed,
+        random_control=random_control,
         recent_action_lags=recent_action_lags,
         carry_dtype=carry_dtype,
     )
     if dataset_path.exists() and not force:
+        if progress is not None:
+            progress(f"Loading and validating carry dataset: {dataset_path}")
         return load_carry_dataset(dataset_path, expected_contract=contract)
 
+    if progress is not None:
+        action = "Replacing" if dataset_path.exists() else "Capturing"
+        progress(f"{action} carry dataset: {dataset_path}")
     dtype = np.float16 if carry_dtype == "float16" else np.float32
     arrays, capture_metadata = capture_carry_trajectories(
         net,
@@ -1073,7 +1443,14 @@ def load_or_capture_dataset(
         rollout_seed=rollout_seed,
         recent_action_lags=recent_action_lags,
         carry_dtype=dtype,
+        progress=progress,
     )
+    captured_random_control = capture_metadata.get("random_control")
+    if not isinstance(captured_random_control, Mapping):
+        raise RuntimeError("Capture omitted random-control identity metadata")
+    for key, expected in random_control.items():
+        if captured_random_control.get(key) != expected:
+            raise RuntimeError(f"Random-control identity changed during capture: {key}")
     metadata = {
         **capture_metadata,
         "contract": contract,
@@ -1083,6 +1460,8 @@ def load_or_capture_dataset(
         "git": _git_provenance(),
     }
     saved_metadata = save_carry_dataset(dataset_path, arrays, metadata)
+    if progress is not None:
+        progress(f"Saved carry dataset: {dataset_path} (sha256={saved_metadata['content_sha256']})")
     return arrays, saved_metadata
 
 
@@ -1111,6 +1490,9 @@ def probe_checkpoint(
     carry_dtype: str = "float16",
     device: str = "cpu",
     force_dataset: bool = False,
+    max_carry_bytes: int = DEFAULT_MAX_CARRY_BYTES,
+    allow_large_dataset: bool = False,
+    progress: ProgressCallback = None,
 ) -> Dict[str, object]:
     if split_name not in {"val", "train"}:
         raise ValueError("Carry studies are restricted to validation or training data")
@@ -1124,9 +1506,13 @@ def probe_checkpoint(
     if dataset in {model, bank}:
         raise ValueError("Dataset path must differ from the checkpoint and puzzle bank")
 
+    if progress is not None:
+        progress(f"Loading checkpoint: {model}")
     net, config, _payload, checkpoint = load_schema2_checkpoint(model, device=device)
     if not config.canonical_identity:
         raise ValueError("Checkpoint is not from the canonical-identity DRC protocol")
+    if progress is not None:
+        progress(f"Loading puzzle bank and selecting {split_name} suite: {bank}")
     bank_provenance = {
         "absolute_path": str(bank),
         "sha256": _file_sha256(bank),
@@ -1152,6 +1538,8 @@ def probe_checkpoint(
     suite = suite_provenance(puzzles, split=split_name, seed=suite_seed, per_stratum=per_stratum)
     env_config = env_config_from_checkpoint(config)
     solver_contract = SolverContract(max_depth=solver_max_depth, max_nodes=solver_max_nodes)
+    if progress is not None:
+        progress(f"Building architecture-matched random control (seed={random_network_seed})")
     random_net = build_random_control(
         config,
         net.observation_shape,
@@ -1166,6 +1554,20 @@ def probe_checkpoint(
         for name, value in random_net.state_dict().items()
     ):
         raise ValueError("Random-control weights exactly equal the trained checkpoint; choose a different seed")
+    carry_preflight = carry_payload_preflight(
+        net,
+        puzzle_count=len(puzzles),
+        horizon=env_config.horizon,
+        carry_dtype=carry_dtype,
+        max_carry_bytes=max_carry_bytes,
+        allow_large_dataset=allow_large_dataset,
+    )
+    if progress is not None:
+        progress(
+            "Carry payload preflight: "
+            f"at most {carry_preflight['estimated_carry_human']} "
+            f"for {carry_preflight['upper_bound_rows']} rows"
+        )
     arrays, dataset_metadata = load_or_capture_dataset(
         dataset,
         net=net,
@@ -1181,6 +1583,7 @@ def probe_checkpoint(
         recent_action_lags=recent_action_lags,
         carry_dtype=carry_dtype,
         force=force_dataset,
+        progress=progress,
     )
     layout_split = stable_layout_split(
         arrays["layout_hash"],
@@ -1199,8 +1602,9 @@ def probe_checkpoint(
         learning_rate=probe_learning_rate,
         hidden_size=probe_hidden_size,
         device=device,
+        progress=progress,
     )
-    return {
+    result = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "protocol_version": PROBE_PROTOCOL_VERSION,
         "study_type": "observational_drc_carry_state_probes",
@@ -1226,6 +1630,7 @@ def probe_checkpoint(
         "solver_contract": dataset_metadata["solver_contract"],
         "solver_coverage": dataset_metadata["solver_coverage"],
         "runtime": dataset_metadata["runtime"],
+        "carry_payload_preflight": carry_preflight,
         "layout_split": layout_split.manifest,
         "hyperparameters": {
             "suite_seed": int(suite_seed),
@@ -1246,11 +1651,17 @@ def probe_checkpoint(
             "recent_action_lags": int(recent_action_lags),
             "carry_dtype": carry_dtype,
             "device": device,
+            "max_carry_bytes": int(max_carry_bytes),
+            "allow_large_dataset": bool(allow_large_dataset),
         },
         "shuffled_label_control": shuffle_audit,
         "probe_fit_manifest": fit_manifest,
         "results": representations,
     }
+    finalized = _with_result_content_fingerprint(result)
+    if progress is not None:
+        progress(f"Probe fits complete: result_content_sha256={finalized['result_content_fingerprint']['sha256']}")
+    return finalized
 
 
 def _atomic_json(path: str | Path, value: Mapping[str, object]) -> None:
@@ -1298,6 +1709,22 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--carry-dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--force-dataset", action="store_true")
+    parser.add_argument(
+        "--max-carry-bytes",
+        type=int,
+        default=DEFAULT_MAX_CARRY_BYTES,
+        help="Maximum estimated eight-array carry payload before refusing (default: 1 GiB)",
+    )
+    parser.add_argument(
+        "--allow-large-dataset",
+        action="store_true",
+        help="Explicitly continue when the conservative carry payload estimate exceeds the cap",
+    )
+    parser.add_argument(
+        "--print-json",
+        action="store_true",
+        help="Print the complete result JSON to stdout instead of the concise completion line",
+    )
     return parser
 
 
@@ -1307,6 +1734,7 @@ def main() -> None:
 
     arguments = vars(args).copy()
     output_path = arguments.pop("output")
+    print_json = bool(arguments.pop("print_json"))
     output = Path(output_path).resolve()
     protected_inputs = {
         Path(arguments["model_path"]).resolve(),
@@ -1315,9 +1743,17 @@ def main() -> None:
     }
     if output in protected_inputs:
         parser.error("--output must differ from --model, --bank, and --dataset")
-    result = probe_checkpoint(**arguments)
+
+    def progress(message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    result = probe_checkpoint(**arguments, progress=progress)
+    result = _with_result_content_fingerprint(result)
     _atomic_json(output, result)
-    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    if print_json:
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print(f"Wrote {output} | result_content_sha256={result['result_content_fingerprint']['sha256']}")
 
 
 if __name__ == "__main__":
@@ -1325,11 +1761,13 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "DEFAULT_MAX_CARRY_BYTES",
     "LayoutSplit",
     "ProbeTarget",
     "_build_argument_parser",
     "build_probe_targets",
     "build_random_control",
+    "carry_payload_preflight",
     "carry_representations",
     "fit_probe_family",
     "load_or_capture_dataset",

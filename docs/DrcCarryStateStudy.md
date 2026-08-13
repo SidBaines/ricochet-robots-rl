@@ -20,12 +20,16 @@ logits, puzzle identifiers, and labels are never probe features.
 Each representation is standardized with training-row feature means and
 standard deviations only (zero-variance dimensions use scale one). Regression
 targets are likewise standardized from applicable training rows and converted
-back to native units for metrics. Shared representations have separate typed
-heads trained with Adam: MSE for regression, cross-entropy for multiclass, and
-binary cross-entropy with logits for binary/multilabel targets. Multilabel
-predictions use a fixed 0.5 sigmoid threshold; no test label tunes a threshold.
-The minibatch objective is the unweighted mean of the applicable target-head
-losses in that minibatch.
+back to native units for metrics. Every target is fitted in complete isolation:
+a linear layer or its own one-hidden-layer MLP (backbone and head), its own Adam
+optimizer, its own target-specific minibatch permutations, and only that
+target's loss. No target shares parameters, gradients, optimizer state,
+minibatches, or supervision with another target. Losses are MSE for regression,
+cross-entropy for multiclass, and binary cross-entropy with logits for
+binary/multilabel targets. Multilabel predictions use a fixed 0.5 sigmoid
+threshold; no test label tunes a threshold. The protocol and result schema are
+version 2; version-1 multitask results are not comparable to this isolated-probe
+protocol.
 
 ## Sampling and rollout contract
 
@@ -101,8 +105,27 @@ Observations and logits remain float32. Carry tensors default to float16 storage
 that lossy storage choice is recorded. The NPZ is written by atomic replacement
 and contains a SHA-256 over all array names, dtypes, shapes, bytes, and contract
 metadata. Reuse rechecks this fingerprint, structural invariants, and every
-requested checkpoint/bank/suite/solver/rollout/random-seed field. `--force-dataset`
-is required to replace an existing dataset instead of validating and reusing it.
+requested checkpoint/bank/suite/solver/rollout field. In schema 2 the reuse
+contract binds the random control's seed, full architecture signature and its
+SHA-256, and a freshly recomputed SHA-256 of every realized `state_dict` tensor
+(name, dtype, shape, and bytes). The same seed with different actual weights is
+therefore rejected. Capture metadata repeats the same identity and validation
+requires it to agree with the contract. This also protects against random
+initialization changes across code or PyTorch versions. Schema-1 datasets and
+the version-1 capture protocol are rejected. `--force-dataset` is required to
+replace an existing dataset instead of validating and reusing it.
+
+Before either capture or reuse, the CLI computes a conservative carry-only
+upper bound:
+`selected_puzzles * horizon * D * C * H * W * dtype_bytes * 8`, where eight is
+trained/random × carry-in/out × h/c. It reports the resolved state shape and
+estimate, and refuses estimates above `--max-carry-bytes` (1 GiB by default)
+unless `--allow-large-dataset` is explicit; an override still emits a warning.
+This is not a peak-memory estimate: observations, labels, NPZ compression,
+feature normalization, concatenated representations, probe tensors, and other
+temporary allocations are additional. For the intended standard suite, the
+rough carry payload is about 0.78 GiB at `per-stratum=8` and 2.32 GiB at
+`per-stratum=25`, before those additional peaks.
 
 ## Controls and split
 
@@ -119,8 +142,11 @@ and landing/length/moved/immediate-success share one. Optimal and reducing masks
 are shuffled independently because independent verification can give them
 different availability. The JSON records permutation hashes and changed-row
 counts, including honest zero changes for constant labels. Within a fixed
-representation and probe family, all three controls use the same probe
-initialization seed and minibatch order.
+representation, probe family, and target, all three controls use the exact same
+derived initialization/minibatch seed. The result records initial and final
+model-state hashes plus the minibatch-order hash, making that pairing auditable.
+A target's seed depends on its name, not mapping order or any other target's
+labels.
 
 Train/test assignment is by unique `layout_hash`, never by state. Layouts are
 ordered by a seeded SHA-256 score, assigned wholly to one partition, and emitted
@@ -139,6 +165,22 @@ targets use all applicable rows. Results are nested as
 `representation -> probe family -> control -> target` so trained, random, and
 shuffled controls are directly paired for both linear and MLP families.
 
+Every target object includes train/test target summaries computed only from its
+applicable rows (and only finite rows for regression). Binary and multiclass
+histograms use stringified numeric keys for stable JSON and include zero-count
+vocabulary classes. Regression summaries report mean, population standard
+deviation, and median. Multilabel summaries report per-label positive counts
+and prevalence plus row-cardinality mean, standard deviation, and median.
+
+No-skill references are selected from training labels only: the majority class
+(smallest-class tie break) with accuracy and balanced accuracy, the training
+mean with MAE/R2, or per-label training prevalence with the same fixed 0.5
+multilabel threshold and reported multilabel metrics. Undefined values are
+`null` with a reason. For the shuffled control, train summaries, baselines, and
+train metrics deliberately use the actual shuffled training labels; test
+summaries and metrics use untouched original labels. The trained and random
+controls use original labels for both, and each target states these sources.
+
 - Distance, slide length, move/progress variables: MAE and R2.
 - Optimal and reducing action sets: top-1 action in the true set, micro
   multilabel F1, and exact-set accuracy.
@@ -146,12 +188,39 @@ shuffled controls are directly paired for both linear and MLP families.
 - Intended action/robot/direction, recent actions, and landing cell: accuracy.
 - Moved and immediate success: accuracy, balanced accuracy, and ROC-AUC.
 
+Each isolated fit also reports train metrics, final training loss, and a loss
+curve summary (initial/final/best batch loss, finite flag, completed/requested
+epochs, and batch count), plus model, prediction, and minibatch-order hashes.
+Training always runs the preregistered fixed epoch count when applicable. There
+is no early stopping, hyperparameter search, threshold fitting, or epoch choice
+using test data. These diagnostics can reveal divergence or failure to fit, but
+they do not prove optimizer convergence or calibrate probe capacity.
+
 When a metric is mathematically undefined—for example ROC-AUC with one test
 class or R2 with zero target variance—the JSON value is `null` with an explicit
 reason. No undefined value is replaced by zero. Legal-action masking makes
 `moved` normally constant true; its ordinary accuracy is therefore a sanity
 target, not evidence of rich representation, while balanced accuracy/AUC will
 correctly be undefined.
+
+## CLI output and result identity
+
+Load, suite selection, payload preflight, dataset capture/reuse, and each grouped
+set of isolated fits report concise progress to stderr. On success, stdout
+contains only the resolved output path and result fingerprint. `--print-json`
+is the explicit opt-in for printing the full JSON. The result file is flushed,
+`fsync`ed, and atomically replaced.
+
+`result_content_fingerprint.sha256` is self-excluding and hashes canonical
+sorted-key compact JSON. Its scope is all result fields except the fingerprint
+object, top-level runtime versions, `dataset.content_sha256` (which transitively
+includes generation runtime/dirty metadata), and the current/capture
+`tracked_worktree_dirty` flags. The exact excluded paths and canonicalization
+protocol are stored beside the hash. Dataset contract identity, checkpoint and
+suite provenance, stable Git/code hashes, hyperparameters, all diagnostics, and
+all probe results remain covered. This defined scope keeps volatile runtime and
+dirty-state observations from changing a claimed deterministic result payload;
+the full NPZ content hash is still retained separately for dataset audit.
 
 ## Interpretation limits
 

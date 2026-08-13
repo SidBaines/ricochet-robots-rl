@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import copy
 import json
+import sys
 
 import numpy as np
 import pytest
 import torch
 
+from src.groundup import probe_drc_carry as probe_module
 from src.groundup.drc import DRCNet, DRCState
 from src.groundup.drc_carry import (
     BOS_ACTION,
+    CAPTURE_PROTOCOL_VERSION,
+    DATASET_SCHEMA_VERSION,
     ExactStateOracle,
     SolverContract,
     capture_carry_trajectories,
@@ -19,14 +24,23 @@ from src.groundup.drc_carry import (
 from src.groundup.drc_train import DRCTrainConfig, _save_model, build_net
 from src.groundup.env import EnvConfig, RicochetEnv
 from src.groundup.probe_drc_carry import (
+    DEFAULT_MAX_CARRY_BYTES,
+    PROBE_PROTOCOL_VERSION,
+    RESULT_SCHEMA_VERSION,
     ProbeTarget,
+    _atomic_json,
     _build_argument_parser,
+    _result_content_fingerprint,
+    _with_result_content_fingerprint,
     build_random_control,
+    carry_payload_preflight,
     fit_probe_family,
+    load_or_capture_dataset,
     load_schema2_checkpoint,
     run_controlled_probes,
     shuffle_training_labels,
     stable_layout_split,
+    suite_provenance,
 )
 from src.groundup.puzzles import Puzzle
 
@@ -170,6 +184,7 @@ def test_capture_threads_exact_forward_carries_and_backfills_labels():
     puzzle = _two_way_puzzle()
     net, config = _tiny_net()
     random_net = build_random_control(config, net.observation_shape, net.n_actions, seed=123)
+    progress_messages: list[str] = []
     arrays, metadata = capture_carry_trajectories(
         net,
         random_net,
@@ -184,6 +199,7 @@ def test_capture_threads_exact_forward_carries_and_backfills_labels():
         rollout_seed=17,
         recent_action_lags=3,
         carry_dtype=np.float32,
+        progress=progress_messages.append,
     )
 
     assert arrays["chosen_action"].tolist() == [0, 2]
@@ -214,6 +230,9 @@ def test_capture_threads_exact_forward_carries_and_backfills_labels():
     assert int(logits.argmax(-1)) == arrays["chosen_action"][0]
     assert np.allclose(state_out.h[:, 0].numpy(), arrays["trained_carry_out_h"][0])
     assert metadata["episodes"]["successes"] == 1
+    assert metadata["schema_version"] == DATASET_SCHEMA_VERSION == 2
+    assert metadata["capture_protocol"] == CAPTURE_PROTOCOL_VERSION == "drc-carry-trajectory-v2"
+    assert progress_messages == ["Capturing puzzle 1/1"]
     assert metadata["solver_coverage"]["exact_known_rows"] == 2
     assert metadata["solver_coverage"]["exact_fraction"] == 1.0
     assert metadata["solver_coverage"]["root_nodes_discovered"] > 0
@@ -336,6 +355,8 @@ def test_schema2_checkpoint_loading_is_strict_and_records_full_provenance(tmp_pa
 
 
 def test_cli_maps_required_paths_to_orchestrator_interface():
+    assert RESULT_SCHEMA_VERSION == 2
+    assert PROBE_PROTOCOL_VERSION == "drc-carry-controlled-probes-v2"
     args = _build_argument_parser().parse_args(
         [
             "--model",
@@ -354,6 +375,9 @@ def test_cli_maps_required_paths_to_orchestrator_interface():
     assert arguments["bank_path"] == "bank.parquet"
     assert arguments["dataset_path"] == "carry.npz"
     assert arguments["split_name"] == "val"
+    assert arguments["max_carry_bytes"] == DEFAULT_MAX_CARRY_BYTES
+    assert arguments["allow_large_dataset"] is False
+    assert arguments.pop("print_json") is False
     assert "model" not in arguments and "bank" not in arguments and "dataset" not in arguments
 
 
@@ -391,6 +415,10 @@ def _minimal_dataset() -> tuple[dict[str, np.ndarray], dict[str, object]]:
 
 def test_saved_dataset_fingerprint_and_contract_reject_mutation(tmp_path):
     arrays, metadata = _minimal_dataset()
+    with pytest.raises(ValueError, match="Unsupported carry dataset schema"):
+        validate_carry_dataset(arrays, {**metadata, "schema_version": 1})
+    with pytest.raises(ValueError, match="Unsupported carry capture protocol"):
+        validate_carry_dataset(arrays, {**metadata, "capture_protocol": "drc-carry-trajectory-v1"})
     path = tmp_path / "carry.npz"
     saved = save_carry_dataset(path, arrays, metadata)
     loaded, loaded_meta = load_carry_dataset(path, expected_contract={"checkpoint_sha256": "abc"})
@@ -410,6 +438,51 @@ def test_saved_dataset_fingerprint_and_contract_reject_mutation(tmp_path):
     )
     with pytest.raises(ValueError, match="fingerprint mismatch"):
         load_carry_dataset(path)
+
+
+def test_dataset_reuse_binds_realized_random_control_weights(tmp_path):
+    puzzle = _two_way_puzzle()
+    net, config = _tiny_net()
+    random_net = build_random_control(config, net.observation_shape, net.n_actions, seed=41)
+    dataset = tmp_path / "bound-random-control.npz"
+    suite = suite_provenance([puzzle], split="val", seed=3, per_stratum=1)
+    kwargs = {
+        "path": dataset,
+        "net": net,
+        "puzzles": [puzzle],
+        "env_config": EnvConfig(horizon=4, shaping_coef=0.0),
+        "checkpoint_provenance": {
+            "absolute_path": "/checkpoint.pt",
+            "sha256": "1" * 64,
+            "config_fingerprint": "2" * 64,
+            "architecture_fingerprint": "3" * 64,
+        },
+        "bank_provenance": {"absolute_path": "/bank.parquet", "sha256": "4" * 64},
+        "suite": suite,
+        "solver_contract": SolverContract(max_depth=8, max_nodes=10_000),
+        "rollout_seed": 0,
+        "random_network_seed": 41,
+        "recent_action_lags": 3,
+        "carry_dtype": "float32",
+        "force": False,
+    }
+
+    _arrays, first_metadata = load_or_capture_dataset(random_net=random_net, **kwargs)
+    exact_clone = build_random_control(config, net.observation_shape, net.n_actions, seed=41)
+    _reused, reused_metadata = load_or_capture_dataset(random_net=exact_clone, **kwargs)
+
+    contract_control = first_metadata["contract"]["random_control"]
+    assert contract_control["state_dict_sha256"] == first_metadata["random_control"]["state_dict_sha256"]
+    assert contract_control["architecture_fingerprint"] == first_metadata["random_control"]["architecture_fingerprint"]
+    assert contract_control["architecture_signature"] == first_metadata["random_control"]["architecture_signature"]
+    assert reused_metadata["content_sha256"] == first_metadata["content_sha256"]
+
+    same_seed_different_weights = build_random_control(config, net.observation_shape, net.n_actions, seed=41)
+    with torch.no_grad():
+        first_parameter = next(same_seed_different_weights.parameters())
+        first_parameter.view(-1)[0].add_(1.0)
+    with pytest.raises(ValueError, match=r"contract\.random_control\.state_dict_sha256"):
+        load_or_capture_dataset(random_net=same_seed_different_weights, **kwargs)
 
 
 def test_shuffled_control_changes_only_training_labels():
@@ -482,6 +555,29 @@ def test_controlled_probe_output_is_explicitly_nested_and_nulls_are_explained():
     assert undefined["balanced_accuracy"]["value"] is None
     assert undefined["balanced_accuracy"]["reason"]
     assert undefined["roc_auc"]["value"] is None
+    trained_target = results["h_final"]["mlp"]["trained"]["future_success"]
+    shuffled_target = results["h_final"]["mlp"]["shuffled_labels"]["future_success"]
+    assert trained_target["label_sources"] == {"train": "original_labels", "test": "original_labels"}
+    assert shuffled_target["label_sources"] == {
+        "train": "shuffled_training_labels",
+        "test": "original_labels",
+    }
+    assert trained_target["train_metrics"]
+    assert trained_target["target_summary"]["train"]["class_histogram"] == {"0": 0, "1": 4}
+    assert trained_target["no_skill_baseline"]["strategy"] == "training_majority_class"
+    diagnostics = trained_target["training_diagnostics"]
+    assert diagnostics["loss_curve_summary"]["finite"] is True
+    assert diagnostics["loss_curve_summary"]["epochs"] == 2
+    assert diagnostics["loss_curve_summary"]["batches"] > 0
+    assert len(diagnostics["initial_state_sha256"]) == 64
+    assert len(diagnostics["final_state_sha256"]) == 64
+    assert len(diagnostics["test_prediction_sha256"]) == 64
+    paired = results["h_final"]["mlp"]
+    for control in ("random_network", "shuffled_labels"):
+        paired_diagnostics = paired[control]["future_success"]["training_diagnostics"]
+        assert paired_diagnostics["seed"] == diagnostics["seed"]
+        assert paired_diagnostics["initial_state_sha256"] == diagnostics["initial_state_sha256"]
+        assert paired_diagnostics["minibatch_order_sha256"] == diagnostics["minibatch_order_sha256"]
     assert shuffle_audit["test_labels_untouched"] is True
     assert fit_manifest["h_final"]["linear"]["trained"]["seed"] is not None
     json.dumps(
@@ -543,3 +639,253 @@ def test_probe_families_learn_signal_and_shuffled_test_labels_stay_real(family):
     # The control object itself retains original labels in the test rows; a
     # deceptively high score against permuted test labels cannot be reported.
     assert np.array_equal(shuffled_targets["binary_signal"].values[split.test_indices], y[split.test_indices])
+
+
+@pytest.mark.parametrize("family", ["linear", "mlp"])
+def test_each_target_probe_is_fully_isolated_from_other_labels(family):
+    rng = np.random.default_rng(812)
+    n = 96
+    features = rng.normal(size=(n, 5)).astype(np.float32)
+    layouts = np.asarray([f"layout-{index // 2:03d}" for index in range(n)])
+    split = stable_layout_split(layouts, seed=7, test_fraction=0.25, min_layouts_per_partition=2)
+    applicable = np.ones(n, dtype=bool)
+    target_b_values = (features[:, 1] - 0.25 * features[:, 2] > 0).astype(np.int64)
+    first_targets = {
+        "target_a": ProbeTarget(
+            "target_a",
+            "binary",
+            (features[:, 0] > 0).astype(np.int64),
+            applicable,
+            1,
+            "target_a",
+        ),
+        "target_b": ProbeTarget(
+            "target_b",
+            "binary",
+            target_b_values,
+            applicable,
+            1,
+            "target_b",
+        ),
+    }
+    changed_targets = dict(first_targets)
+    changed_targets["target_a"] = ProbeTarget(
+        "target_a",
+        "binary",
+        1 - first_targets["target_a"].values,
+        applicable,
+        1,
+        "target_a",
+    )
+    kwargs = {
+        "family": family,
+        "split": split,
+        "epochs": 8,
+        "batch_size": 19,
+        "learning_rate": 0.02,
+        "hidden_size": 11,
+        "seed": 991,
+        "device": "cpu",
+    }
+
+    first = fit_probe_family(features, first_targets, **kwargs)["targets"]["target_b"]
+    changed = fit_probe_family(features, changed_targets, **kwargs)["targets"]["target_b"]
+
+    assert (
+        first["training_diagnostics"]["initial_state_sha256"] == changed["training_diagnostics"]["initial_state_sha256"]
+    )
+    assert first["training_diagnostics"]["final_state_sha256"] == changed["training_diagnostics"]["final_state_sha256"]
+    assert (
+        first["training_diagnostics"]["train_prediction_sha256"]
+        == changed["training_diagnostics"]["train_prediction_sha256"]
+    )
+    assert (
+        first["training_diagnostics"]["test_prediction_sha256"]
+        == changed["training_diagnostics"]["test_prediction_sha256"]
+    )
+    assert first["train_metrics"] == changed["train_metrics"]
+    assert first["metrics"] == changed["metrics"]
+
+
+def test_target_summaries_and_no_skill_baselines_cover_every_target_kind():
+    rng = np.random.default_rng(83)
+    features = rng.normal(size=(12, 3)).astype(np.float32)
+    split = probe_module.LayoutSplit(
+        train_indices=np.arange(8),
+        test_indices=np.arange(8, 12),
+        train_layouts=("train",),
+        test_layouts=("test",),
+        fingerprint="unit-test",
+        manifest={},
+    )
+    applicable = np.ones(12, dtype=bool)
+    regression_values = np.asarray([1, 2, 3, np.nan, 5, 6, 7, 8, 10, 10, 10, np.nan], dtype=np.float32)
+    regression_applicable = applicable.copy()
+    multilabel_values = np.asarray(
+        [[1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1]] * 3,
+        dtype=np.int64,
+    )
+    targets = {
+        "binary": ProbeTarget(
+            "binary", "binary", np.asarray([0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1]), applicable, 1, "binary"
+        ),
+        "multiclass": ProbeTarget(
+            "multiclass",
+            "multiclass",
+            np.asarray([0, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2]),
+            applicable,
+            3,
+            "multiclass",
+        ),
+        "regression": ProbeTarget(
+            "regression", "regression", regression_values, regression_applicable, 1, "regression"
+        ),
+        "multilabel": ProbeTarget("multilabel", "multilabel", multilabel_values, applicable, 3, "multilabel"),
+    }
+
+    fitted = fit_probe_family(
+        features,
+        targets,
+        family="linear",
+        split=split,
+        epochs=2,
+        batch_size=4,
+        learning_rate=0.01,
+        seed=13,
+        device="cpu",
+    )["targets"]
+
+    assert fitted["binary"]["target_summary"]["train"]["class_histogram"] == {"0": 5, "1": 3}
+    assert fitted["multiclass"]["target_summary"]["test"]["class_histogram"] == {
+        "0": 0,
+        "1": 0,
+        "2": 4,
+    }
+    regression_summary = fitted["regression"]["target_summary"]
+    assert regression_summary["train"]["n_applicable_finite"] == 7
+    assert regression_summary["test"]["n_applicable_finite"] == 3
+    assert regression_summary["test"]["mean"]["value"] == 10.0
+    assert regression_summary["test"]["std"]["value"] == 0.0
+    assert regression_summary["test"]["median"]["value"] == 10.0
+    multilabel_summary = fitted["multilabel"]["target_summary"]["train"]
+    assert multilabel_summary["positive_count"] == {"0": 4, "1": 4, "2": 2}
+    assert multilabel_summary["prevalence"] == {"0": 0.5, "1": 0.5, "2": 0.25}
+    assert multilabel_summary["cardinality"]["mean"]["value"] == 1.25
+    assert fitted["regression"]["no_skill_baseline"]["strategy"] == "training_mean"
+    assert fitted["regression"]["no_skill_baseline"]["metrics"]["r2"]["value"] is None
+    assert fitted["regression"]["no_skill_baseline"]["metrics"]["r2"]["reason"]
+    assert fitted["multilabel"]["no_skill_baseline"]["strategy"] == "per_label_training_prevalence"
+    assert fitted["multilabel"]["no_skill_baseline"]["predicted_prevalence"] == {
+        "0": 0.5,
+        "1": 0.5,
+        "2": 0.25,
+    }
+    for result in fitted.values():
+        assert result["train_metrics"]
+        assert result["no_skill_baseline"]["metrics"]
+        assert result["training_diagnostics"]["loss_curve_summary"]["finite"] is True
+    json.dumps(fitted, allow_nan=False)
+
+
+def test_result_content_fingerprint_excludes_only_declared_volatile_fields(tmp_path):
+    payload = {
+        "schema_version": 2,
+        "git": {"head": "abc", "tracked_worktree_dirty": False},
+        "dataset": {
+            "content_sha256": "1" * 64,
+            "contract_sha256": "2" * 64,
+            "generation_git": {"head": "def", "tracked_worktree_dirty": False},
+        },
+        "runtime": {"torch_version": "old", "numpy_version": "old"},
+        "results": {"h_final": {"score": 0.75}},
+    }
+    finalized = _with_result_content_fingerprint(payload)
+    assert finalized["result_content_fingerprint"]["sha256"] == _result_content_fingerprint(finalized)
+    assert _with_result_content_fingerprint(finalized) == finalized
+
+    volatile_changes = copy.deepcopy(finalized)
+    volatile_changes["git"]["tracked_worktree_dirty"] = True
+    volatile_changes["dataset"]["generation_git"]["tracked_worktree_dirty"] = True
+    volatile_changes["dataset"]["content_sha256"] = "9" * 64
+    volatile_changes["runtime"]["torch_version"] = "new"
+    assert _result_content_fingerprint(volatile_changes) == _result_content_fingerprint(finalized)
+
+    meaningful_change = copy.deepcopy(finalized)
+    meaningful_change["results"]["h_final"]["score"] = 0.5
+    assert _result_content_fingerprint(meaningful_change) != _result_content_fingerprint(finalized)
+
+    output = tmp_path / "result.json"
+    _atomic_json(output, finalized)
+    reloaded = json.loads(output.read_text())
+    assert reloaded["result_content_fingerprint"] == finalized["result_content_fingerprint"]
+    assert _result_content_fingerprint(reloaded) == finalized["result_content_fingerprint"]["sha256"]
+
+
+def test_carry_payload_preflight_uses_full_carry_shape_and_requires_override():
+    net, _config = _tiny_net()
+    expected_bytes = 2 * 4 * 1 * 3 * 3 * 3 * np.dtype(np.float32).itemsize * 8
+    estimate = carry_payload_preflight(
+        net,
+        puzzle_count=2,
+        horizon=4,
+        carry_dtype="float32",
+        max_carry_bytes=expected_bytes,
+        allow_large_dataset=False,
+    )
+    assert estimate["upper_bound_rows"] == 8
+    assert estimate["carry_shape_per_row"] == [1, 3, 3, 3]
+    assert estimate["carry_array_count"] == 8
+    assert estimate["estimated_carry_bytes"] == expected_bytes
+    assert estimate["within_limit"] is True
+
+    with pytest.raises(ValueError, match="--allow-large-dataset"):
+        carry_payload_preflight(
+            net,
+            puzzle_count=2,
+            horizon=4,
+            carry_dtype="float32",
+            max_carry_bytes=expected_bytes - 1,
+            allow_large_dataset=False,
+        )
+    with pytest.warns(RuntimeWarning, match="carry payload"):
+        overridden = carry_payload_preflight(
+            net,
+            puzzle_count=2,
+            horizon=4,
+            carry_dtype="float32",
+            max_carry_bytes=expected_bytes - 1,
+            allow_large_dataset=True,
+        )
+    assert overridden["override_used"] is True
+
+
+def test_cli_prints_concise_default_and_full_json_only_on_request(tmp_path, monkeypatch, capsys):
+    def fake_probe_checkpoint(**kwargs):
+        kwargs["progress"]("fitting isolated probes")
+        return _with_result_content_fingerprint({"schema_version": 2, "results": {"ok": True}})
+
+    monkeypatch.setattr(probe_module, "probe_checkpoint", fake_probe_checkpoint)
+    common = [
+        "probe_drc_carry",
+        "--model",
+        str(tmp_path / "model.pt"),
+        "--bank",
+        str(tmp_path / "bank.parquet"),
+        "--dataset",
+        str(tmp_path / "carry.npz"),
+        "--output",
+        str(tmp_path / "result.json"),
+    ]
+    monkeypatch.setattr(sys, "argv", common)
+    probe_module.main()
+    captured = capsys.readouterr()
+    assert captured.out.startswith("Wrote ")
+    assert "result_content_sha256=" in captured.out
+    assert '"results"' not in captured.out
+    assert "fitting isolated probes" in captured.err
+
+    monkeypatch.setattr(sys, "argv", [*common, "--output", str(tmp_path / "printed.json"), "--print-json"])
+    probe_module.main()
+    captured = capsys.readouterr()
+    printed = json.loads(captured.out)
+    assert printed["results"] == {"ok": True}
