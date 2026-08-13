@@ -1017,3 +1017,60 @@ driven near ceiling without touching task performance.
 **Next**: extend the control to 200M (still improving, LR schedule 68% consumed);
 do NOT run the from-scratch aux arm; fix the keep-best inheritance trap before
 further branch arms.
+
+## 2026-08-13 — priorities 0/1/2 complete: honest 200M DRC closeout and causal carry result
+
+Full report: `docs/Drc200MCarryMechanismResult.md`. Registered observational
+and causal protocols/results: `docs/DrcCarryStateStudy.md` and
+`docs/DrcCarryInterventionStudy.md`.
+
+- **Reporting fixed first** (`9ccf245`, `84d91f0`): headline evaluation now
+  always reloads immutable final weights; periodic best is separately named;
+  every score carries source run/timestep/path/kind/SHA and suite identity;
+  semantic branches cannot inherit a parent's best silently; the hard suite is
+  genuinely joint-stratified by length x robots moved. The exact 190M resume
+  had no contract differences and legitimately reconstructed the 135M best.
+- **Exact continuation complete:** `training_pause_190005248.pt` resumed to
+  the legal boundary at **200,007,680**. Immutable final source SHA
+  `8760ba70...`. Final validation: **82.08% det / 82.29% stoch** on 480;
+  joint-hard validation **75.96%** on 470. The separately evaluated 135M
+  periodic best was worse on all three (79.79% / 80.83% / 74.89%), confirming
+  the registered final-only rule was the right closeout.
+- **DRC-line test evaluated once under a prewritten decision:** only the 200M
+  final checkpoint, test seed 17, 60 puzzles/length, 480 total, 1 det + 3 stoch.
+  Suite fingerprint `9cf385d2...`; scientific payload SHA `85d351c2...`.
+  Result: **80.42% det / 81.25% stoch**, versus frozen feed-forward P1
+  **69.17% / 68.33%**: **+11.25/+12.92pp**. Hard-tail det gains are +15pp L5,
+  +18.33pp L7, +30pp L8, +17.26pp two-robot, and +29.42pp on the small n=17
+  three-robot cell. One seed and unequal trainer/compute budgets: recipe
+  success, not architecture-only attribution. The suite was held out from DRC
+  training/selection but was not globally untouched: exact reproduction of
+  P1's scripted-baseline aggregates strongly evidences the same selection was
+  used for P1, whose strata informed the DRC programme; legacy P1 predates
+  suite fingerprints.
+- **Real-rollout carry probes** (`d78aa83`, `97e606a`) ran at 9M, 59M, 135M,
+  and 200M on the same 157-puzzle/20-cell validation suite with exact BFS
+  labels, a leak-free 118/39 layout split, independent target probes, and
+  architecture-matched random-network plus shuffled-label controls. Carry has
+  strong action/history code and learned nonlinear distance/optimal/reducing
+  action information. It does not reveal a clean explicit plan: final best
+  distance R2 .229, optimal/reducing top-1 .418/.427, landing-cell accuracy
+  only ~.10-.13, and future-success decoding is non-monotonic.
+- **Causal carry study** (`e6c85b9`, `e3f91c6`) settles the main question.
+  Resetting all carry every move costs **32--38pp** at all four checkpoints;
+  final effect **-38.22pp**, paired 95% CI **[-46.50,-29.94]**. Deeper depths
+  and both `h/c` matter descriptively. One-shot move-1/2/4/8 resets are tiny,
+  consistent with reconstruction, redundancy, or local bypass but not
+  distinguishing them. At 200M, exact-state coherent donor carry
+  changes actions in **39/68** matched contexts but has **0.00pp** mean
+  suffix-success effect, CI [-7.35,+7.35]: histories change decisions, but no
+  directional mean effect was detected at this precision. Donor controls pass.
+- **Conclusion:** the carry is a causally necessary, distributed,
+  history-dependent dynamical policy state that is resilient to isolated
+  zeroing; it is not presently a readable symbolic route or slide simulator.
+- **Next:** do not extend seed 11 blindly beyond its registered 200M/floor-LR
+  plateau. Prioritize (1) two-seed confirmation under the repaired final-only
+  protocol, (2) a preregistered reset-recovery-timescale experiment, and (3)
+  outcome-blind, prefix/probe-stratified exact-state patching. The RGB
+  entry gate is met; start with a short correctness/throughput/learnability
+  gate, not a full long run.

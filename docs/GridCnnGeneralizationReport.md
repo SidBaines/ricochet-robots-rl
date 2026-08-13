@@ -1,6 +1,6 @@
 # Grid-CNN Generalization Report
 
-Run dates: 2026-07-10 – 2026-07-12
+Run dates: 2026-07-10 – 2026-07-12; DRC follow-up updated 2026-08-13
 Branch: `sid-learnable-agent` (pushed to origin)
 Baseline being fixed: `docs/Phase2BenchmarkReport.md` (stock-CNN PPO failed the held-out gate at 31.7% stochastic vs the 46.7% target-robot-only baseline, with 3.1% deterministic success and 91% no-movement actions)
 
@@ -17,8 +17,14 @@ The Phase 2 stock-CNN failure was an **observation-encoding × architecture mism
 | Phase 2c (same fixture, two-robot bands up-weighted, 819k steps) | 14.1% / 16.6% | — | **84.8% stoch, 87.0% det**; single-robot strata 97–100%, two-robot 67–68% |
 | Phase 4 (16×16, 4 robots, lengths 1–8; scale-only) | 4.4% / 8.5% | — | 3.3% stoch — **failed** (from-scratch PPO, exploration wall) |
 | Phase 4b (same 16×16; BC warmstart + PPO) | 4.4% / 8.5% | — | **28.8% stoch / 24.2% det final test — gate passed at 3.4×**; lengths 7–8 solved for the first time |
+| DRC helper-free follow-up (12×12, 3 robots, lengths 1–8) | 14.25% / 25.96% | P1 feed-forward: 68.33% stoch / 69.17% det | **81.25% stoch / 80.42% det** at 200M; fixed DRC-held-out test previously used for P1, seed 11 |
 
-All numbers are held-out test suites disjoint from training by layout hash, on the unchanged deterministic fixtures and evaluation protocol. The 8×8 milestones are final; 16×16 is the live frontier (Phase 4/4b below).
+All numbers are held-out test suites disjoint from their model's training by
+layout hash. The legacy P1 artifact predates the suite-fingerprint field; exact
+reproduction of all scripted-baseline aggregates strongly supports, but does
+not hash-prove, its suite identity with the DRC test. That suite was held out
+from DRC training/selection but was already known from P1. The 8×8 milestones
+are final; 16×16 remains a separate frontier (Phase 4/4b below).
 
 ## Diagnosis
 
@@ -133,21 +139,66 @@ Final held-out **test**: **28.8% stochastic / 24.2% deterministic** vs the 8.5% 
 
 Interpretation: **exploration was the 16×16 constraint, and imitation solves it.** Scale alone (phase 4) failed at 3.3%; the solver-plan prior alone reaches ~30%; reinforcement learning on top extends skill to the longest puzzles while the mastery-threshold curriculum progression confirms the pathology is gone. Remaining headroom: the 2M dip and post-7.2M fade suggest a gentler fine-tune (lower lr / `ent_coef`, or checkpoint selection — the 7.2M policy is the best artifact at ~33%) is worth several points; the formal 3-seed protocol should precede any milestone claim; and this recipe is now the right baseline for the DRC/recurrence comparison below.
 
-## Connection to the original DRC research goal
+## DRC follow-up: task gain and recurrent mechanism
 
-The project's `docs/ResearchPlan.md` and `docs/rr_base_prompt.md` are built around the Deep Repeating ConvLSTM (DRC) from Guez et al. 2019, as analyzed for Sokoban in [arXiv:2407.15421](https://arxiv.org/html/2407.15421v3), with mechanistic interpretability of the learned *plan* as the eventual payoff. The work in this report is deliberately **feed-forward, not recurrent** — the January review's recovery plan said to establish a trustworthy non-recurrent baseline before repairing the (still-broken) DRC/RecurrentPPO paths in `src/models/`. Three connections:
+The original DRC research goal has now advanced beyond the feed-forward setup
+described above. A faithful DRC(3,3) was trained on the 12x12 helper-free task
+with the corrected recurrent PPO reward semantics and an explicit final-only
+reporting rule. Its final 200M checkpoint reached **80.42% deterministic /
+81.25% stochastic** on a fixed 480-puzzle DRC-held-out test suite, versus the frozen
+feed-forward P1 artifact's **69.17% / 68.33%**. The deterministic gain grows
+from +6.78 points on one-robot puzzles to +17.26 on two-robot and +29.42 on the
+small 17-puzzle three-robot stratum; by length it reaches +30 points at length
+8. This is the complete viable-recipe comparison for seed 11, not an
+architecture-only effect: trainers and environment-step budgets differ.
+The suite was not globally untouched: the reproduced baseline aggregates
+strongly evidence that P1 used the same selection, and its difficulty results
+informed the DRC research plan.
 
-1. **Same core design principle, minus recurrence.** The reason DRC hidden states are interpretable in that paper is that computation stays spatial and grid-aligned throughout; the old baseline violated exactly this by aliasing the grid through a stride-4 conv. `GridPlanesCnn`/`GridPlanesResNet` restore the spatial-computation property — "the DRC encoder philosophy without the recurrent core."
-2. **8×8 calibrates where planning is *not* needed.** A fixed-depth net solves held-out 8×8 puzzles up to length 4 with two-robot blockers at ~87% — so for shallow instances amortized pattern-matching suffices, no iterative computation required. That is the control the DRC comparison needs and didn't previously exist.
-3. **16×16 marks where recurrence should earn its keep.** Fixed-depth compute stalls on lengths ≥5 (the exploration wall). That is precisely the regime where DRC's "more ticks = more planning compute / pondering helps hardest levels" result predicts a recurrent core would help — and the env already has the optional no-op "thinking step" action the plan earmarked for it. The benchmark harness now gives a clean A/B (same fixture, splits, gates: feed-forward vs DRC). Caveat: the paper's DRC used ~2B IMPALA steps; since even the feed-forward 16×16 run looks compute/exploration-starved, fix the data/exploration axis (BC warmstart) before attributing any residual gap to architecture, or the comparison is confounded. Ricochet Robots is arguably a *better* interpretability probe than Sokoban because the bank stores BFS-optimal plans for every puzzle — ground-truth "which robot, which direction" labels for probes, the direct analogue of the paper's box-direction probes.
+Mechanistic follow-up used real-rollout `h/c` probes and paired causal
+interventions at 9M, 59M, 135M, and 200M. Continuously resetting all carry
+costs 32--38 points at every checkpoint; at 200M the paired effect is -38.22
+points, 95% interval [-46.50, -29.94]. One-off resets have only small effects,
+consistent with reconstruction, redundancy, or local bypass but not
+distinguishing them. Exact-state coherent donor carry changes action
+sequences in 39/68 final-checkpoint matches but has zero average suffix-success
+effect. Carry is therefore causally necessary and genuinely history-dependent;
+no directional donor-history mean effect was detected at this precision.
+
+The observational controls show strong action/history decoding and modest
+nonlinear distance/optimal-action information, without a clean explicit route,
+shortest-path-progress signal, or accurate slide simulator. The current model
+is best described as maintaining a distributed dynamical policy state. Full
+tables, frozen hashes, limitations, and recommended experiments are in
+`docs/Drc200MCarryMechanismResult.md`.
 
 ## Next steps (prioritized)
 
-1. **Attack the robots-moved axis directly — the highest-value lever.** The joint heatmap shows single-robot plans are near-solved at every length while 2/3-robot plans are the wall. The proven fix already exists: `two_robot_band_weight` (Phase 2c lifted 8×8 two-robot success 23→68% by raising exposure ~13→41%). Add explicit 3-robot band weighting and re-run — this targets the actual failure mode rather than adding undirected scale. It also likely helps the BC dataset (up-weight multi-robot plans in `_bc_dataset`).
-2. **Checkpoint selection + gentler fine-tune.** The best policy was the 7.2M checkpoint (~33%), above the 10.24M endpoint (~30%) — the run has a mild late fade. Save intermediate checkpoints (the harness now persists per-checkpoint joint tables but still only saves final weights — add periodic `model.save`), select by validation, and try lower PPO `learning_rate`/`ent_coef` or a KL-to-BC-prior penalty to reduce the 2M dip and the fade.
-3. **Formal 3-seed protocol** before claiming the 16×16 milestone (seeds 11/29/47, as at 8×8). Single-seed 28.8% clears the gate but the milestone needs the multi-seed interval.
-4. **Across-training joint heatmaps.** Now unblocked: `summarize_records` persists `summary["joint"]` per checkpoint, and `plot_difficulty_heatmap.py` renders the across-training row when those tables are present. The next run produces it automatically.
-5. **DRC / recurrence comparison** (the original research goal, see below) — only once the feed-forward recipe is multi-seed-confirmed, so the comparison is not confounded by the exploration axis.
+1. **Confirm the 12x12 DRC result across two more seeds.** Use the repaired
+   final-only contract and frozen validation/hard protocol. Seed 11 has reached
+   its registered 200M horizon and floor learning rate; extending that same
+   plateau is lower value than estimating between-seed variation. Treat the
+   known test as a fixed replication endpoint, and reserve a new globally
+   untouched suite or bank for programme-level confirmation.
+2. **Measure recurrent-state recovery after a one-off reset.** Track carry,
+   logits, action divergence, optimal-action probability, and success for the
+   next 1--6 decisions, plus repeated reset spacings. This directly tests the
+   large continuous-reset/small one-shot contrast.
+3. **Target exact-state patching prospectively.** Select reconvergences without
+   outcomes and stratify by prefix-only properties or a frozen probe score when
+   next-action/logit change is the proximal outcome. In any separate cohort
+   selected for natural-action disagreement, use suffix success as the
+   estimand and action divergence only as a manipulation check.
+4. **Run a matched feed-forward/DRC seed study** before claiming recurrence
+   itself caused the 11--13-point gain; keep reward semantics, budget, suites,
+   checkpoint rule, and seeds identical.
+5. **RGB follow-up starts with a short gate.** The structured DRC satisfies the
+   registered entry criteria. Freeze the time-signal choice, then test renderer
+   correctness, real-factory throughput, and short-run learnability before a
+   long pixel run.
+6. **If returning to the 16x16 feed-forward frontier, attack robots moved.**
+   Add explicit multi-robot exposure weighting to training and BC, then pair it
+   with final-only checkpoint reporting and formal seeds.
 
 ## Artifacts, fixtures and fingerprints
 
@@ -182,11 +233,11 @@ uv pip install --python .venv-phase2/bin/python -e .
   --output-dir artifacts/phase2_experiments/phase2c_grid_cnn_2robot
 
 # 16×16 current frontier: BC warmstart + staged PPO (~5.5–6h MPS)
-nohup caffeinate -is .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py \
+nohup caffeinate -dis .venv-phase2/bin/python src/scripts/run_phase2_benchmark.py \
   --config configs/phase4b_bc_16x16.yaml \
   --bank-dir artifacts/phase4_bank \
   --output-dir artifacts/phase2_experiments/phase4b_bc_16x16 \
   > artifacts/phase2_experiments/phase4b_bc_16x16.log 2>&1 &
 ```
 
-Fixture banks are created and labelled deterministically on first use if absent (the 55k-row phase4 bank takes ~30 min; use the parallel builder in `WorkInProgress.md`). Each run writes `results.json` (full per-episode records, provenance, both fingerprints, `bc_pretrain` stats) and `report.md` under its output directory. Long runs must be launched detached (`nohup caffeinate -is … &`) — harness background tasks have been killed at ~15–20 min on this machine.
+Fixture banks are created and labelled deterministically on first use if absent (the 55k-row phase4 bank takes ~30 min; use the parallel builder in `WorkInProgress.md`). Each run writes `results.json` (full per-episode records, provenance, both fingerprints, `bc_pretrain` stats) and `report.md` under its output directory. Long runs must be launched detached (`nohup caffeinate -dis … &`) — harness background tasks have been killed at ~15–20 min on this machine, and `-d` is required to prevent display/clamshell sleep.

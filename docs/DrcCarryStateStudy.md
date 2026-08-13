@@ -1,7 +1,8 @@
 # DRC Carry-State Study: Preregistered Observational Protocol
 
-Status: protocol and implementation only. No carry dataset has been generated
-and this document reports no empirical result.
+Status: protocol frozen and study complete on 2026-08-13. The protocol below
+is retained as registered; the post-run result is summarized at the end and
+reported fully in `docs/Drc200MCarryMechanismResult.md`.
 
 ## Question and scope
 
@@ -234,3 +235,33 @@ reported coverage. Per-decision rows within an episode are correlated; the
 layout split prevents leakage but does not make rows independent experimental
 units. No result should be claimed until the preregistered CLI has run and its
 dataset/result fingerprints have been preserved.
+
+## Post-run result (2026-08-13)
+
+The registered version-2 study ran at four frozen checkpoints: 9,003,008,
+59,006,976, 135,004,160, and 200,007,680 steps. Every run used the same
+157-puzzle validation suite across all 20 observed
+`(optimal_length, robots_moved)` cells (fingerprint `5410a2bee4...`) and the
+same leak-free 118/39-layout train/test split (fingerprint `235624ed1e...`).
+Exact-distance and reducing-action oracle coverage was 100%; there were no
+censored rows.
+
+The learned carry robustly decoded intended and recent actions and contained
+nonlinear solution-adjacent information beyond both controls. At 200M, the
+best registered representations reached exact-distance R2 .229,
+optimal-action top-1-in-set .418, and reducing-action top-1-in-set .427.
+Landing-cell accuracy remained only about .10--.13, shortest-path progress was
+weak, and final future-success decoding did not beat the shuffled-label
+control. Horizon progress was also strong in the random network, correctly
+identifying the observation's time channel as an architectural rather than
+learned signal.
+
+The result supports a distributed action/history state with modest access to
+solution-relevant variables, not a clean explicit route or slide simulator.
+Cross-checkpoint trends remain confounded by the checkpoints' different
+on-policy state distributions; the matched controls within each checkpoint
+are the primary observational comparison. Probe result fingerprints are
+`952dff97...`, `46670b77...`, `d245a4a9...`, and `37ef57e0...`.
+
+See `docs/Drc200MCarryMechanismResult.md` for the complete tables, causal
+cross-check, provenance, limitations, and next-step recommendations.

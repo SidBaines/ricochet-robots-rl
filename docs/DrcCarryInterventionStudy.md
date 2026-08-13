@@ -1,9 +1,8 @@
 # DRC Carry-State Intervention Study: Preregistered Causal Protocol
 
-Status: protocol and implementation only. No checkpoint-wide intervention
-study has been run, and this document reports no empirical result. In
-particular, no carry-dependent performance difference is explained by this
-document or by implementation tests.
+Status: protocol frozen and study complete on 2026-08-13. The protocol below
+is retained as registered; the post-run result is summarized at the end and
+reported fully in `docs/Drc200MCarryMechanismResult.md`.
 
 ## Question and causal scope
 
@@ -333,3 +332,38 @@ permitted until the preregistered runner is executed on the named checkpoint
 and suite, its JSON is preserved, and the full-reset result, localization arms,
 patch eligibility, paired intervals, and per-stratum heterogeneity are reviewed
 together.
+
+## Post-run result (2026-08-13)
+
+The registered study ran at 9,003,008, 59,006,976, 135,004,160, and
+200,007,680 steps on the same 157-puzzle validation suite (fingerprint
+`5410a2bee4...`). All four exact-state donor-natural positive controls passed.
+
+The preregistered full-carry continuous-reset contrast reduced deterministic
+success by 32.48, 33.12, 31.85, and 38.22 percentage points respectively. At
+200M the untreated success rate was 77.71%; resetting every carry before each
+post-initial decision reduced it to 39.49%, with a paired 95% bootstrap
+interval of [-46.50, -29.94] points for the effect. Carry is therefore
+causally important throughout the observed learning trajectory.
+
+Final-checkpoint descriptive localization found effects of -3.18, -10.19,
+and -16.56 points for depths 0, 1, and 2, and -28.66/-21.02 for continuous
+`h`/`c` reset. Single resets after moves 1, 2, 4, and 8 were small (-2.55,
+-2.55, +1.27, and -0.64 points), consistent with rapid reconstruction,
+redundancy, or local bypass after isolated carry loss; this study does not
+distinguish them. These localization and subgroup intervals are pointwise,
+multiplicity-unadjusted, and hypothesis-generating as registered.
+
+Exact-state matching yielded 68 eligible contexts at 200M. A full coherent
+donor `h+c` patch changed action sequences in 39/68 but had 0.00-point mean
+suffix-success effect, 95% interval [-7.35, +7.35]. Thus history-dependent
+carry causally changes decisions; no directional mean success effect was
+detected at this precision among the eligible arbitrary donor histories. The
+final `c`-only patch effect (-8.82
+points) remains descriptive localization and may reflect component mismatch;
+it does not identify a unique semantic role for `c`.
+
+See `docs/Drc200MCarryMechanismResult.md` for the checkpoint-wide table,
+difficulty breakdown, observational and paired causal results, limitations,
+provenance, and next-step recommendations. Causal result file SHA-256 prefixes are
+`0b0bfab7...`, `de650a13...`, `eac83be9...`, and `30cb932e...`.

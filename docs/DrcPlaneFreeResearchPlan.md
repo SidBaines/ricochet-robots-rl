@@ -1,7 +1,8 @@
 # DRC Helper-Free Slide-Dynamics Research Plan and Execution Log
 
 Date created: 2026-07-23
-Status: executing; mandatory 60M structured-input DRC sweep in progress
+Status: complete on 2026-08-13; 200M closeout, sealed test, and carry-state
+mechanism studies reported in `docs/Drc200MCarryMechanismResult.md`
 Branch at creation: `rl-ground-up`
 
 This document is both:
@@ -663,12 +664,12 @@ write-ups should be committed.
 ### Extension and closeout
 
 - [x] Record 60M extend/stop decision.
-- [ ] If extended, complete 120M review.
-- [ ] Decide whether to extend toward 180-200M.
-- [ ] Freeze validation-selected checkpoint.
-- [ ] Run sealed test once.
-- [ ] Write final conclusion and update headline docs.
-- [ ] Decide whether the RGB follow-up entry gate is met.
+- [x] Complete 120M review.
+- [x] Decide to extend the unmodified control toward 200M.
+- [x] Freeze the final-only checkpoint rule (135M periodic best diagnostic only).
+- [x] Run the sealed test once.
+- [x] Write the final conclusion and update headline docs.
+- [x] Decide the RGB follow-up entry gate is met; require a short gate before a long run.
 
 ---
 
@@ -1433,3 +1434,62 @@ Watch items, in order of usefulness:
 Still not implemented: the extra telemetry recommended in report §11.2 (`V_mean`/
 `V_std` on a fixed probe set, and the policy-gradient share of the update). The
 `V`-at-expiry alarm is now moot, since `V` is no longer evaluated there.
+
+### 2026-08-13 — 200M closeout and recurrent-carry mechanism study complete
+
+- **Status before:** the clean v2 DRC run had reached 120M; the no-aux A0
+  control had reached 135M and was still improving. The reporting path could
+  inherit and headline a parent branch's periodic best, the test split remained
+  sealed, and the existing probes did not follow carry through real rollouts.
+- **Reporting repair:** commits `9ccf245` and `84d91f0` make final weights the
+  headline, report periodic best separately, bind every result to immutable
+  source run/timestep/path/kind/SHA, reject unsafe semantic branches, and add a
+  real joint `(optimal_length, robots_moved)` hard suite.
+- **Continuation:** resumed exactly from `training_pause_190005248.pt` with no
+  contract difference and completed at the legal 200,007,680-step rollout
+  boundary. The final source SHA is `8760ba70...`; final validation was 82.08%
+  deterministic / 82.29% stochastic and joint-hard validation was 75.96%.
+  The separately evaluated 135M periodic best scored 79.79% / 80.83% / 74.89%
+  on those same suites, so max-selection would have chosen the worse policy.
+- **Frozen DRC-line test decision:** before final-report inspection, named only
+  the 200M final checkpoint, test seed 17, 60 puzzles per length, and one
+  deterministic plus three stochastic episodes. The 135M best was never
+  tested. This split was held out from DRC training/selection; exact
+  reproduction of P1's scripted-baseline aggregates strongly evidences the
+  same selection was used for P1, whose legacy result predates suite
+  fingerprints and informed this programme. Suite
+  fingerprint: `9cf385d2...`; scientific result hash: `85d351c2...`.
+- **Sealed result:** DRC 80.42% deterministic / 81.25% stochastic versus the
+  frozen feed-forward P1 artifact's 69.17% / 68.33%, gains of +11.25/+12.92
+  points. Deterministic gains increase through the hard tail: +15 points at
+  length 5, +18.33 at length 7, +30 at length 8; +17.26 points on two-robot
+  and +29.42 on the small 17-puzzle three-robot stratum.
+- **Observational study:** commits `d78aa83` and `97e606a` add exact BFS labels,
+  real-rollout `h/c` capture, independent linear/MLP target probes, leak-free
+  layout splitting, and matched random-network/shuffled-label controls. Four
+  checkpoints (9M/59M/135M/200M) show strong action/history decoding and
+  learned nonlinear distance/optimal-action information, but only weak
+  landing-cell/shortest-path-progress structure. Final result fingerprint:
+  `37ef57e0...`.
+- **Causal study:** commits `e6c85b9` and `e3f91c6` add continuous/depth/
+  component/timing resets and exact-state matched donor patching. Full carry
+  reset every decision costs 32--38 points at every checkpoint; final effect
+  -38.22 points, paired 95% CI [-46.50, -29.94]. One-off resets are small.
+  At 200M, coherent donor carry changes actions in 39/68 exact reconvergences
+  but has 0.00-point mean suffix-success effect, CI [-7.35, +7.35]. All donor
+  positive controls pass.
+- **Interpretation:** task-performance success is achieved for this seed.
+  Carry is causally necessary and history-dependent; its resilience to
+  one-time zeroing is consistent with reconstruction, redundancy, or local
+  bypass. Probes do not support a simple explicit route or slide simulator.
+  This is a complete-recipe result, not an architecture-only or multi-seed
+  claim.
+- **Artifacts and report:** `artifacts/groundup/drc33_p1_aux_A0_control/`,
+  `artifacts/groundup/drc_carry_study_v2/`, and
+  `docs/Drc200MCarryMechanismResult.md`.
+- **Decision:** do not extend seed 11 beyond the registered 200M horizon by
+  default. Highest-value next work is multi-seed confirmation plus a
+  preregistered carry-recovery-timescale intervention. Treat the known test as
+  a fixed replication endpoint and reserve a new globally untouched suite for
+  programme-level confirmation. The RGB entry gate is met, but begin with a
+  correctness/throughput/short-learnability gate rather than a full long run.

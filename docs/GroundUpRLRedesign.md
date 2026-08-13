@@ -180,11 +180,12 @@ richer (stop/distance planes) until ladder steps 1–2 land.
 Results are appended chronologically to `WorkInProgress.md` per repo
 convention.
 
-## 6. Results to date (updated 2026-07-20)
+## 6. Results to date (updated 2026-08-13)
 
-All numbers are masked, full-start evaluations; "sealed test" suites were
-never used for any training or selection decision. Single seed (11)
-throughout — exploratory phase by agreement. W&B project:
+All numbers are masked, full-start evaluations. Each "sealed test" suite was
+excluded from the reported model/checkpoint's own training and selection;
+some selections were known from earlier experiments, as specifically noted
+for D2 below. Single seed (11) throughout — exploratory phase by agreement. W&B project:
 `ricochet-robots-rl`, runs prefixed `groundup-`.
 
 | Experiment | Setup | Result |
@@ -198,6 +199,13 @@ throughout — exploratory phase by agreement. W&B project:
 | D1 DRC(3,3) 8×8 gate | faithful DRC, recurrent masked PPO | **99.2% det, stable through 1M** (v3; v1/v2 exposed and fixed two trainer bugs) |
 | D1 DRC(3,3) 16×16 | all helpers, 10M | **64.8% sealed-test det** — matches feedforward on 1-robot puzzles, collapses on multi-robot (39/41% vs 68/59%); faithful flatten readout is the suspected binding constraint |
 | P1 12×12 plane-free | no stop/distance planes, flat head, 181M steps | **69.2% sealed-test det** (best ckpt 112M); task plateaued 66–73% from 50M; landing-cell probes: mid/long slides never exceeded ~6%/4% decodability — the ray-tracing circuit never formed; motivates auxiliary landing-cell loss for ladder step 2 |
+| D2 DRC(3,3) 12×12 plane-free | no stop/distance planes, recurrent PPO, 200M | **80.42% det / 81.25% stoch** on the fixed DRC-held-out seed-11 suite, +11.25/+12.92pp over P1; full-carry reset costs 38.22pp at 200M; see `docs/Drc200MCarryMechanismResult.md` |
+
+For D2, “held out” is scoped to DRC training and selection. Legacy P1 predates
+suite fingerprints, but reproducing every scripted-baseline aggregate strongly
+evidences that it used the same selection; its aggregate strata informed the
+DRC plan. Exact identity is therefore reconstructed rather than hash-proven
+from the old JSON.
 
 Failures found and fixed along the way (each within ~1M steps of training,
 via behavioral probes; all now regression-tested):
@@ -214,8 +222,13 @@ via behavioral probes; all now regression-tested):
 5. RGB renderer geometry (open wall corners, shrunken edge cells, off-centre
    sprites, tint bleed). Fix: +1px canvas, closed segments, interior-only
    sprites/tint.
+6. Resumed branch reports could silently headline an inherited parent best.
+   Fix: final-only headline evaluation from immutable content-addressed
+   checkpoints, explicit best-periodic diagnostics, verified provenance, and
+   preflight rejection of unsafe semantic branches.
 
-Infrastructure: `src/groundup/` (~2,400 lines incl. the faithful DRC core
-and recurrent trainer), 66 tests across `test_groundup.py`,
-`test_drc_faithful.py`, `test_drc_train.py`. Throughput: 1,000–4,000 st/s
+Infrastructure: `src/groundup/` now includes the faithful DRC core, recurrent
+trainer, immutable evaluation provenance, exact carry-state probes, and paired
+causal interventions. At the final mechanism-study commit the full suite was
+273 passed, 9 intentionally skipped. Throughput remains 1,000–4,000 st/s
 depending on configuration (legacy: ~700).
