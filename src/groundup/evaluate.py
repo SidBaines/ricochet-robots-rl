@@ -26,9 +26,11 @@ def _aggregate(records: List[dict]) -> Dict[str, object]:
     overall = float(np.mean([r["success"] for r in records])) if records else 0.0
     by_length: Dict[int, List[int]] = defaultdict(list)
     by_robots: Dict[int, List[int]] = defaultdict(list)
+    by_joint: Dict[int, Dict[int, List[int]]] = defaultdict(lambda: defaultdict(list))
     for r in records:
         by_length[r["optimal_length"]].append(r["success"])
         by_robots[r["robots_moved"]].append(r["success"])
+        by_joint[r["optimal_length"]][r["robots_moved"]].append(r["success"])
     return {
         "success_rate": round(overall, 4),
         "episodes": len(records),
@@ -39,6 +41,19 @@ def _aggregate(records: List[dict]) -> Dict[str, object]:
         "by_robots_moved": {
             robots: {"success_rate": round(float(np.mean(v)), 4), "n": len(v)}
             for robots, v in sorted(by_robots.items())
+        },
+        # String keys survive a JSON round trip unchanged. A nested mapping is
+        # unambiguous and keeps the two independently meaningful dimensions
+        # available to report consumers.
+        "by_joint_stratum": {
+            str(length): {
+                str(robots): {
+                    "success_rate": round(float(np.mean(values)), 4),
+                    "n": len(values),
+                }
+                for robots, values in sorted(by_robots_for_length.items())
+            }
+            for length, by_robots_for_length in sorted(by_joint.items())
         },
     }
 

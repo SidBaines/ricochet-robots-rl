@@ -94,6 +94,7 @@ import json
 import os
 import random
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1034,6 +1035,9 @@ def _flatten_eval(prefix: str, summary: dict) -> dict:
         out[f"{prefix}/len_{length}"] = v["success_rate"]
     for robots, v in summary.get("by_robots_moved", {}).items():
         out[f"{prefix}/robots_{robots}"] = v["success_rate"]
+    for length, by_robots in summary.get("by_joint_stratum", {}).items():
+        for robots, v in by_robots.items():
+            out[f"{prefix}/joint_len_{length}_robots_{robots}"] = v["success_rate"]
     return out
 
 
@@ -1224,23 +1228,50 @@ def _state_dicts_equal(
     )
 
 
+def _load_verified_evaluation_source(
+    net: DRCNet,
+    source: Dict[str, object],
+    expected_state_dict: Dict[str, torch.Tensor],
+) -> None:
+    """Load the exact source bytes named by provenance, verifying their state."""
+    checkpoint_path = Path(str(source["checkpoint_path"]))
+    expected_sha256 = source.get("checkpoint_sha256")
+    if not isinstance(expected_sha256, str) or _file_sha256(checkpoint_path) != expected_sha256:
+        raise RuntimeError(f"Evaluation checkpoint provenance mismatch: {checkpoint_path}")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if payload.get("kind") == "drc_model" and int(payload.get("schema_version", -1)) == 2:
+        source_state_dict = payload["state_dict"]
+    elif (
+        payload.get("kind") == "drc_training_state"
+        and source.get("state_location") == "run_state.best_state_dict"
+    ):
+        source_state_dict = payload["run_state"]["best_state_dict"]
+    else:
+        raise RuntimeError(f"Evaluation source does not contain model weights: {checkpoint_path}")
+    if not _state_dicts_equal(source_state_dict, expected_state_dict):
+        raise RuntimeError(
+            f"Evaluation source tensors do not match the selected best: {checkpoint_path}"
+        )
+    net.load_state_dict(source_state_dict)
+
+
 def _reconstruct_legacy_best_source(
     resume_path: str | Path,
     resume_payload: Dict[str, object],
     best_state_dict: Dict[str, torch.Tensor],
     best_timesteps: Optional[int],
+    *,
+    existing_source: Optional[Dict[str, object]] = None,
+    destination_dir: Optional[Path] = None,
 ) -> Dict[str, object]:
-    """Recover provenance omitted by older outer-schema-1 checkpoints.
-
-    Prefer a sibling schema-2 ``model_best.pt`` only after proving its tensors
-    equal the embedded best state. Otherwise the training checkpoint itself is
-    the exact, hash-addressed container from which the evaluated state came.
-    """
+    """Give an inherited best state durable, tensor-verified provenance."""
     resume_path = Path(resume_path)
-    candidate = resume_path.parent / "model_best.pt"
-    if candidate.is_file():
+
+    def verified_model(path: Path) -> Optional[Dict[str, object]]:
+        if not path.is_file():
+            return None
         try:
-            candidate_payload = torch.load(candidate, map_location="cpu", weights_only=False)
+            candidate_payload = torch.load(path, map_location="cpu", weights_only=False)
             candidate_metadata = candidate_payload.get("metadata", {})
             candidate_timestep = (
                 candidate_metadata.get("timesteps")
@@ -1258,16 +1289,133 @@ def _reconstruct_legacy_best_source(
                 and timestep_matches
                 and _state_dicts_equal(candidate_payload["state_dict"], best_state_dict)
             ):
-                return _model_checkpoint_source(
-                    candidate,
-                    candidate_payload,
-                    source_timesteps=best_timesteps,
-                    provenance_reconstructed=True,
-                )
+                return candidate_payload
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             pass
+        return None
+
+    # Sources written by the repaired trainer are already immutable. Verify
+    # both their bytes and tensors before carrying them across a continuation.
+    if isinstance(existing_source, dict):
+        existing_path_text = existing_source.get("checkpoint_path")
+        existing_sha = existing_source.get("checkpoint_sha256")
+        if isinstance(existing_path_text, str) and isinstance(existing_sha, str):
+            existing_path = Path(existing_path_text)
+            immutable_name = existing_path.name.startswith("model_eval_") or (
+                best_timesteps is not None
+                and existing_path.name == f"model_{int(best_timesteps)}.pt"
+            )
+            if (
+                immutable_name
+                and existing_path.is_file()
+                and _file_sha256(existing_path) == existing_sha
+                and verified_model(existing_path) is not None
+            ):
+                return dict(existing_source)
+
+    # Historical periodic snapshots were already no-overwrite. Prefer the
+    # exact best-timestep snapshot when its tensors prove the identity.
+    if best_timesteps is not None:
+        periodic_path = resume_path.parent / f"model_{int(best_timesteps)}.pt"
+        periodic_payload = verified_model(periodic_path)
+        if periodic_payload is not None:
+            return _model_checkpoint_source(
+                periodic_path,
+                periodic_payload,
+                source_timesteps=best_timesteps,
+                provenance_reconstructed=True,
+            )
+
+    # A prior source or model_best alias may still contain the right tensors,
+    # but its filename is mutable. Copy its exact bytes to a content-addressed
+    # path before allowing any report to name it.
+    mutable_candidates: List[Path] = []
+    if isinstance(existing_source, dict):
+        existing_path_text = existing_source.get("checkpoint_path")
+        existing_sha = existing_source.get("checkpoint_sha256")
+        if isinstance(existing_path_text, str):
+            existing_path = Path(existing_path_text)
+            if (
+                isinstance(existing_sha, str)
+                and existing_path.is_file()
+                and _file_sha256(existing_path) == existing_sha
+            ):
+                mutable_candidates.append(existing_path)
+    mutable_candidates.append(resume_path.parent / "model_best.pt")
+    seen_candidates = set()
+    for candidate in mutable_candidates:
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate in seen_candidates:
+            continue
+        seen_candidates.add(resolved_candidate)
+        candidate_payload = verified_model(candidate)
+        if candidate_payload is None:
+            continue
+        immutable_path = _materialize_immutable_evaluation_checkpoint(
+            candidate,
+            source_timesteps=best_timesteps,
+        )
+        return _model_checkpoint_source(
+            immutable_path,
+            candidate_payload,
+            source_timesteps=best_timesteps,
+            provenance_reconstructed=True,
+        )
 
     stored_config = resume_payload.get("config", {})
+    algo_state = resume_payload.get("algo_state", {})
+    algo_contract = algo_state.get("contract", {}) if isinstance(algo_state, dict) else {}
+    observation_shape = algo_contract.get("obs_shape")
+    n_actions = algo_contract.get("n_actions")
+    if observation_shape is not None and n_actions is not None:
+        payload = {
+            "kind": "drc_model",
+            "schema_version": 2,
+            "state_dict": best_state_dict,
+            "config": stored_config,
+            "config_fingerprint": _sha256_json(stored_config),
+            "observation_shape": tuple(observation_shape),
+            "n_actions": int(n_actions),
+            "metadata": {
+                "kind": "legacy_best_eval_source",
+                "timesteps": (
+                    None if best_timesteps is None else int(best_timesteps)
+                ),
+            },
+        }
+        materialize_dir = Path(destination_dir or resume_path.parent)
+        materialize_dir.mkdir(parents=True, exist_ok=True)
+        staged_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=".legacy_best_eval_",
+                suffix=".pt",
+                dir=materialize_dir,
+                delete=False,
+            ) as staged:
+                staged_path = Path(staged.name)
+            torch.save(payload, staged_path)
+            immutable_path = _materialize_immutable_evaluation_checkpoint(
+                staged_path,
+                source_timesteps=best_timesteps,
+            )
+        finally:
+            if staged_path is not None:
+                staged_path.unlink(missing_ok=True)
+        return _model_checkpoint_source(
+            immutable_path,
+            payload,
+            source_timesteps=best_timesteps,
+            provenance_reconstructed=True,
+        )
+
+    # Very old training payloads may lack the model shape contract. Their
+    # immutable content-addressed copy still durably contains the embedded best
+    # tensors and remains readable under the existing outer schema.
+    immutable_resume = _materialize_immutable_evaluation_checkpoint(
+        resume_path,
+        source_timesteps=best_timesteps,
+    )
     originating_run = (
         stored_config.get("run_name") if isinstance(stored_config, dict) else None
     ) or resume_path.parent.name
@@ -1275,9 +1423,9 @@ def _reconstruct_legacy_best_source(
         "source_type": "model_checkpoint",
         "originating_run_name": originating_run,
         "source_timesteps": None if best_timesteps is None else int(best_timesteps),
-        "checkpoint_path": str(resume_path.resolve()),
+        "checkpoint_path": str(immutable_resume.resolve()),
         "checkpoint_kind": "training_state_embedded_best",
-        "checkpoint_sha256": _file_sha256(resume_path),
+        "checkpoint_sha256": _file_sha256(immutable_resume),
         "state_location": "run_state.best_state_dict",
         "provenance_reconstructed": True,
     }
@@ -1429,6 +1577,61 @@ def _atomic_torch_save(payload: Dict[str, object], path: Path, *, immutable: boo
     os.replace(temporary, path)
 
 
+def _materialize_immutable_evaluation_checkpoint(
+    source_path: str | Path,
+    *,
+    source_timesteps: Optional[int],
+) -> Path:
+    """Copy checkpoint bytes to an immutable, content-addressed evaluation path.
+
+    The timestep keeps filenames legible while the full SHA-256 handles two
+    different checkpoints produced at the same timestep. Publishing uses a
+    no-overwrite hard link from a private completed copy, so an existing exact
+    target is idempotently reused and no partial checkpoint is ever visible.
+    The published file has a distinct inode from the mutable source alias.
+    """
+    source = Path(source_path)
+    staged_path: Optional[Path] = None
+    try:
+        digest = hashlib.sha256()
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".model_eval_",
+            suffix=".tmp",
+            dir=source.parent,
+            delete=False,
+        ) as staged:
+            staged_path = Path(staged.name)
+            with source.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    staged.write(block)
+                    digest.update(block)
+            staged.flush()
+            os.fsync(staged.fileno())
+
+        checkpoint_sha256 = digest.hexdigest()
+        timestep_label = (
+            "unknown" if source_timesteps is None else str(int(source_timesteps))
+        )
+        target = source.parent / (
+            f"model_eval_{timestep_label}_{checkpoint_sha256}.pt"
+        )
+        try:
+            os.link(staged_path, target)
+        except FileExistsError:
+            if _file_sha256(target) != checkpoint_sha256:
+                raise RuntimeError(
+                    "Immutable evaluation checkpoint path exists with different "
+                    f"bytes: {target}"
+                )
+        if _file_sha256(target) != checkpoint_sha256:
+            raise RuntimeError(f"Published evaluation checkpoint failed verification: {target}")
+        return target
+    finally:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+
+
 def _save_model(
     net: DRCNet,
     config: DRCTrainConfig,
@@ -1451,6 +1654,26 @@ def _save_model(
         path,
         immutable=immutable,
     )
+
+
+def _save_evaluation_model(
+    net: DRCNet,
+    config: DRCTrainConfig,
+    alias_path: Path,
+    *,
+    metadata: Dict[str, object],
+) -> Tuple[Path, Dict[str, object]]:
+    """Save a convenience alias and return the durable checkpoint to evaluate."""
+    _save_model(net, config, alias_path, metadata=metadata)
+    source_timesteps = metadata.get("timesteps")
+    immutable_path = _materialize_immutable_evaluation_checkpoint(
+        alias_path,
+        source_timesteps=(
+            None if source_timesteps is None else int(source_timesteps)
+        ),
+    )
+    payload = _load_model_checkpoint(net, immutable_path)
+    return immutable_path, payload
 
 
 def _save_training_checkpoint(
@@ -1482,16 +1705,15 @@ def _save_training_checkpoint(
     )
 
 
-def _load_training_checkpoint(
-    path: str | Path,
+def _resume_contract_changes(
+    payload: Dict[str, object],
     *,
-    algo: RecurrentPPO,
-    sampler: object,
+    path: str | Path,
     config: DRCTrainConfig,
-    allow_device_change: bool = False,
-) -> Dict[str, object]:
-    payload = torch.load(path, map_location=algo.device, weights_only=False)
-    if payload.get("kind") != "drc_training_state" or int(payload.get("schema_version", -1)) != 1:
+) -> List[str]:
+    if payload.get("kind") != "drc_training_state" or int(
+        payload.get("schema_version", -1)
+    ) != 1:
         raise ValueError(f"Not a supported DRC training-state checkpoint: {path}")
     expected_contract = _config_contract(config)
     changed = _contract_differences(payload.get("config_contract", {}), expected_contract)
@@ -1503,6 +1725,19 @@ def _load_training_checkpoint(
             "deliberate experiment branch rather than a resume, declare them in "
             "resume_allow_contract_change."
         )
+    return changed
+
+
+def _load_training_checkpoint(
+    path: str | Path,
+    *,
+    algo: RecurrentPPO,
+    sampler: object,
+    config: DRCTrainConfig,
+    allow_device_change: bool = False,
+) -> Dict[str, object]:
+    payload = torch.load(path, map_location=algo.device, weights_only=False)
+    changed = _resume_contract_changes(payload, path=path, config=config)
     if changed:
         print(
             "[drc] BRANCH, not an exact continuation: deliberately changed contract "
@@ -1542,12 +1777,33 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             f"schedule_total_steps ({schedule_total_steps}) must be >= "
             f"total_steps ({config.total_steps})"
         )
-    if config.hard_eval_per_stratum < 0:
+    if config.hard_eval_per_stratum <= 0:
         raise ValueError(
-            "hard_eval_per_stratum must be non-negative, got "
+            "hard_eval_per_stratum must be positive, got "
             f"{config.hard_eval_per_stratum}"
         )
     out = Path(config.out_dir) / config.run_name
+    if (
+        config.resume_from is not None
+        and config.resume_allow_contract_change
+        and out.resolve() == Path(config.resume_from).resolve().parent
+    ):
+        preflight_payload = torch.load(
+            config.resume_from,
+            map_location="cpu",
+            weights_only=False,
+        )
+        preflight_changes = _resume_contract_changes(
+            preflight_payload,
+            path=config.resume_from,
+            config=config,
+        )
+        if preflight_changes:
+            raise ValueError(
+                "Refusing semantic branch in the same resolved output directory "
+                f"as its resume checkpoint parent: {out.resolve()}. Use a new "
+                "out_dir/run_name so parent artifacts remain unambiguous."
+            )
     out.mkdir(parents=True, exist_ok=True)
     curve_path = out / "curve.jsonl"
     if config.resume_from is None and curve_path.exists():
@@ -1737,12 +1993,14 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             best_state_dict = run_state.get("best_state_dict")
             best_source = run_state.get("best_source")
             best_selection_provenance = run_state.get("best_selection_provenance")
-            if best_state_dict is not None and best_source is None:
+            if best_state_dict is not None:
                 best_source = _reconstruct_legacy_best_source(
                     config.resume_from,
                     resume_payload,
                     best_state_dict,
                     best_timesteps,
+                    existing_source=best_source,
+                    destination_dir=out,
                 )
             if (
                 best_state_dict is not None
@@ -1755,6 +2013,9 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
                         best_source,
                     )
                 )
+            elif best_selection_provenance is not None and best_source is not None:
+                best_selection_provenance = dict(best_selection_provenance)
+                best_selection_provenance["source"] = dict(best_source)
         # A declared semantic branch starts a new experiment's selection
         # process. It resumes optimizer/environment state, but not its parent's
         # notion of which weights are best.
@@ -1843,14 +2104,16 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             while next_eval <= algo.num_timesteps:
                 next_eval += config.eval_every
             latest_path = out / "model_latest.pt"
-            _save_model(
+            latest_eval_path, latest_payload = _save_evaluation_model(
                 net,
                 config,
                 latest_path,
                 metadata=snapshot_metadata("model_latest"),
             )
-            latest_payload = _load_model_checkpoint(net, latest_path)
-            latest_source = _model_checkpoint_source(latest_path, latest_payload)
+            latest_source = _model_checkpoint_source(
+                latest_eval_path,
+                latest_payload,
+            )
             det = _evaluate_model_with_provenance(
                 net,
                 val_suite,
@@ -1874,13 +2137,10 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
                     out / "model_best.pt",
                     metadata=snapshot_metadata("model_best"),
                 )
-                best_payload = torch.load(
-                    out / "model_best.pt", map_location="cpu", weights_only=False
-                )
-                best_source = _model_checkpoint_source(
-                    out / "model_best.pt", best_payload
-                )
-                best_selection_provenance["source"] = dict(best_source)
+                # The periodic immutable checkpoint is the exact file loaded
+                # for the selection score. model_best.pt is only a convenient
+                # alias of those tensors and must never become provenance.
+                best_source = dict(latest_source)
             entry = {
                 "timesteps": int(algo.num_timesteps),
                 "elapsed_s": round(elapsed_total(), 1),
@@ -1953,7 +2213,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         schedule_total_steps=schedule_total_steps,
     )
     final_model_path = out / "model_final.pt"
-    _save_model(
+    final_eval_path, final_model_payload = _save_evaluation_model(
         net,
         config,
         final_model_path,
@@ -1962,8 +2222,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
     # Headline evaluation is checkpoint-backed by construction: reload the
     # just-written model instead of relying on whichever weights happen to be
     # resident in memory.
-    final_model_payload = _load_model_checkpoint(net, final_model_path)
-    final_source = _model_checkpoint_source(final_model_path, final_model_payload)
+    final_source = _model_checkpoint_source(final_eval_path, final_model_payload)
     _save_training_checkpoint(
         algo,
         sampler,
@@ -2011,7 +2270,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
     if best_state_dict is not None:
         if best_source is None:
             raise RuntimeError("Best weights exist without checkpoint provenance")
-        net.load_state_dict(best_state_dict)
+        _load_verified_evaluation_source(net, best_source, best_state_dict)
         best_periodic_val_det = _evaluate_model_with_provenance(
             net,
             final_suite,
@@ -2044,7 +2303,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         )
         # Do not leave a completed run's in-memory network pointing at a
         # secondary comparison checkpoint.
-        _load_model_checkpoint(net, final_model_path)
+        _load_model_checkpoint(net, final_eval_path)
 
     report = {
         "config": dataclasses.asdict(config),

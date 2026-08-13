@@ -39,6 +39,7 @@ from src.groundup.drc_train import (
 )
 from src.groundup.curriculum import ReverseFrontierSampler
 from src.groundup.env import EnvConfig, RicochetEnv
+from src.groundup.evaluate import _aggregate
 from src.groundup.puzzles import Puzzle
 
 BANK_8 = Path("artifacts/phase2b_bank/size-8x8_numR2_ET1_CL1_gen10.parquet")
@@ -736,7 +737,13 @@ def test_evaluate_drc_protocol_and_determinism():
     assert det["episodes"] == len(puzzles) * 2
     assert set(det["by_length"]) == {1, 2}
     assert det["deterministic"] is True
-    assert set(det) >= {"success_rate", "episodes", "by_length", "by_robots_moved"}
+    assert set(det) >= {
+        "success_rate",
+        "episodes",
+        "by_length",
+        "by_robots_moved",
+        "by_joint_stratum",
+    }
 
     det2 = evaluate_drc(
         net, puzzles, env_config, episodes_per_puzzle=2, deterministic=True, batch_size=3
@@ -748,6 +755,26 @@ def test_evaluate_drc_protocol_and_determinism():
     )
     assert stoch["episodes"] == len(puzzles) * 3
     assert stoch["deterministic"] is False
+
+
+def test_aggregate_reports_json_stable_joint_stratum_counts_and_rates():
+    records = [
+        {"success": True, "optimal_length": 1, "robots_moved": 1},
+        {"success": False, "optimal_length": 1, "robots_moved": 1},
+        {"success": True, "optimal_length": 1, "robots_moved": 2},
+        {"success": False, "optimal_length": 2, "robots_moved": 1},
+    ]
+
+    joint = _aggregate(records)["by_joint_stratum"]
+
+    assert joint == {
+        "1": {
+            "1": {"success_rate": 0.5, "n": 2},
+            "2": {"success_rate": 1.0, "n": 1},
+        },
+        "2": {"1": {"success_rate": 0.0, "n": 1}},
+    }
+    assert json.loads(json.dumps(joint)) == joint
 
 
 def test_evaluate_drc_leaves_the_callers_rng_untouched():
@@ -1248,6 +1275,12 @@ def test_learn_smoke_end_to_end(tmp_path):
         assert 0.0 <= summary["success_rate"] <= 1.0
         assert summary["episodes"] > 0
     assert saved_report["final_val_stoch"]["deterministic"] is False
+    hard_joint = saved_report["final_hard_val_det"]["by_joint_stratum"]
+    hard_cells = [cell for by_robots in hard_joint.values() for cell in by_robots.values()]
+    assert sum(cell["n"] for cell in hard_cells) == saved_report["final_hard_val_det"][
+        "episodes"
+    ]
+    assert all(0.0 <= cell["success_rate"] <= 1.0 for cell in hard_cells)
 
     # Keep-best is a separate comparison. The headline always describes this
     # run's just-saved final checkpoint.
@@ -1399,6 +1432,33 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_immutable_eval_checkpoint_is_idempotent_and_collision_safe(tmp_path):
+    from src.groundup.drc_train import _materialize_immutable_evaluation_checkpoint
+
+    mutable_alias = tmp_path / "model_latest.pt"
+    mutable_alias.write_bytes(b"first evaluated checkpoint")
+
+    first = _materialize_immutable_evaluation_checkpoint(
+        mutable_alias,
+        source_timesteps=123,
+    )
+    repeated = _materialize_immutable_evaluation_checkpoint(
+        mutable_alias,
+        source_timesteps=123,
+    )
+    assert repeated == first
+    assert first.read_bytes() == b"first evaluated checkpoint"
+
+    mutable_alias.write_bytes(b"different checkpoint at the same timestep")
+    collision = _materialize_immutable_evaluation_checkpoint(
+        mutable_alias,
+        source_timesteps=123,
+    )
+    assert collision != first
+    assert collision.read_bytes() == b"different checkpoint at the same timestep"
+    assert first.read_bytes() == b"first evaluated checkpoint"
+
+
 def test_final_headline_uses_model_final_and_best_periodic_is_separate(
     tmp_path, monkeypatch
 ):
@@ -1421,23 +1481,27 @@ def test_final_headline_uses_model_final_and_best_periodic_is_separate(
     assert final_source["originating_run_name"] == config.run_name
     assert final_source["source_timesteps"] == 64
     assert final_source["checkpoint_kind"] == "model_final"
-    assert Path(final_source["checkpoint_path"]) == (out / "model_final.pt").resolve()
-    assert final_source["checkpoint_sha256"] == _sha256_file(out / "model_final.pt")
+    final_path = Path(final_source["checkpoint_path"])
+    assert final_path.parent == out.resolve()
+    assert final_path.name.startswith("model_eval_64_")
+    assert final_path != (out / "model_final.pt").resolve()
+    assert final_source["checkpoint_sha256"] == _sha256_file(final_path)
 
     best_source = report["best_periodic_val_det"]["provenance"]["source"]
     assert best_source["originating_run_name"] == config.run_name
     assert best_source["source_timesteps"] == 64
-    assert best_source["checkpoint_kind"] == "model_best"
-    assert Path(best_source["checkpoint_path"]) == (out / "model_best.pt").resolve()
-    assert best_source["checkpoint_sha256"] == _sha256_file(out / "model_best.pt")
+    assert best_source["checkpoint_kind"] == "model_latest"
+    best_path = Path(best_source["checkpoint_path"])
+    assert best_path.parent == out.resolve()
+    assert best_path.name.startswith("model_eval_64_")
+    assert best_path != (out / "model_best.pt").resolve()
+    assert best_source["checkpoint_sha256"] == _sha256_file(best_path)
     assert best_source != final_source
 
     suites = report["provenance"]["evaluation_suites"]
     selection = report["best_selection_provenance"]
-    assert selection["source"]["checkpoint_kind"] == "model_best"
-    assert selection["source"]["checkpoint_sha256"] == _sha256_file(
-        out / "model_best.pt"
-    )
+    assert selection["source"] == best_source
+    assert selection["source"]["checkpoint_sha256"] == _sha256_file(best_path)
     assert selection["suite"] == suites["validation_periodic"]
     assert report["final_val_det"]["provenance"]["suite"] == suites["validation_final"]
     assert report["final_hard_val_det"]["provenance"]["suite"] == suites["validation_hard"]
@@ -1450,6 +1514,95 @@ def test_final_headline_uses_model_final_and_best_periodic_is_separate(
         assert source["source_type"] == "scripted_policy"
         assert "checkpoint_path" not in source
         assert "checkpoint_sha256" not in source
+
+
+def test_score_provenance_survives_later_same_directory_saves(tmp_path, monkeypatch):
+    import src.groundup.drc_train as drc_train
+
+    _install_checkpoint_reporting_fakes(monkeypatch)
+    puzzles = synthetic_puzzles()
+    config = _reporting_test_config(tmp_path, "continued_in_place")
+    first_report = build_and_train(config, puzzles_override=puzzles)
+    out = tmp_path / config.run_name
+    first_curve = [json.loads(line) for line in (out / "curve.jsonl").read_text().splitlines()]
+
+    sources = [first_curve[0]["val_det"]["provenance"]["source"]]
+    sources.extend(
+        first_report[key]["provenance"]["source"]
+        for key in (
+            "final_val_det",
+            "final_val_stoch",
+            "final_hard_val_det",
+            "best_periodic_val_det",
+            "best_periodic_val_stoch",
+            "best_periodic_hard_val_det",
+        )
+    )
+    sources.append(first_report["best_selection_provenance"]["source"])
+    original_sources = {
+        (source["checkpoint_path"], source["checkpoint_sha256"])
+        for source in sources
+    }
+    assert len(original_sources) == 2  # periodic/selected-best and final bytes
+    for path_text, expected_sha in original_sources:
+        path = Path(path_text)
+        assert path.name.startswith("model_eval_64_")
+        assert _sha256_file(path) == expected_sha
+
+    def fill(net, value):
+        with torch.no_grad():
+            for parameter in net.parameters():
+                parameter.fill_(value)
+
+    def continue_with_new_periodic_and_final(
+        self, total_steps, on_iteration=None, *, schedule_total_steps=None
+    ):
+        fill(self.net, 0.6)
+        self.num_timesteps = 128
+        if on_iteration is not None:
+            on_iteration(self, {"fake_loss": 0.0})
+        fill(self.net, 0.9)
+        self.num_timesteps = total_steps
+
+    monkeypatch.setattr(
+        drc_train.RecurrentPPO,
+        "learn",
+        continue_with_new_periodic_and_final,
+    )
+    continued = dataclasses.replace(
+        config,
+        total_steps=128,
+        resume_from=str(out / "training_final.pt"),
+    )
+    build_and_train(continued, puzzles_override=puzzles)
+
+    historical_report = json.loads((out / "report_64.json").read_text())
+    historical_curve = json.loads((out / "curve.jsonl").read_text().splitlines()[0])
+    assert historical_report["final_val_det"]["provenance"]["source"] == first_report[
+        "final_val_det"
+    ]["provenance"]["source"]
+    assert historical_curve["val_det"]["provenance"]["source"] == first_curve[0][
+        "val_det"
+    ]["provenance"]["source"]
+    for path_text, expected_sha in original_sources:
+        path = Path(path_text)
+        assert path.is_file()
+        assert _sha256_file(path) == expected_sha
+
+
+@pytest.mark.parametrize("hard_eval_per_stratum", [0, -1])
+def test_build_rejects_non_positive_hard_eval_per_stratum(
+    tmp_path, monkeypatch, hard_eval_per_stratum
+):
+    _install_checkpoint_reporting_fakes(monkeypatch)
+    config = _reporting_test_config(
+        tmp_path,
+        f"invalid_hard_{hard_eval_per_stratum}",
+        hard_eval_per_stratum=hard_eval_per_stratum,
+    )
+
+    with pytest.raises(ValueError, match="hard_eval_per_stratum must be positive"):
+        build_and_train(config, puzzles_override=synthetic_puzzles())
 
 
 def test_declared_branch_resets_parent_best_tracking(tmp_path, monkeypatch):
@@ -1481,12 +1634,47 @@ def test_declared_branch_resets_parent_best_tracking(tmp_path, monkeypatch):
     assert not (tmp_path / "branch" / "model_best.pt").exists()
 
 
+def test_declared_branch_rejects_parent_output_directory_without_deleting_best(
+    tmp_path, monkeypatch
+):
+    _install_checkpoint_reporting_fakes(monkeypatch)
+    puzzles = synthetic_puzzles()
+    parent_config = _reporting_test_config(tmp_path, "same_directory_parent")
+    build_and_train(parent_config, puzzles_override=puzzles)
+    parent_dir = tmp_path / parent_config.run_name
+    parent_checkpoint = parent_dir / "training_final.pt"
+    parent_best = parent_dir / "model_best.pt"
+    best_sha = _sha256_file(parent_best)
+    config_sha = _sha256_file(parent_dir / "config.json")
+
+    branch_config = dataclasses.replace(
+        parent_config,
+        total_steps=128,
+        resume_from=str(parent_checkpoint),
+        aux_landing_coef=1.0,
+        resume_allow_contract_change=["aux_landing_coef"],
+    )
+    with pytest.raises(
+        ValueError,
+        match="semantic branch.*same resolved output directory",
+    ):
+        build_and_train(branch_config, puzzles_override=puzzles)
+
+    assert parent_best.is_file()
+    assert _sha256_file(parent_best) == best_sha
+    assert _sha256_file(parent_dir / "config.json") == config_sha
+
+
 def test_exact_continuation_preserves_and_reconstructs_legacy_best_source(
     tmp_path, monkeypatch
 ):
     _install_checkpoint_reporting_fakes(monkeypatch)
     puzzles = synthetic_puzzles()
-    parent_config = _reporting_test_config(tmp_path, "legacy_parent")
+    parent_config = _reporting_test_config(
+        tmp_path,
+        "legacy_parent",
+        checkpoint_every=64,
+    )
     build_and_train(parent_config, puzzles_override=puzzles)
     parent_dir = tmp_path / "legacy_parent"
 
@@ -1519,12 +1707,56 @@ def test_exact_continuation_preserves_and_reconstructs_legacy_best_source(
     source = report["best_periodic_val_det"]["provenance"]["source"]
     assert source["originating_run_name"] == parent_config.run_name
     assert source["source_timesteps"] == 64
-    assert source["checkpoint_kind"] == "model_best"
-    assert Path(source["checkpoint_path"]) == (parent_dir / "model_best.pt").resolve()
-    assert source["checkpoint_sha256"] == _sha256_file(parent_dir / "model_best.pt")
+    assert source["checkpoint_kind"] == "periodic"
+    assert Path(source["checkpoint_path"]) == (parent_dir / "model_64.pt").resolve()
+    assert source["checkpoint_sha256"] == _sha256_file(parent_dir / "model_64.pt")
     assert source["provenance_reconstructed"] is True
     selection = report["best_selection_provenance"]
     assert selection["suite"]["fingerprint"] == report["provenance"][
         "evaluation_suites"
     ]["validation_periodic"]["fingerprint"]
     assert selection["provenance_reconstructed"] is True
+
+
+def test_legacy_best_fallback_materializes_standalone_immutable_source(
+    tmp_path, monkeypatch
+):
+    _install_checkpoint_reporting_fakes(monkeypatch)
+    puzzles = synthetic_puzzles()
+    parent_config = _reporting_test_config(tmp_path, "legacy_fallback_parent")
+    build_and_train(parent_config, puzzles_override=puzzles)
+    parent_dir = tmp_path / parent_config.run_name
+
+    # Remove provenance as in the legacy schema, use the mutable latest file as
+    # the resume source, and make model_best tensor-incompatible. The embedded
+    # best_state_dict is then the only trustworthy copy of the selected state.
+    legacy_path = parent_dir / "training_latest.pt"
+    legacy_payload = torch.load(legacy_path, map_location="cpu", weights_only=False)
+    legacy_payload["run_state"].pop("best_source", None)
+    legacy_payload["run_state"].pop("best_selection_provenance", None)
+    torch.save(legacy_payload, legacy_path)
+    torch.save(
+        torch.load(parent_dir / "model_final.pt", map_location="cpu", weights_only=False),
+        parent_dir / "model_best.pt",
+    )
+
+    child_config = _reporting_test_config(
+        tmp_path,
+        "legacy_fallback_child",
+        total_steps=128,
+        resume_from=str(legacy_path),
+    )
+    report = build_and_train(child_config, puzzles_override=puzzles)
+    source = report["best_periodic_val_det"]["provenance"]["source"]
+    source_path = Path(source["checkpoint_path"])
+
+    assert source_path.parent == (tmp_path / "legacy_fallback_child").resolve()
+    assert source_path.name.startswith("model_eval_64_")
+    assert source["checkpoint_kind"] == "legacy_best_eval_source"
+    assert source["checkpoint_sha256"] == _sha256_file(source_path)
+    assert source["provenance_reconstructed"] is True
+    assert torch.load(source_path, map_location="cpu", weights_only=False)["kind"] == "drc_model"
+
+    legacy_path.write_bytes(b"later mutable training save")
+    (parent_dir / "model_best.pt").write_bytes(b"later mutable best save")
+    assert _sha256_file(source_path) == source["checkpoint_sha256"]
