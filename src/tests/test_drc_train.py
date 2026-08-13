@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 
@@ -512,6 +513,11 @@ def test_config_contract_allows_additive_fields_at_their_default_only():
     # fingerprint, or every branch would need its own contract.
     declared = dataclasses.replace(_RESUME_CONFIG, resume_allow_contract_change=["x"])
     assert _sha256_json(_config_contract(declared)) == _sha256_json(current)
+    # Hard-suite size affects closeout cost/reporting only, never the training
+    # trajectory. Existing exact checkpoints must accept any requested size.
+    changed_hard_suite = dataclasses.replace(_RESUME_CONFIG, hard_eval_per_stratum=3)
+    assert "hard_eval_per_stratum" not in current
+    assert _sha256_json(_config_contract(changed_hard_suite)) == _sha256_json(current)
 
 
 def test_deliberate_contract_change_requires_an_explicit_declaration(tmp_path):
@@ -1204,6 +1210,8 @@ def test_learn_smoke_end_to_end(tmp_path):
         "best_val_det", "best_timesteps",
     } <= set(curve[0])
     assert curve[0]["val_det"]["episodes"] > 0
+    assert curve[0]["val_det"]["provenance"]["source"]["checkpoint_kind"] == "model_latest"
+    assert curve[0]["val_det"]["provenance"]["suite"]["name"] == "validation_periodic"
     assert curve[0]["sampler"]["sampler"] == "reverse_frontier"
     assert "approx_kl_max" in curve[0]["losses"]
     # Best tracking is monotone and consistent with the entries seen so far.
@@ -1220,23 +1228,53 @@ def test_learn_smoke_end_to_end(tmp_path):
         "policy_params",
         "final_val_det",
         "final_val_stoch",
+        "final_hard_val_det",
+        "best_periodic_val_det",
+        "best_periodic_val_stoch",
+        "best_periodic_hard_val_det",
         "baseline_random",
         "baseline_target_only",
         "sampler_final",
     ):
         assert key in saved_report
-    for eval_key in ("final_val_det", "final_val_stoch", "baseline_random", "baseline_target_only"):
+    for eval_key in (
+        "final_val_det",
+        "final_val_stoch",
+        "final_hard_val_det",
+        "baseline_random",
+        "baseline_target_only",
+    ):
         summary = saved_report[eval_key]
         assert 0.0 <= summary["success_rate"] <= 1.0
         assert summary["episodes"] > 0
     assert saved_report["final_val_stoch"]["deterministic"] is False
 
-    # Keep-best: periodic evals ran, so a best checkpoint exists and the
-    # report evals used it.
+    # Keep-best is a separate comparison. The headline always describes this
+    # run's just-saved final checkpoint.
     assert (out / "model_best.pt").exists()
-    assert saved_report["report_eval_weights"] == "best"
+    assert saved_report["report_eval_weights"] == "final"
     assert saved_report["best_val_det"] == curve[-1]["best_val_det"]
     assert saved_report["best_timesteps"] == curve[-1]["best_timesteps"]
+    assert saved_report["best_periodic_val_det"] is not None
+    assert saved_report["best_periodic_val_stoch"] is not None
+    assert saved_report["best_periodic_hard_val_det"] is not None
+
+    for eval_key in (
+        "final_val_det",
+        "final_val_stoch",
+        "final_hard_val_det",
+        "best_periodic_val_det",
+        "best_periodic_val_stoch",
+        "best_periodic_hard_val_det",
+    ):
+        source = saved_report[eval_key]["provenance"]["source"]
+        assert source["source_type"] == "model_checkpoint"
+        assert len(source["checkpoint_sha256"]) == 64
+        assert Path(source["checkpoint_path"]).is_file()
+    for baseline_key in ("baseline_random", "baseline_target_only"):
+        source = saved_report[baseline_key]["provenance"]["source"]
+        assert source["source_type"] == "scripted_policy"
+        assert "checkpoint_sha256" not in source
 
     # Model checkpoints exist and reload into a working net.
     assert (out / "model_final.pt").exists()
@@ -1274,25 +1312,24 @@ def test_learn_smoke_end_to_end(tmp_path):
     )
 
 
-def test_report_evals_use_best_checkpoint(tmp_path):
-    """Rebuilding the net from model_best.pt and re-running the deterministic
-    final eval must reproduce report['final_val_det'] exactly."""
-    puzzles = synthetic_puzzles()
-    config = DRCTrainConfig(
+def _reporting_test_config(tmp_path: Path, run_name: str, **changes) -> DRCTrainConfig:
+    values = dict(
         out_dir=str(tmp_path),
-        run_name="drc_best",
+        run_name=run_name,
         horizon=6,
         curriculum="reverse",
         min_episodes=10,
         seed=1,
-        num_envs=4,
-        n_steps=16,
-        batch_size=32,
-        n_epochs=2,
-        total_steps=256,
+        num_envs=1,
+        n_steps=2,
+        batch_size=2,
+        n_epochs=1,
+        total_steps=64,
+        schedule_total_steps=256,
         eval_every=64,
         eval_batch_size=4,
-        final_eval_episodes=1,
+        final_eval_episodes=2,
+        hard_eval_per_stratum=1,
         drc_depth=1,
         drc_ticks=1,
         drc_hidden_channels=8,
@@ -1301,29 +1338,193 @@ def test_report_evals_use_best_checkpoint(tmp_path):
         drc_mlp_hidden=32,
         device="cpu",
     )
-    report = build_and_train(config, puzzles_override=puzzles)
-    assert report["report_eval_weights"] == "best"
+    values.update(changes)
+    return DRCTrainConfig(**values)
 
-    payload = torch.load(tmp_path / "drc_best" / "model_best.pt", weights_only=False)
-    net = build_net(
-        DRCTrainConfig(**payload["config"]), payload["observation_shape"], payload["n_actions"]
-    )
-    net.load_state_dict(payload["state_dict"])
-    env_config = EnvConfig(
-        horizon=config.horizon,
-        step_penalty=config.step_penalty,
-        goal_reward=config.goal_reward,
-        shaping_coef=config.shaping_coef,
-        gamma=config.gamma,
-        time_channel=config.time_channel,
-        canonical_identity=config.canonical_identity,
-    )
-    redo = evaluate_drc(
+
+def _install_checkpoint_reporting_fakes(monkeypatch):
+    """Make periodic and final weights observably different without training."""
+    import src.groundup.drc_train as drc_train
+
+    def fill(net, value):
+        with torch.no_grad():
+            for parameter in net.parameters():
+                parameter.fill_(value)
+
+    def fake_learn(self, total_steps, on_iteration=None, *, schedule_total_steps=None):
+        # Fresh parent: create a periodic best at 0.2, then a distinct final at
+        # 0.8. Resumed children deliberately run no periodic evaluation.
+        if self.num_timesteps == 0:
+            fill(self.net, 0.2)
+            self.num_timesteps = 64
+            if on_iteration is not None:
+                on_iteration(self, {"fake_loss": 0.0})
+        fill(self.net, 0.8)
+        self.num_timesteps = total_steps
+
+    def fake_evaluate(
         net,
-        puzzles,  # puzzles_override: final_suite == the training list
-        env_config,
+        puzzles,
+        config,
+        *,
         episodes_per_puzzle=1,
         deterministic=True,
-        batch_size=config.eval_batch_size,
+        batch_size=32,
+        seed=0,
+    ):
+        marker = round(float(next(net.parameters()).detach().reshape(-1)[0]), 4)
+        return {
+            "success_rate": marker,
+            "episodes": len(puzzles) * episodes_per_puzzle,
+            "by_length": {},
+            "by_robots_moved": {},
+            "deterministic": deterministic,
+        }
+
+    def fake_baseline(puzzles, config, *, policy, episodes_per_puzzle=5, seed=0):
+        return {
+            "success_rate": 0.0,
+            "episodes": len(puzzles) * episodes_per_puzzle,
+            "by_length": {},
+            "by_robots_moved": {},
+            "policy": policy,
+        }
+
+    monkeypatch.setattr(drc_train.RecurrentPPO, "learn", fake_learn)
+    monkeypatch.setattr(drc_train, "evaluate_drc", fake_evaluate)
+    monkeypatch.setattr(drc_train, "scripted_baseline", fake_baseline)
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_final_headline_uses_model_final_and_best_periodic_is_separate(
+    tmp_path, monkeypatch
+):
+    _install_checkpoint_reporting_fakes(monkeypatch)
+    config = _reporting_test_config(tmp_path, "report_sources")
+
+    report = build_and_train(config, puzzles_override=synthetic_puzzles())
+    out = tmp_path / config.run_name
+
+    assert report["report_eval_weights"] == "final"
+    assert report["final_val_det"]["success_rate"] == 0.8
+    assert report["final_val_stoch"]["success_rate"] == 0.8
+    assert report["final_hard_val_det"]["success_rate"] == 0.8
+    assert report["best_periodic_val_det"]["success_rate"] == 0.2
+    assert report["best_periodic_val_stoch"]["success_rate"] == 0.2
+    assert report["best_periodic_hard_val_det"]["success_rate"] == 0.2
+
+    final_source = report["final_val_det"]["provenance"]["source"]
+    assert final_source == report["final_val_stoch"]["provenance"]["source"]
+    assert final_source["originating_run_name"] == config.run_name
+    assert final_source["source_timesteps"] == 64
+    assert final_source["checkpoint_kind"] == "model_final"
+    assert Path(final_source["checkpoint_path"]) == (out / "model_final.pt").resolve()
+    assert final_source["checkpoint_sha256"] == _sha256_file(out / "model_final.pt")
+
+    best_source = report["best_periodic_val_det"]["provenance"]["source"]
+    assert best_source["originating_run_name"] == config.run_name
+    assert best_source["source_timesteps"] == 64
+    assert best_source["checkpoint_kind"] == "model_best"
+    assert Path(best_source["checkpoint_path"]) == (out / "model_best.pt").resolve()
+    assert best_source["checkpoint_sha256"] == _sha256_file(out / "model_best.pt")
+    assert best_source != final_source
+
+    suites = report["provenance"]["evaluation_suites"]
+    selection = report["best_selection_provenance"]
+    assert selection["source"]["checkpoint_kind"] == "model_best"
+    assert selection["source"]["checkpoint_sha256"] == _sha256_file(
+        out / "model_best.pt"
     )
-    assert redo == report["final_val_det"]
+    assert selection["suite"] == suites["validation_periodic"]
+    assert report["final_val_det"]["provenance"]["suite"] == suites["validation_final"]
+    assert report["final_hard_val_det"]["provenance"]["suite"] == suites["validation_hard"]
+    assert suites["validation_final"]["fingerprint"]
+    assert suites["validation_hard"]["fingerprint"]
+    assert suites["validation_hard"]["seed"] == 9
+
+    for key in ("baseline_random", "baseline_target_only"):
+        source = report[key]["provenance"]["source"]
+        assert source["source_type"] == "scripted_policy"
+        assert "checkpoint_path" not in source
+        assert "checkpoint_sha256" not in source
+
+
+def test_declared_branch_resets_parent_best_tracking(tmp_path, monkeypatch):
+    _install_checkpoint_reporting_fakes(monkeypatch)
+    puzzles = synthetic_puzzles()
+    parent_config = _reporting_test_config(tmp_path, "parent")
+    build_and_train(parent_config, puzzles_override=puzzles)
+    parent_checkpoint = tmp_path / "parent" / "training_final.pt"
+
+    branch_config = _reporting_test_config(
+        tmp_path,
+        "branch",
+        total_steps=128,
+        resume_from=str(parent_checkpoint),
+        aux_landing_coef=1.0,
+        resume_allow_contract_change=["aux_landing_coef"],
+    )
+    report = build_and_train(branch_config, puzzles_override=puzzles)
+
+    assert report["report_eval_weights"] == "final"
+    assert report["final_val_det"]["success_rate"] == 0.8
+    assert report["best_val_det"] is None
+    assert report["best_timesteps"] is None
+    assert report["best_source"] is None
+    assert report["best_selection_provenance"] is None
+    assert report["best_periodic_val_det"] is None
+    assert report["best_periodic_val_stoch"] is None
+    assert report["best_periodic_hard_val_det"] is None
+    assert not (tmp_path / "branch" / "model_best.pt").exists()
+
+
+def test_exact_continuation_preserves_and_reconstructs_legacy_best_source(
+    tmp_path, monkeypatch
+):
+    _install_checkpoint_reporting_fakes(monkeypatch)
+    puzzles = synthetic_puzzles()
+    parent_config = _reporting_test_config(tmp_path, "legacy_parent")
+    build_and_train(parent_config, puzzles_override=puzzles)
+    parent_dir = tmp_path / "legacy_parent"
+
+    # Simulate the currently deployed outer schema-1 checkpoint: best weights
+    # are embedded in run_state, but best-source metadata predates this repair.
+    payload = torch.load(parent_dir / "training_final.pt", map_location="cpu", weights_only=False)
+    assert payload["schema_version"] == 1
+    legacy_model = torch.load(parent_dir / "model_best.pt", weights_only=False)
+    assert legacy_model["schema_version"] == 2
+    legacy_model["config"].pop("hard_eval_per_stratum")
+    torch.save(legacy_model, parent_dir / "model_best.pt")
+    payload["config"].pop("hard_eval_per_stratum")
+    payload["metadata"].pop("evaluation_suites", None)
+    payload["run_state"].pop("best_source", None)
+    payload["run_state"].pop("best_selection_provenance", None)
+    legacy_checkpoint = parent_dir / "legacy_training.pt"
+    torch.save(payload, legacy_checkpoint)
+
+    continued_config = _reporting_test_config(
+        tmp_path,
+        "exact_child",
+        total_steps=128,
+        resume_from=str(legacy_checkpoint),
+        hard_eval_per_stratum=2,  # evaluation-only and therefore resume-mutable
+    )
+    report = build_and_train(continued_config, puzzles_override=puzzles)
+
+    assert report["final_val_det"]["success_rate"] == 0.8
+    assert report["best_periodic_val_det"]["success_rate"] == 0.2
+    source = report["best_periodic_val_det"]["provenance"]["source"]
+    assert source["originating_run_name"] == parent_config.run_name
+    assert source["source_timesteps"] == 64
+    assert source["checkpoint_kind"] == "model_best"
+    assert Path(source["checkpoint_path"]) == (parent_dir / "model_best.pt").resolve()
+    assert source["checkpoint_sha256"] == _sha256_file(parent_dir / "model_best.pt")
+    assert source["provenance_reconstructed"] is True
+    selection = report["best_selection_provenance"]
+    assert selection["suite"]["fingerprint"] == report["provenance"][
+        "evaluation_suites"
+    ]["validation_periodic"]["fingerprint"]
+    assert selection["provenance_reconstructed"] is True

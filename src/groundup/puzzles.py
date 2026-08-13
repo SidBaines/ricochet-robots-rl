@@ -125,3 +125,37 @@ def stratified_subset(
         pick = rng.choice(idxs, size=take, replace=False)
         chosen.extend(puzzles[int(i)] for i in sorted(pick))
     return chosen
+
+
+def joint_stratified_subset(
+    puzzles: Sequence[Puzzle],
+    per_stratum: int,
+    *,
+    seed: int = 0,
+) -> List[Puzzle]:
+    """Select up to ``per_stratum`` puzzles for each observed hard stratum.
+
+    Strata are the actual ``(optimal_length, robots_moved)`` pairs in
+    ``puzzles``. Missing Cartesian-product cells are not invented, and every
+    puzzle belongs to exactly one group. Each group gets a stable derived RNG
+    seed, so adding or removing a sparse stratum cannot perturb other groups.
+    For a fixed input order and seed the returned suite is deterministic.
+    """
+    if per_stratum < 0:
+        raise ValueError(f"per_stratum must be non-negative, got {per_stratum}")
+
+    by_stratum: Dict[Tuple[int, int], List[int]] = {}
+    for index, puzzle in enumerate(puzzles):
+        stratum = (puzzle.optimal_length, puzzle.robots_moved)
+        by_stratum.setdefault(stratum, []).append(index)
+
+    chosen: List[Puzzle] = []
+    for stratum in sorted(by_stratum):
+        seed_material = f"{seed}:{stratum[0]}:{stratum[1]}".encode("utf-8")
+        stratum_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+        rng = np.random.default_rng(stratum_seed)
+        indices = np.asarray(by_stratum[stratum], dtype=np.int64)
+        take = min(per_stratum, len(indices))
+        picked = rng.choice(indices, size=take, replace=False)
+        chosen.extend(puzzles[int(index)] for index in sorted(picked))
+    return chosen

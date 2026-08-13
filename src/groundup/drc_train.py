@@ -69,9 +69,9 @@ artifacts/groundup/drc33_8x8_gate/curve.jsonl):
   and unclipped losses; default off), bounding the
   shared-trunk gradients from value-loss spikes.
 - Keep-best checkpointing: ``model_best.pt`` is saved whenever the periodic
-  val_det improves and the BEST weights are reloaded for the final report
-  evals; ``approx_kl_max`` (max per-minibatch KL per update) is logged for
-  telemetry.
+  val_det improves. Closeout always reports ``model_final.pt`` as the headline
+  result and evaluates the periodic best separately; ``approx_kl_max`` (max
+  per-minibatch KL per update) is logged for telemetry.
 
 Setting ``adv_std_floor: 0``, ``adv_clip: null``, ``clip_range_vf: null``
 recovers the pre-hardening update semantics exactly.
@@ -216,6 +216,9 @@ class DRCTrainConfig:
     eval_per_length: int = 25
     final_eval_per_length: int = 50
     final_eval_episodes: int = 3
+    # Evaluation-only joint (optimal_length, robots_moved) diagnostic. Every
+    # observed validation stratum contributes up to this many puzzles.
+    hard_eval_per_stratum: int = 25
     eval_batch_size: int = 32
     # Immutable lightweight model and full training-state snapshots.
     checkpoint_every: Optional[int] = None
@@ -1055,7 +1058,13 @@ def _maybe_init_wandb(config: "DRCTrainConfig", out_dir: Path):
         dir=str(out_dir),
     )
     run.define_metric("train/timesteps")
-    for pattern in ("train/*", "curriculum/*", "val_det/*", "final/*"):
+    for pattern in (
+        "train/*",
+        "curriculum/*",
+        "val_det/*",
+        "final/*",
+        "best_periodic/*",
+    ):
         run.define_metric(pattern, step_metric="train/timesteps")
     return run
 
@@ -1076,6 +1085,7 @@ _RESUME_MUTABLE_CONFIG_FIELDS = {
     "eval_per_length",
     "final_eval_per_length",
     "final_eval_episodes",
+    "hard_eval_per_stratum",
     "eval_batch_size",
     "wandb_project",
     "wandb_run_name",
@@ -1143,6 +1153,248 @@ def _puzzle_fingerprint(puzzles: Sequence) -> str:
         for puzzle in puzzles
     ]
     return _sha256_json(rows)
+
+
+def _suite_provenance(
+    name: str,
+    puzzles: Sequence,
+    *,
+    seed: Optional[int],
+) -> Dict[str, object]:
+    """Stable identity for one concrete evaluation suite."""
+    return {
+        "name": name,
+        "seed": seed,
+        "fingerprint": _puzzle_fingerprint(puzzles),
+        "puzzles": len(puzzles),
+    }
+
+
+def _load_model_checkpoint(net: DRCNet, path: str | Path) -> Dict[str, object]:
+    """Load the existing schema-2 model format into ``net`` for evaluation."""
+    checkpoint_path = Path(path)
+    payload = torch.load(
+        checkpoint_path,
+        map_location=next(net.parameters()).device,
+        weights_only=False,
+    )
+    if payload.get("kind") != "drc_model" or int(payload.get("schema_version", -1)) != 2:
+        raise ValueError(f"Not a supported schema-2 DRC model checkpoint: {checkpoint_path}")
+    net.load_state_dict(payload["state_dict"])
+    return payload
+
+
+def _model_checkpoint_source(
+    path: str | Path,
+    payload: Dict[str, object],
+    *,
+    source_timesteps: Optional[int] = None,
+    provenance_reconstructed: bool = False,
+) -> Dict[str, object]:
+    """Describe the exact model checkpoint used by an evaluation."""
+    checkpoint_path = Path(path)
+    metadata = payload.get("metadata", {})
+    stored_config = payload.get("config", {})
+    timestep = source_timesteps
+    if timestep is None and isinstance(metadata, dict):
+        timestep = metadata.get("timesteps")
+    checkpoint_kind = metadata.get("kind") if isinstance(metadata, dict) else None
+    originating_run = (
+        stored_config.get("run_name") if isinstance(stored_config, dict) else None
+    ) or checkpoint_path.parent.name
+    source = {
+        "source_type": "model_checkpoint",
+        "originating_run_name": originating_run,
+        "source_timesteps": None if timestep is None else int(timestep),
+        "checkpoint_path": str(checkpoint_path.resolve()),
+        "checkpoint_kind": checkpoint_kind or checkpoint_path.stem,
+        "checkpoint_sha256": _file_sha256(checkpoint_path),
+    }
+    if provenance_reconstructed:
+        source["provenance_reconstructed"] = True
+    return source
+
+
+def _state_dicts_equal(
+    first: Dict[str, torch.Tensor], second: Dict[str, torch.Tensor]
+) -> bool:
+    return set(first) == set(second) and all(
+        torch.equal(first[key].detach().cpu(), second[key].detach().cpu())
+        for key in first
+    )
+
+
+def _reconstruct_legacy_best_source(
+    resume_path: str | Path,
+    resume_payload: Dict[str, object],
+    best_state_dict: Dict[str, torch.Tensor],
+    best_timesteps: Optional[int],
+) -> Dict[str, object]:
+    """Recover provenance omitted by older outer-schema-1 checkpoints.
+
+    Prefer a sibling schema-2 ``model_best.pt`` only after proving its tensors
+    equal the embedded best state. Otherwise the training checkpoint itself is
+    the exact, hash-addressed container from which the evaluated state came.
+    """
+    resume_path = Path(resume_path)
+    candidate = resume_path.parent / "model_best.pt"
+    if candidate.is_file():
+        try:
+            candidate_payload = torch.load(candidate, map_location="cpu", weights_only=False)
+            candidate_metadata = candidate_payload.get("metadata", {})
+            candidate_timestep = (
+                candidate_metadata.get("timesteps")
+                if isinstance(candidate_metadata, dict)
+                else None
+            )
+            timestep_matches = (
+                best_timesteps is None
+                or candidate_timestep is None
+                or int(candidate_timestep) == int(best_timesteps)
+            )
+            if (
+                candidate_payload.get("kind") == "drc_model"
+                and int(candidate_payload.get("schema_version", -1)) == 2
+                and timestep_matches
+                and _state_dicts_equal(candidate_payload["state_dict"], best_state_dict)
+            ):
+                return _model_checkpoint_source(
+                    candidate,
+                    candidate_payload,
+                    source_timesteps=best_timesteps,
+                    provenance_reconstructed=True,
+                )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            pass
+
+    stored_config = resume_payload.get("config", {})
+    originating_run = (
+        stored_config.get("run_name") if isinstance(stored_config, dict) else None
+    ) or resume_path.parent.name
+    return {
+        "source_type": "model_checkpoint",
+        "originating_run_name": originating_run,
+        "source_timesteps": None if best_timesteps is None else int(best_timesteps),
+        "checkpoint_path": str(resume_path.resolve()),
+        "checkpoint_kind": "training_state_embedded_best",
+        "checkpoint_sha256": _file_sha256(resume_path),
+        "state_location": "run_state.best_state_dict",
+        "provenance_reconstructed": True,
+    }
+
+
+def _reconstruct_legacy_best_selection_provenance(
+    resume_payload: Dict[str, object],
+    best_source: Dict[str, object],
+) -> Dict[str, object]:
+    """Recover the periodic suite identity omitted by legacy run state."""
+    metadata = resume_payload.get("metadata", {})
+    stored_suites = metadata.get("evaluation_suites", {}) if isinstance(metadata, dict) else {}
+    stored_suite = (
+        stored_suites.get("validation_periodic")
+        if isinstance(stored_suites, dict)
+        else None
+    )
+    if isinstance(stored_suite, dict):
+        suite = dict(stored_suite)
+    else:
+        split_fingerprints = (
+            metadata.get("split_fingerprints", {}) if isinstance(metadata, dict) else {}
+        )
+        fingerprint = (
+            split_fingerprints.get("validation_periodic_suite")
+            if isinstance(split_fingerprints, dict)
+            else None
+        )
+        stored_config = resume_payload.get("config", {})
+        overfit_n = stored_config.get("overfit_n") if isinstance(stored_config, dict) else None
+        bank_path = stored_config.get("bank_path") if isinstance(stored_config, dict) else None
+        suite = {
+            "name": "validation_periodic",
+            "seed": 7 if overfit_n is None and bank_path else None,
+            "fingerprint": fingerprint,
+            "puzzles": None,
+        }
+    return {
+        "source": dict(best_source),
+        "suite": suite,
+        "evaluation_seed": 0,
+        "episodes_per_puzzle": 1,
+        "provenance_reconstructed": True,
+    }
+
+
+def _with_evaluation_provenance(
+    summary: Dict[str, object],
+    *,
+    source: Dict[str, object],
+    suite: Dict[str, object],
+    evaluation_seed: int,
+    episodes_per_puzzle: int,
+) -> Dict[str, object]:
+    result = dict(summary)
+    result["provenance"] = {
+        "source": dict(source),
+        "suite": dict(suite),
+        "evaluation_seed": int(evaluation_seed),
+        "episodes_per_puzzle": int(episodes_per_puzzle),
+    }
+    return result
+
+
+def _evaluate_model_with_provenance(
+    net: DRCNet,
+    puzzles: Sequence,
+    env_config: EnvConfig,
+    *,
+    source: Dict[str, object],
+    suite: Dict[str, object],
+    episodes_per_puzzle: int,
+    deterministic: bool,
+    batch_size: int,
+    seed: int = 0,
+) -> Dict[str, object]:
+    summary = evaluate_drc(
+        net,
+        puzzles,
+        env_config,
+        episodes_per_puzzle=episodes_per_puzzle,
+        deterministic=deterministic,
+        batch_size=batch_size,
+        seed=seed,
+    )
+    return _with_evaluation_provenance(
+        summary,
+        source=source,
+        suite=suite,
+        evaluation_seed=seed,
+        episodes_per_puzzle=episodes_per_puzzle,
+    )
+
+
+def _evaluate_scripted_with_provenance(
+    puzzles: Sequence,
+    env_config: EnvConfig,
+    *,
+    policy: str,
+    suite: Dict[str, object],
+    episodes_per_puzzle: int,
+    seed: int = 0,
+) -> Dict[str, object]:
+    summary = scripted_baseline(
+        puzzles,
+        env_config,
+        policy=policy,
+        episodes_per_puzzle=episodes_per_puzzle,
+        seed=seed,
+    )
+    return _with_evaluation_provenance(
+        summary,
+        source={"source_type": "scripted_policy", "policy": policy, "seed": int(seed)},
+        suite=suite,
+        evaluation_seed=seed,
+        episodes_per_puzzle=episodes_per_puzzle,
+    )
 
 
 def _git_provenance() -> Dict[str, object]:
@@ -1262,7 +1514,11 @@ def _load_training_checkpoint(
         raise TypeError(f"Sampler {type(sampler).__name__} does not support exact resume")
     sampler.load_state_dict(payload["sampler_state"])
     algo.load_state_dict(payload["algo_state"], allow_device_change=allow_device_change)
-    return payload
+    # Runtime-only information for the caller. Do not persist it into the
+    # checkpoint schema: outer schema 1 remains readable by older tooling.
+    loaded = dict(payload)
+    loaded["_resume_contract_changes"] = tuple(sorted(changed))
+    return loaded
 
 
 # ------------------------------------------------------------------ entrypoint
@@ -1272,7 +1528,11 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
     ``puzzles_override`` is a test hook: a puzzle list used directly for
     training AND evaluation (like overfit mode), bypassing the bank.
     """
-    from .puzzles import load_puzzles, stratified_subset
+    from .puzzles import joint_stratified_subset, load_puzzles, stratified_subset
+
+    periodic_suite_seed = 7
+    final_suite_seed = 8
+    hard_suite_seed = 9
 
     schedule_total_steps = (
         config.total_steps if config.schedule_total_steps is None else config.schedule_total_steps
@@ -1281,6 +1541,11 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         raise ValueError(
             f"schedule_total_steps ({schedule_total_steps}) must be >= "
             f"total_steps ({config.total_steps})"
+        )
+    if config.hard_eval_per_stratum < 0:
+        raise ValueError(
+            "hard_eval_per_stratum must be non-negative, got "
+            f"{config.hard_eval_per_stratum}"
         )
     out = Path(config.out_dir) / config.run_name
     out.mkdir(parents=True, exist_ok=True)
@@ -1309,6 +1574,8 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         val_puzzles = list(train_puzzles)
         val_suite = list(train_puzzles)
         final_suite = list(train_puzzles)
+        periodic_selection_seed: Optional[int] = None
+        final_selection_seed: Optional[int] = None
     else:
         split_kwargs = dict(
             eval_fraction=config.eval_fraction,
@@ -1323,13 +1590,43 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             val_puzzles = list(train_puzzles)
             val_suite = list(train_puzzles)
             final_suite = list(train_puzzles)
+            periodic_selection_seed = None
+            final_selection_seed = None
         else:
             val_puzzles = load_puzzles(config.bank_path, "val", **split_kwargs)
-            val_suite = stratified_subset(val_puzzles, config.eval_per_length, seed=7)
-            final_suite = stratified_subset(val_puzzles, config.final_eval_per_length, seed=8)
+            val_suite = stratified_subset(
+                val_puzzles, config.eval_per_length, seed=periodic_suite_seed
+            )
+            final_suite = stratified_subset(
+                val_puzzles, config.final_eval_per_length, seed=final_suite_seed
+            )
+            periodic_selection_seed = periodic_suite_seed
+            final_selection_seed = final_suite_seed
+    hard_suite = joint_stratified_subset(
+        val_puzzles,
+        config.hard_eval_per_stratum,
+        seed=hard_suite_seed,
+    )
+    evaluation_suites = {
+        "validation_periodic": _suite_provenance(
+            "validation_periodic",
+            val_suite,
+            seed=periodic_selection_seed,
+        ),
+        "validation_final": _suite_provenance(
+            "validation_final",
+            final_suite,
+            seed=final_selection_seed,
+        ),
+        "validation_hard": _suite_provenance(
+            "validation_hard_joint_strata",
+            hard_suite,
+            seed=hard_suite_seed,
+        ),
+    }
     print(
         f"[drc] train={len(train_puzzles)} puzzles, val_suite={len(val_suite)}, "
-        f"final_suite={len(final_suite)}",
+        f"final_suite={len(final_suite)}, hard_suite={len(hard_suite)}",
         flush=True,
     )
 
@@ -1393,7 +1690,9 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             "validation_pool": _puzzle_fingerprint(val_puzzles),
             "validation_periodic_suite": _puzzle_fingerprint(val_suite),
             "validation_final_suite": _puzzle_fingerprint(final_suite),
+            "validation_hard_suite": _puzzle_fingerprint(hard_suite),
         },
+        "evaluation_suites": evaluation_suites,
         "observation_shape": tuple(net.observation_shape),
         "n_actions": int(net.n_actions),
         "policy_params": int(n_params),
@@ -1418,6 +1717,9 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
     best_val_det: Optional[float] = None
     best_timesteps: Optional[int] = None
     best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    best_source: Optional[Dict[str, object]] = None
+    best_selection_provenance: Optional[Dict[str, object]] = None
+    resume_contract_changes: Tuple[str, ...] = ()
 
     if config.resume_from is not None:
         resume_payload = _load_training_checkpoint(
@@ -1427,10 +1729,41 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             config=config,
         )
         run_state = resume_payload.get("run_state", {})
+        resume_contract_changes = tuple(resume_payload.get("_resume_contract_changes", ()))
         elapsed_before = float(run_state.get("elapsed_s", 0.0))
-        best_val_det = run_state.get("best_val_det")
-        best_timesteps = run_state.get("best_timesteps")
-        best_state_dict = run_state.get("best_state_dict")
+        if not resume_contract_changes:
+            best_val_det = run_state.get("best_val_det")
+            best_timesteps = run_state.get("best_timesteps")
+            best_state_dict = run_state.get("best_state_dict")
+            best_source = run_state.get("best_source")
+            best_selection_provenance = run_state.get("best_selection_provenance")
+            if best_state_dict is not None and best_source is None:
+                best_source = _reconstruct_legacy_best_source(
+                    config.resume_from,
+                    resume_payload,
+                    best_state_dict,
+                    best_timesteps,
+                )
+            if (
+                best_state_dict is not None
+                and best_source is not None
+                and best_selection_provenance is None
+            ):
+                best_selection_provenance = (
+                    _reconstruct_legacy_best_selection_provenance(
+                        resume_payload,
+                        best_source,
+                    )
+                )
+        # A declared semantic branch starts a new experiment's selection
+        # process. It resumes optimizer/environment state, but not its parent's
+        # notion of which weights are best.
+        else:
+            best_val_det = None
+            best_timesteps = None
+            best_state_dict = None
+            best_source = None
+            best_selection_provenance = None
         next_eval = int(run_state.get("next_eval", 0))
         if next_eval <= algo.num_timesteps:
             next_eval = (algo.num_timesteps // config.eval_every + 1) * config.eval_every
@@ -1443,8 +1776,9 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             ) * config.checkpoint_every
         else:
             next_checkpoint = int(saved_next_checkpoint)
+        continuation_kind = "branch training state" if resume_contract_changes else "exact training state"
         print(
-            f"[drc] resumed exact training state from {config.resume_from} "
+            f"[drc] resumed {continuation_kind} from {config.resume_from} "
             f"at t={algo.num_timesteps:,}",
             flush=True,
         )
@@ -1460,6 +1794,7 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         "start_timesteps": int(algo.num_timesteps),
         "target_total_steps": int(config.total_steps),
         "schedule_total_steps": int(schedule_total_steps),
+        "resume_contract_changes": list(resume_contract_changes),
         **provenance,
     }
     with (out / "run_history.jsonl").open("a") as handle:
@@ -1484,6 +1819,8 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
             "best_val_det": best_val_det,
             "best_timesteps": best_timesteps,
             "best_state_dict": best_state_dict,
+            "best_source": best_source,
+            "best_selection_provenance": best_selection_provenance,
             "next_eval": next_eval,
             "next_checkpoint": next_checkpoint,
         }
@@ -1499,15 +1836,27 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         )
 
     def on_iteration(algo: RecurrentPPO, metrics: Dict[str, object]) -> None:
-        nonlocal next_eval, next_checkpoint, best_val_det, best_timesteps, best_state_dict
+        nonlocal next_eval, next_checkpoint, best_val_det, best_timesteps
+        nonlocal best_state_dict, best_source, best_selection_provenance
         saved_something = False
         if algo.num_timesteps >= next_eval:
             while next_eval <= algo.num_timesteps:
                 next_eval += config.eval_every
-            det = evaluate_drc(
+            latest_path = out / "model_latest.pt"
+            _save_model(
+                net,
+                config,
+                latest_path,
+                metadata=snapshot_metadata("model_latest"),
+            )
+            latest_payload = _load_model_checkpoint(net, latest_path)
+            latest_source = _model_checkpoint_source(latest_path, latest_payload)
+            det = _evaluate_model_with_provenance(
                 net,
                 val_suite,
                 env_config,
+                source=latest_source,
+                suite=evaluation_suites["validation_periodic"],
                 episodes_per_puzzle=1,
                 deterministic=True,
                 batch_size=config.eval_batch_size,
@@ -1518,12 +1867,20 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
                 best_state_dict = {
                     key: value.detach().cpu().clone() for key, value in net.state_dict().items()
                 }
+                best_selection_provenance = dict(det["provenance"])
                 _save_model(
                     net,
                     config,
                     out / "model_best.pt",
                     metadata=snapshot_metadata("model_best"),
                 )
+                best_payload = torch.load(
+                    out / "model_best.pt", map_location="cpu", weights_only=False
+                )
+                best_source = _model_checkpoint_source(
+                    out / "model_best.pt", best_payload
+                )
+                best_selection_provenance["source"] = dict(best_source)
             entry = {
                 "timesteps": int(algo.num_timesteps),
                 "elapsed_s": round(elapsed_total(), 1),
@@ -1533,6 +1890,8 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
                 "val_det": det,
                 "best_val_det": best_val_det,
                 "best_timesteps": best_timesteps,
+                "best_source": best_source,
+                "best_selection_provenance": best_selection_provenance,
                 "sampler": sampler.stats(),
                 "losses": metrics,
             }
@@ -1557,12 +1916,6 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
                 f"by_len={ {k: v['success_rate'] for k, v in det['by_length'].items()} } "
                 f"sampler={sampler.stats().get('frontier', '-')}",
                 flush=True,
-            )
-            _save_model(
-                net,
-                config,
-                out / "model_latest.pt",
-                metadata=snapshot_metadata("model_latest"),
             )
             saved_something = True
 
@@ -1599,25 +1952,99 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         on_iteration,
         schedule_total_steps=schedule_total_steps,
     )
-    final_metadata = snapshot_metadata("final")
-    _save_model(net, config, out / "model_final.pt", metadata=final_metadata)
+    final_model_path = out / "model_final.pt"
+    _save_model(
+        net,
+        config,
+        final_model_path,
+        metadata=snapshot_metadata("model_final"),
+    )
+    # Headline evaluation is checkpoint-backed by construction: reload the
+    # just-written model instead of relying on whichever weights happen to be
+    # resident in memory.
+    final_model_payload = _load_model_checkpoint(net, final_model_path)
+    final_source = _model_checkpoint_source(final_model_path, final_model_payload)
     _save_training_checkpoint(
         algo,
         sampler,
         config,
         out / "training_final.pt",
         run_state=current_run_state(),
-        metadata=final_metadata,
+        metadata=snapshot_metadata("training_final"),
     )
     save_training_latest()
 
-    # Final report evals use the BEST periodic-eval checkpoint (post-convergence
-    # collapse protection); fall back to the final weights when no periodic
-    # eval ever ran (total_steps < eval_every).
-    report_eval_weights = "final"
+    final_val_det = _evaluate_model_with_provenance(
+        net,
+        final_suite,
+        env_config,
+        source=final_source,
+        suite=evaluation_suites["validation_final"],
+        episodes_per_puzzle=1,
+        deterministic=True,
+        batch_size=config.eval_batch_size,
+    )
+    final_val_stoch = _evaluate_model_with_provenance(
+        net,
+        final_suite,
+        env_config,
+        source=final_source,
+        suite=evaluation_suites["validation_final"],
+        episodes_per_puzzle=config.final_eval_episodes,
+        deterministic=False,
+        batch_size=config.eval_batch_size,
+    )
+    final_hard_val_det = _evaluate_model_with_provenance(
+        net,
+        hard_suite,
+        env_config,
+        source=final_source,
+        suite=evaluation_suites["validation_hard"],
+        episodes_per_puzzle=1,
+        deterministic=True,
+        batch_size=config.eval_batch_size,
+    )
+
+    best_periodic_val_det: Optional[Dict[str, object]] = None
+    best_periodic_val_stoch: Optional[Dict[str, object]] = None
+    best_periodic_hard_val_det: Optional[Dict[str, object]] = None
     if best_state_dict is not None:
+        if best_source is None:
+            raise RuntimeError("Best weights exist without checkpoint provenance")
         net.load_state_dict(best_state_dict)
-        report_eval_weights = "best"
+        best_periodic_val_det = _evaluate_model_with_provenance(
+            net,
+            final_suite,
+            env_config,
+            source=best_source,
+            suite=evaluation_suites["validation_final"],
+            episodes_per_puzzle=1,
+            deterministic=True,
+            batch_size=config.eval_batch_size,
+        )
+        best_periodic_val_stoch = _evaluate_model_with_provenance(
+            net,
+            final_suite,
+            env_config,
+            source=best_source,
+            suite=evaluation_suites["validation_final"],
+            episodes_per_puzzle=config.final_eval_episodes,
+            deterministic=False,
+            batch_size=config.eval_batch_size,
+        )
+        best_periodic_hard_val_det = _evaluate_model_with_provenance(
+            net,
+            hard_suite,
+            env_config,
+            source=best_source,
+            suite=evaluation_suites["validation_hard"],
+            episodes_per_puzzle=1,
+            deterministic=True,
+            batch_size=config.eval_batch_size,
+        )
+        # Do not leave a completed run's in-memory network pointing at a
+        # secondary comparison checkpoint.
+        _load_model_checkpoint(net, final_model_path)
 
     report = {
         "config": dataclasses.asdict(config),
@@ -1628,28 +2055,30 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         "provenance": provenance,
         "best_val_det": best_val_det,
         "best_timesteps": best_timesteps,
-        "report_eval_weights": report_eval_weights,
-        "final_val_det": evaluate_drc(
-            net,
+        "best_source": best_source,
+        "best_selection_provenance": best_selection_provenance,
+        # Backwards-compatible explicit primary source. This is now invariant:
+        # final_* always means model_final.pt.
+        "report_eval_weights": "final",
+        "final_val_det": final_val_det,
+        "final_val_stoch": final_val_stoch,
+        "final_hard_val_det": final_hard_val_det,
+        "best_periodic_val_det": best_periodic_val_det,
+        "best_periodic_val_stoch": best_periodic_val_stoch,
+        "best_periodic_hard_val_det": best_periodic_hard_val_det,
+        "baseline_random": _evaluate_scripted_with_provenance(
             final_suite,
             env_config,
-            episodes_per_puzzle=1,
-            deterministic=True,
-            batch_size=config.eval_batch_size,
+            policy="random",
+            suite=evaluation_suites["validation_final"],
+            episodes_per_puzzle=5,
         ),
-        "final_val_stoch": evaluate_drc(
-            net,
+        "baseline_target_only": _evaluate_scripted_with_provenance(
             final_suite,
             env_config,
-            episodes_per_puzzle=config.final_eval_episodes,
-            deterministic=False,
-            batch_size=config.eval_batch_size,
-        ),
-        "baseline_random": scripted_baseline(
-            final_suite, env_config, policy="random", episodes_per_puzzle=5
-        ),
-        "baseline_target_only": scripted_baseline(
-            final_suite, env_config, policy="target_only", episodes_per_puzzle=5
+            policy="target_only",
+            suite=evaluation_suites["validation_final"],
+            episodes_per_puzzle=5,
         ),
         "sampler_final": sampler.stats(),
     }
@@ -1664,6 +2093,10 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
                 for k in (
                     "final_val_det",
                     "final_val_stoch",
+                    "final_hard_val_det",
+                    "best_periodic_val_det",
+                    "best_periodic_val_stoch",
+                    "best_periodic_hard_val_det",
                     "baseline_random",
                     "baseline_target_only",
                 )
@@ -1673,16 +2106,25 @@ def build_and_train(config: DRCTrainConfig, *, puzzles_override: Optional[Sequen
         flush=True,
     )
     if wandb_run is not None:
-        wandb_run.log(
-            {
-                "train/timesteps": int(algo.num_timesteps),
-                **_flatten_eval("final/val_det", report["final_val_det"]),
-                **_flatten_eval("final/val_stoch", report["final_val_stoch"]),
-                **_flatten_eval("final/baseline_random", report["baseline_random"]),
-                **_flatten_eval("final/baseline_target_only", report["baseline_target_only"]),
-            },
-            step=int(algo.num_timesteps),
-        )
+        final_wandb = {
+            "train/timesteps": int(algo.num_timesteps),
+            **_flatten_eval("final/val_det", report["final_val_det"]),
+            **_flatten_eval("final/val_stoch", report["final_val_stoch"]),
+            **_flatten_eval("final/hard_val_det", report["final_hard_val_det"]),
+            **_flatten_eval("final/baseline_random", report["baseline_random"]),
+            **_flatten_eval("final/baseline_target_only", report["baseline_target_only"]),
+        }
+        if best_periodic_val_det is not None:
+            final_wandb.update(
+                {
+                    **_flatten_eval("best_periodic/val_det", best_periodic_val_det),
+                    **_flatten_eval("best_periodic/val_stoch", best_periodic_val_stoch),
+                    **_flatten_eval(
+                        "best_periodic/hard_val_det", best_periodic_hard_val_det
+                    ),
+                }
+            )
+        wandb_run.log(final_wandb, step=int(algo.num_timesteps))
         wandb_run.finish()
     return report
 

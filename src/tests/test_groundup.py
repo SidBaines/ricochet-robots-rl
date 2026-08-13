@@ -11,7 +11,12 @@ from src.env.ricochet_core import Board, apply_action
 from src.groundup.curriculum import ReverseFrontierSampler
 from src.groundup.distance import relaxed_distance_map
 from src.groundup.env import EnvConfig, RicochetEnv
-from src.groundup.puzzles import Puzzle, load_puzzles, stratified_subset
+from src.groundup.puzzles import (
+    Puzzle,
+    joint_stratified_subset,
+    load_puzzles,
+    stratified_subset,
+)
 
 BANK_16 = Path("artifacts/phase4_bank/size-16x16_numR4_ET2_CL2_gen10.parquet")
 BANK_8 = Path("artifacts/phase2b_bank/size-8x8_numR2_ET1_CL1_gen10.parquet")
@@ -304,6 +309,70 @@ def test_8x8_bank_loads():
     assert all(p.height == 8 and p.num_robots == 2 for p in puzzles)
     subset = stratified_subset(puzzles, 10, seed=0)
     assert len(subset) == 40  # 4 lengths x 10
+
+
+def _selection_puzzle(optimal_length: int, robots_moved: int, serial: int) -> Puzzle:
+    return Puzzle(
+        h_walls=np.zeros((5, 4), dtype=bool),
+        v_walls=np.zeros((4, 5), dtype=bool),
+        robots=((0, 0), (1, 1), (2, 2)),
+        goal=(3, 3),
+        target=0,
+        optimal_length=optimal_length,
+        actions=tuple((0, 0) for _ in range(optimal_length)),
+        robots_moved=robots_moved,
+        layout_hash=f"stratum-{optimal_length}-{robots_moved}-{serial}",
+        seed=serial,
+    )
+
+
+def test_joint_stratified_subset_is_deterministic_and_samples_each_group_disjointly():
+    from collections import Counter
+
+    counts = {(1, 1): 7, (1, 2): 4, (2, 1): 5, (3, 3): 6}
+    puzzles = [
+        _selection_puzzle(length, robots, serial)
+        for (length, robots), count in counts.items()
+        for serial in range(count)
+    ]
+
+    first = joint_stratified_subset(puzzles, per_stratum=3, seed=19)
+    second = joint_stratified_subset(puzzles, per_stratum=3, seed=19)
+
+    assert [p.layout_hash for p in first] == [p.layout_hash for p in second]
+    assert len({p.layout_hash for p in first}) == len(first)
+    assert Counter((p.optimal_length, p.robots_moved) for p in first) == {
+        stratum: min(3, count) for stratum, count in counts.items()
+    }
+    # A sparse group appearing or disappearing must not perturb which puzzles
+    # are selected from any other, disjoint group.
+    for stratum in counts:
+        group = [
+            puzzle
+            for puzzle in puzzles
+            if (puzzle.optimal_length, puzzle.robots_moved) == stratum
+        ]
+        group_only = joint_stratified_subset(group, per_stratum=3, seed=19)
+        assert [p.layout_hash for p in first if (p.optimal_length, p.robots_moved) == stratum] == [
+            p.layout_hash for p in group_only
+        ]
+
+
+def test_joint_stratified_subset_uses_only_nonempty_sparse_strata():
+    from collections import Counter
+
+    puzzles = [
+        _selection_puzzle(1, 1, 0),
+        *[_selection_puzzle(4, 3, serial) for serial in range(3)],
+    ]
+
+    selected = joint_stratified_subset(puzzles, per_stratum=25, seed=7)
+
+    assert Counter((p.optimal_length, p.robots_moved) for p in selected) == {
+        (1, 1): 1,
+        (4, 3): 3,
+    }
+    assert joint_stratified_subset(puzzles, per_stratum=0, seed=7) == []
 
 
 @needs_bank16
