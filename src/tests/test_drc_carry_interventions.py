@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 
 import numpy as np
 import pytest
@@ -175,18 +176,27 @@ def test_reset_timing_is_exact_once_and_every_move_excludes_move_zero():
         assert trace.applied_at_completed_moves == (timing,)
 
     short_net, short_config = _tiny_net(horizon=2)
+    progress = []
     short = evaluate_core_interventions(
         short_net,
         [_cycling_puzzle()],
         _env_config(short_config),
         timing_moves=DEFAULT_TIMING_MOVES,
         bootstrap_reps=8,
+        progress=progress.append,
     )
     after_two = short["interventions"]["reset_once_after_2_moves"]
     assert after_two["application_counts"]["eligible_pre_intervention"] == 0
     assert after_two["application_counts"]["not_eligible_pre_intervention"] == 1
     assert after_two["paired_outcomes"][0]["intervention_applied"] is False
     assert after_two["effects"]["overall"]["n"] == 1  # intention to treat
+    assert after_two["effects"]["overall"]["n_eligible"] == 0
+    assert after_two["effects"]["overall"]["eligibility_rate"] == 0.0
+    after_two_eligible = after_two["effects"]["eligible_puzzles_descriptive_effects"]
+    assert after_two_eligible["overall"]["n"] == 0
+    assert after_two_eligible["subset"]["all_selected_rows_intervention_applied"] is None
+    assert any("core puzzle-arm evaluations" in message for message in progress)
+    assert progress[-1] == "core phase complete"
 
 
 def test_baseline_matches_existing_deterministic_drc_evaluation_semantics():
@@ -218,6 +228,9 @@ def test_baseline_matches_existing_deterministic_drc_evaluation_semantics():
     assert core["baseline"]["success_rate"] == existing["success_rate"]
     assert core["baseline"]["outcomes"][0]["moves"] == trace.moves
     assert core["baseline"]["outcomes"][0]["actions"] == [0, 2]
+    assert {arm["effects"]["estimand_role"] for arm in core["interventions"].values()} == {
+        "all_selected_puzzles_itt_estimand"
+    }
 
 
 def test_paired_aggregation_is_stratified_deterministic_and_explicit_when_small():
@@ -236,6 +249,7 @@ def test_paired_aggregation_is_stratified_deterministic_and_explicit_when_small(
     first = aggregate_paired_effects(rows, **kwargs)
     second = aggregate_paired_effects(rows, **kwargs)
     assert first == second
+    assert first["estimand_role"] == "paired_puzzle_estimand"
     overall = first["overall"]
     assert overall["n"] == 4
     assert overall["baseline_success_rate"] == 0.5
@@ -243,6 +257,12 @@ def test_paired_aggregation_is_stratified_deterministic_and_explicit_when_small(
     assert overall["mean_paired_success_delta"] == 0.0
     assert (overall["improved"], overall["harmed"], overall["tied"]) == (1, 1, 2)
     assert overall["bootstrap_ci"]["unit"] == "puzzle"
+    assert overall["bootstrap_ci"]["coverage_scope"] == "pointwise_only"
+    assert overall["bootstrap_ci"]["multiplicity_adjustment"] == "none"
+    assert overall["bootstrap_ci"]["family_wise_coverage"] is False
+    assert overall["bootstrap_ci"]["simultaneous_coverage"] is False
+    assert overall["bootstrap_ci"]["zero_exclusion_claim_allowed"] is False
+    assert first["by_optimal_length"]["1"]["bootstrap_ci"]["inference_role"] == (interventions.SUBGROUP_INFERENCE_ROLE)
     assert first["by_optimal_length"]["2"]["size_status"] == "single_item"
     assert first["by_optimal_length"]["2"]["bootstrap_ci"]["status"] == "single_item_degenerate"
     missing = first["by_joint_cell"]["2|2"]
@@ -254,6 +274,141 @@ def test_paired_aggregation_is_stratified_deterministic_and_explicit_when_small(
     empty = aggregate_paired_effects([], bootstrap_seed=1, bootstrap_reps=5)
     assert empty["overall"]["n"] == 0
     assert empty["overall"]["baseline_success_rate"] is None
+
+
+def test_timing_effects_report_unequal_stratum_coverage_and_descriptive_eligible_subset():
+    rows = [
+        {
+            "optimal_length": 1,
+            "robots_moved": 1,
+            "baseline_success": False,
+            "intervention_success": True,
+            "eligible_pre_intervention": True,
+            "intervention_applied": True,
+        },
+        {
+            "optimal_length": 1,
+            "robots_moved": 1,
+            "baseline_success": True,
+            "intervention_success": False,
+            "eligible_pre_intervention": True,
+            "intervention_applied": True,
+        },
+        {
+            "optimal_length": 2,
+            "robots_moved": 1,
+            "baseline_success": False,
+            "intervention_success": False,
+            "eligible_pre_intervention": True,
+            "intervention_applied": True,
+        },
+        *(
+            {
+                "optimal_length": 2,
+                "robots_moved": 1,
+                "baseline_success": success,
+                "intervention_success": success,
+                "eligible_pre_intervention": False,
+                "intervention_applied": False,
+            }
+            for success in (True, False, True)
+        ),
+        *(
+            {
+                "optimal_length": 2,
+                "robots_moved": 2,
+                "baseline_success": success,
+                "intervention_success": success,
+                "eligible_pre_intervention": False,
+                "intervention_applied": False,
+            }
+            for success in (False, True)
+        ),
+    ]
+    effects = aggregate_paired_effects(
+        rows,
+        bootstrap_seed=91,
+        bootstrap_reps=100,
+        seed_namespace="unequal_timing_coverage",
+        reference_strata=[(1, 1), (2, 1), (2, 2)],
+        report_eligibility_application=True,
+        estimand_role="all_selected_puzzles_itt_estimand",
+        overall_inference_role=interventions.LOCALIZATION_INFERENCE_ROLE,
+    )
+
+    assert effects["estimand_role"] == "all_selected_puzzles_itt_estimand"
+    all_itt_summaries = [
+        effects["overall"],
+        *effects["by_optimal_length"].values(),
+        *effects["by_robots_moved"].values(),
+        *effects["by_joint_cell"].values(),
+    ]
+    coverage_fields = {
+        "n_eligible",
+        "eligibility_rate",
+        "eligibility_denominator_n",
+        "n_applied",
+        "application_rate",
+        "application_denominator_n",
+    }
+    for summary in all_itt_summaries:
+        assert coverage_fields <= set(summary)
+        assert summary["eligibility_denominator_n"] == summary["n"]
+        assert summary["application_denominator_n"] == summary["n"]
+
+    overall = effects["overall"]
+    assert overall["n"] == 8
+    assert overall["eligibility_denominator"] == "all_puzzles_in_effect_summary"
+    assert overall["eligibility_denominator_n"] == 8
+    assert overall["n_eligible"] == 3
+    assert overall["eligibility_rate"] == 0.375
+    assert overall["application_denominator"] == "all_puzzles_in_effect_summary"
+    assert overall["application_denominator_n"] == 8
+    assert overall["n_applied"] == 3
+    assert overall["application_rate"] == 0.375
+    assert overall["application_among_eligible_denominator_n"] == 3
+    assert overall["application_rate_among_eligible"] == 1.0
+    assert overall["bootstrap_ci"]["inference_role"] == interventions.LOCALIZATION_INFERENCE_ROLE
+
+    short = effects["by_optimal_length"]["1"]
+    long = effects["by_optimal_length"]["2"]
+    assert (short["n"], short["n_eligible"], short["eligibility_rate"]) == (2, 2, 1.0)
+    assert (long["n"], long["n_eligible"], long["eligibility_rate"]) == (6, 1, 1 / 6)
+    assert short["bootstrap_ci"]["inference_role"] == interventions.SUBGROUP_INFERENCE_ROLE
+    assert effects["by_joint_cell"]["1|1"]["eligibility_rate"] == 1.0
+    assert effects["by_joint_cell"]["2|1"]["eligibility_rate"] == 0.25
+    assert effects["by_joint_cell"]["2|2"]["eligibility_rate"] == 0.0
+    assert effects["by_robots_moved"]["1"]["eligibility_rate"] == 0.5
+    assert effects["by_robots_moved"]["2"]["eligibility_rate"] == 0.0
+
+    empty = effects["by_joint_cell"]["1|2"]
+    assert empty["n"] == 0
+    assert empty["eligibility_denominator_n"] == 0
+    assert empty["n_eligible"] == 0 and empty["n_applied"] == 0
+    assert empty["eligibility_rate"] is None and empty["application_rate"] is None
+    assert empty["application_rate_among_eligible"] is None
+
+    eligible = effects["eligible_puzzles_descriptive_effects"]
+    assert eligible["estimand_role"] == "secondary_descriptive_principal_stratum_not_randomized_or_itt"
+    assert eligible["subset"]["is_primary_contrast"] is False
+    assert eligible["subset"]["is_randomized_or_itt_estimand"] is False
+    assert eligible["subset"]["interpretation"] == "descriptive_principal_stratum_only"
+    assert eligible["subset"]["all_selected_rows_intervention_applied"] is True
+    assert eligible["overall"]["n"] == 3
+    assert eligible["by_optimal_length"]["2"]["n"] == 1
+    assert eligible["by_joint_cell"]["1|2"]["n"] == 0
+    assert eligible["overall"]["bootstrap_ci"]["inference_role"] == (interventions.ELIGIBLE_SUBSET_INFERENCE_ROLE)
+    assert eligible["overall"]["bootstrap_ci"]["multiplicity_adjustment"] == "none"
+    json.dumps(effects, allow_nan=False)
+
+    invalid = [dict(rows[0], eligible_pre_intervention=False, intervention_applied=True)]
+    with pytest.raises(ValueError, match="cannot be applied to an ineligible"):
+        aggregate_paired_effects(
+            invalid,
+            bootstrap_seed=1,
+            bootstrap_reps=2,
+            report_eligibility_application=True,
+        )
 
 
 def _patch_context(
@@ -400,6 +555,14 @@ def test_patch_runner_uses_identical_suffix_state_requested_components_and_no_le
         arm = result["patches"][component]
         assert arm["effects"]["overall"]["n"] == 1
         assert arm["effects"]["estimand"] == result["primary_estimand"]
+        assert arm["effects"]["estimand_role"] == "paired_recipient_suffix_estimand"
+        expected_role = (
+            interventions.PRIMARY_OVERALL_INFERENCE_ROLE
+            if component == "hc"
+            else interventions.LOCALIZATION_INFERENCE_ROLE
+        )
+        assert arm["effects"]["overall"]["bootstrap_ci"]["inference_role"] == expected_role
+        assert arm["effects"]["overall"]["bootstrap_ci"]["multiplicity_adjustment"] == "none"
         record = arm["paired_outcomes"][0]
         assert record["context"]["recipient_action_prefix"] == [0]
         assert record["context"]["donor_action_prefix"] == [1]
@@ -502,11 +665,13 @@ def test_patch_disabled_and_enabled_no_match_are_not_reported_as_zero_effects(mo
     puzzle = _cycling_puzzle()
     env_config = _env_config(config)
 
-    disabled = evaluate_matched_patches(net, [puzzle], env_config, patch_rollouts=0)
+    progress = []
+    disabled = evaluate_matched_patches(net, [puzzle], env_config, patch_rollouts=0, progress=progress.append)
     assert disabled["status"] == "disabled"
     assert disabled["eligibility"]["eligible_puzzles"] is None
     assert disabled["donor_natural_control"]["status"] == "not_evaluated"
     assert disabled["patches"]["hc"]["effects"] is None
+    assert progress == ["patch phase disabled (patch_rollouts=0)"]
 
     monkeypatch.setattr(
         interventions,
@@ -587,6 +752,78 @@ def test_model_mode_is_restored_when_patch_collection_fails(monkeypatch):
     assert net.training is False
 
 
+@pytest.mark.parametrize("initial_training", [True, False])
+@pytest.mark.parametrize(
+    ("failure_point", "failure_marker"),
+    [
+        ("start", "core phase started"),
+        ("progress", "core puzzle-arm evaluations"),
+        ("end", "core phase complete"),
+    ],
+)
+def test_core_progress_callback_failures_restore_model_mode(initial_training, failure_point, failure_marker):
+    net, config = _tiny_net(horizon=1)
+    net.train(initial_training)
+    messages = []
+
+    def failing_progress(message):
+        messages.append(message)
+        if failure_marker in message:
+            raise RuntimeError(f"controlled {failure_point} callback failure")
+
+    with pytest.raises(RuntimeError, match=f"controlled {failure_point} callback failure"):
+        evaluate_core_interventions(
+            net,
+            [_cycling_puzzle()],
+            _env_config(config),
+            timing_moves=(1,),
+            bootstrap_reps=4,
+            progress=failing_progress,
+        )
+
+    assert any(failure_marker in message for message in messages)
+    assert net.training is initial_training
+
+
+@pytest.mark.parametrize("initial_training", [True, False])
+@pytest.mark.parametrize(
+    ("failure_point", "failure_marker"),
+    [
+        ("start", "patch phase started"),
+        ("progress", "patch puzzles"),
+        ("end", "patch phase complete"),
+    ],
+)
+def test_patch_progress_callback_failures_restore_model_mode(
+    monkeypatch,
+    initial_training,
+    failure_point,
+    failure_marker,
+):
+    net, config = _tiny_net(horizon=1)
+    net.train(initial_training)
+    messages = []
+    monkeypatch.setattr(interventions, "_collect_stochastic_contexts", lambda *_args, **_kwargs: ([], []))
+
+    def failing_progress(message):
+        messages.append(message)
+        if failure_marker in message:
+            raise RuntimeError(f"controlled {failure_point} callback failure")
+
+    with pytest.raises(RuntimeError, match=f"controlled {failure_point} callback failure"):
+        evaluate_matched_patches(
+            net,
+            [_cycling_puzzle()],
+            _env_config(config),
+            patch_rollouts=2,
+            bootstrap_reps=4,
+            progress=failing_progress,
+        )
+
+    assert any(failure_marker in message for message in messages)
+    assert net.training is initial_training
+
+
 def test_cli_rejects_test_split_and_nonpositive_suite_and_exposes_disable_switch():
     parser = interventions._build_argument_parser()
     args = parser.parse_args(
@@ -595,7 +832,20 @@ def test_cli_rejects_test_split_and_nonpositive_suite_and_exposes_disable_switch
     assert args.split_name == "val"
     assert args.per_stratum > 0
     assert args.patch_rollouts == 0
+    assert args.quiet_progress is False
     assert tuple(args.timing_moves) == DEFAULT_TIMING_MOVES
+    quiet_args = parser.parse_args(
+        [
+            "--model",
+            "model.pt",
+            "--bank",
+            "bank.parquet",
+            "--output",
+            "result.json",
+            "--quiet-progress",
+        ]
+    )
+    assert quiet_args.quiet_progress is True
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
@@ -633,6 +883,76 @@ def test_atomic_output_refuses_overwrite_force_replaces_and_failures_preserve_ol
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
+def test_cli_progress_uses_stderr_preserves_concise_stdout_and_can_be_quiet(tmp_path, monkeypatch, capsys):
+    callbacks = []
+
+    def fake_intervene_checkpoint(*_args, progress=None, **_kwargs):
+        callbacks.append(progress)
+        if progress is not None:
+            progress("core puzzle-arm evaluations: 1/1 puzzle evaluations")
+        return {
+            "suite": {"count": 1},
+            "core": {"baseline": {"success_rate": 0.5}},
+            "patching": {"status": "disabled"},
+        }
+
+    monkeypatch.setattr(interventions, "intervene_checkpoint", fake_intervene_checkpoint)
+    first_output = tmp_path / "with-progress.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "intervene_drc_carry",
+            "--model",
+            "model.pt",
+            "--bank",
+            "bank.parquet",
+            "--output",
+            str(first_output),
+        ],
+    )
+    interventions.main()
+    captured = capsys.readouterr()
+    stdout_payload = json.loads(captured.out)
+    assert stdout_payload == {
+        "baseline_success_rate": 0.5,
+        "output": str(first_output.resolve()),
+        "patch_status": "disabled",
+        "suite_puzzles": 1,
+    }
+    assert captured.out.count("\n") == 1
+    assert "[drc-carry] core puzzle-arm evaluations: 1/1" in captured.err
+    assert "[drc-carry] publishing atomic result" in captured.err
+    assert "[drc-carry] run complete" in captured.err
+    assert callable(callbacks[0])
+    assert json.loads(first_output.read_text()) == {
+        "core": {"baseline": {"success_rate": 0.5}},
+        "patching": {"status": "disabled"},
+        "suite": {"count": 1},
+    }
+
+    quiet_output = tmp_path / "quiet.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "intervene_drc_carry",
+            "--model",
+            "model.pt",
+            "--bank",
+            "bank.parquet",
+            "--output",
+            str(quiet_output),
+            "--quiet-progress",
+        ],
+    )
+    interventions.main()
+    quiet_captured = capsys.readouterr()
+    assert json.loads(quiet_captured.out)["output"] == str(quiet_output.resolve())
+    assert quiet_captured.err == ""
+    assert callbacks[1] is None
+
+
 def test_checkpoint_runner_records_complete_provenance_and_stable_scientific_payload(tmp_path, monkeypatch):
     net, config = _tiny_net(seed=29, horizon=3)
     checkpoint_path = tmp_path / "origin" / "model_1234.pt"
@@ -665,6 +985,8 @@ def test_checkpoint_runner_records_complete_provenance_and_stable_scientific_pay
     }
     first = intervene_checkpoint(checkpoint_path, bank_path, **kwargs)
     second = intervene_checkpoint(checkpoint_path, bank_path, **kwargs)
+    assert first["schema_version"] == 2
+    assert first["protocol_version"] == "drc-carry-causal-interventions-v2"
     assert first["checkpoint"]["absolute_path"] == str(checkpoint_path.resolve())
     assert len(first["checkpoint"]["sha256"]) == 64
     assert first["checkpoint"]["originating_run"] == config.run_name
@@ -680,9 +1002,47 @@ def test_checkpoint_runner_records_complete_provenance_and_stable_scientific_pay
     assert first["suite"]["count"] == 1
     assert first["suite"]["per_cell_counts"] == {"2|1": 1}
     assert first["settings"]["bootstrap_unit"] == "puzzle"
+    assert first["inference"]["status"] == "estimation_only_with_unadjusted_pointwise_intervals"
+    interval_contract = first["inference"]["interval_contract"]
+    assert interval_contract["coverage_scope"] == "pointwise_only"
+    assert interval_contract["multiplicity_adjustment"] == "none"
+    assert interval_contract["family_wise_coverage"] is False
+    assert interval_contract["simultaneous_coverage"] is False
+    localization_role = first["inference"]["role_definitions"][interventions.LOCALIZATION_INFERENCE_ROLE]
+    assert localization_role["descriptive_only"] is True
+    assert localization_role["hypothesis_generating"] is True
+    assert localization_role["confirmatory"] is False
+    assert (
+        first["inference"]["claim_policy"]["localization_or_subgroup_claim_from_interval_excluding_zero_allowed"]
+        is False
+    )
     assert first["patching"]["status"] == "disabled"
     assert "full_reset_every_move" in first["localization"]
     assert set(first["localization"]["per_depth"]) == {"0", "1"}
+    full_reset = first["core"]["interventions"]["reset_all_every_move"]["effects"]
+    assert full_reset["estimand_role"] == "all_selected_puzzles_itt_estimand"
+    assert full_reset["overall"]["bootstrap_ci"]["inference_role"] == (interventions.PRIMARY_OVERALL_INFERENCE_ROLE)
+    assert full_reset["by_optimal_length"]["2"]["bootstrap_ci"]["inference_role"] == (
+        interventions.SUBGROUP_INFERENCE_ROLE
+    )
+    depth_zero = first["core"]["interventions"]["reset_depth_0_every_move"]["effects"]
+    assert depth_zero["overall"]["bootstrap_ci"]["inference_role"] == (interventions.LOCALIZATION_INFERENCE_ROLE)
+    timing_one = first["core"]["interventions"]["reset_once_after_1_moves"]["effects"]
+    assert timing_one["estimand_role"] == "all_selected_puzzles_itt_estimand"
+    assert timing_one["overall"]["eligibility_denominator_n"] == 1
+    assert timing_one["overall"]["n_eligible"] == 1
+    assert timing_one["overall"]["n_applied"] == 1
+    assert timing_one["overall"]["bootstrap_ci"]["inference_role"] == (interventions.LOCALIZATION_INFERENCE_ROLE)
+    timing_eligible = timing_one["eligible_puzzles_descriptive_effects"]
+    assert timing_eligible["subset"]["is_randomized_or_itt_estimand"] is False
+    assert timing_eligible["overall"]["bootstrap_ci"]["inference_role"] == (
+        interventions.ELIGIBLE_SUBSET_INFERENCE_ROLE
+    )
+    assert first["localization"]["timing"]["1"]["n_eligible"] == 1
+    assert (
+        first["localization"]["timing"]["1"]["eligible_puzzles_descriptive_effect"]["estimand_role"]
+        == "secondary_descriptive_principal_stratum_not_randomized_or_itt"
+    )
     assert set(first["git"]["implementation_file_sha256"]) >= {
         "src/groundup/intervene_drc_carry.py",
         "src/groundup/probe_drc_carry.py",

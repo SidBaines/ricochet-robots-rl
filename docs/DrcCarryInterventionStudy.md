@@ -20,7 +20,7 @@ within puzzle and estimates
 `mean(intervention_success - untreated_baseline_success)`.
 
 The patch contrasts estimate the analogous paired suffix-success difference
-from an exact shared environment state. Their primary estimand is always
+from an exact shared environment state. Every patch arm uses the estimand
 `mean(recipient_patched_suffix_success -
 recipient_natural_suffix_success)`. The donor-natural suffix described below
 is a required positive control, not a second baseline, additional experimental
@@ -28,7 +28,11 @@ unit, or part of an effect estimate. Positive values mean the intervention
 improved success; negative values mean it harmed success. These interventions
 can establish that a carry part matters under the stated ablation or patch,
 but they do not by themselves assign a human-interpretable algorithm to that
-part.
+part. Sharing this estimand does not share an inference role: only the overall
+full-`hc` transplant is preregistered-primary, while partial `h` and `c`
+transplants are descriptive localization. Accordingly, every patch component
+uses the neutral machine label
+`estimand_role=paired_recipient_suffix_estimand`.
 
 ## Frozen checkpoint and puzzle suite
 
@@ -84,6 +88,12 @@ The following arms are preregistered:
    exactly `k` completed moves, zero all depths of both `h` and `c`, then carry
    normally. The preregistered default values are `k = 1, 2, 4, 8`.
 
+Every core arm retains the all-selected-puzzle estimand and uses the neutral
+machine label `estimand_role=all_selected_puzzles_itt_estimand`. Separate
+inference-role metadata marks only the overall full reset as
+preregistered-primary; depth, component, and timing arms are descriptive
+localization.
+
 One-shot eligibility is defined from the untreated path: a puzzle is eligible
 at `k` only if its untreated episode reaches a decision after `k` completed
 moves. Before the intervention, the treated and untreated action/position
@@ -93,6 +103,28 @@ with `eligible_pre_intervention=false`, `intervention_applied=false`, and an
 outcome identical to baseline. Each arm records per-puzzle application flags,
 application move indices, puzzle-level application totals, and explicit
 eligible/not-eligible counts for timing arms.
+
+The timing ITT estimand/contrast includes all selected puzzles. Its inference
+role is descriptive, hypothesis-generating localization. Its `overall`,
+`by_optimal_length`, `by_robots_moved`, and `by_joint_cell` summaries each
+report `n_eligible`, `eligibility_rate`, `n_applied`, and `application_rate`.
+Both named rates use all puzzles in that particular effect summary as their
+denominator; the denominator definition and integer denominator are emitted
+explicitly. Application among eligible puzzles is also reported with its own
+eligible-puzzle denominator. For an empty cell, both counts are zero, both
+all-puzzle rates are null, and the eligible-denominator application rate is
+null. Thus a small ITT effect at a late `k` cannot be read without that cell's
+reach/application coverage.
+
+Every timing arm additionally emits
+`effects.eligible_puzzles_descriptive_effects`, with the same overall and full
+marginal/joint layout, restricted to puzzles whose untreated path was eligible.
+Protocol checks require every such puzzle to receive the intervention. This is
+a secondary, descriptive principal-stratum summary. It is neither the
+all-selected-puzzle ITT estimand nor a randomized estimand, and it does not
+replace or reweight the all-puzzle result. Its purpose is to separate dilution
+by pre-intervention reach from the observed effect within the reached subset;
+it does not license a population-causal claim about a post-selected subgroup.
 
 State transformations clone both tensors before changing them. Tests pin that
 only the named component/depth is zeroed and that the source carry is not
@@ -159,8 +191,8 @@ identical environment state and identical incoming carry by construction.
 They are therefore a mandatory implementation positive control: their complete
 action sequences, success, suffix and total move counts, and final positions
 must be identical or the run aborts. This control is reported for every
-eligible context but is never substituted for recipient-natural in a primary
-contrast.
+eligible context but is never substituted for recipient-natural in the paired
+recipient-suffix effect estimate.
 
 No tensor is stored in JSON. Component hashes and explicit verification flags
 show that requested components equal the donor, unrequested components equal
@@ -171,10 +203,10 @@ positive control passes. Each suffix uses a fresh environment and cloned carry;
 state is never continued from another suffix. The output records recipient-
 natural, donor-natural, and recipient-patched successes, suffix and total move
 counts, action sequences, the recipient-natural-versus-patched paired success
-delta, and first/action-count divergence for that primary comparison. Move
-counts are audit fields only; each patch arm also totals diverged and non-
-diverged primary suffix pairs. The primary analysis does not condition move
-counts on post-treatment success.
+delta, and first/action-count divergence for that paired recipient-suffix
+comparison. Move counts are audit fields only; each patch arm also totals
+diverged and non-diverged paired suffixes. The paired recipient-suffix analysis
+does not condition move counts on post-treatment success.
 
 `--patch-rollouts 0` disables patching for a checkpoint-wide core sweep. The
 JSON then reports `status=disabled`, `eligibility.status=not_evaluated`, null
@@ -202,6 +234,26 @@ puzzle deltas with replacement using a local NumPy generator. The default is
 10,000 replicates, a 95% interval, and base seed 42,424; group-specific seeds
 are deterministic hashes of the base seed, arm, and stratum.
 
+All reported 95% intervals are nominal, pointwise intervals only. No
+multiplicity adjustment is performed, and no interval has family-wise or
+simultaneous coverage. The overall full-reset-every-move contrast and overall
+full-`hc` transplant contrast retain their preregistered-primary pointwise
+labels. Overall depth, `h`/`c` component, timing, and partial-patch component
+localization intervals are explicitly descriptive and hypothesis-generating.
+Every `optimal_length`, `robots_moved`, and joint-cell interval is likewise
+descriptive and hypothesis-generating regardless of its parent arm. Every
+eligible-puzzle timing interval is labeled secondary descriptive
+principal-stratum. No scientific claim may be selected or justified by which
+of these localization, subgroup, or eligible-subset intervals happen to
+exclude zero.
+
+This contract is machine-readable twice: every `bootstrap_ci` records
+`coverage_scope=pointwise_only`, `multiplicity_adjustment=none`, false
+family-wise/simultaneous coverage flags, an `inference_role`, and a false
+zero-exclusion claim flag; the result-level `inference` object defines those
+roles and the global claim policy. The labels describe interpretation only and
+do not silently convert any interval into adjusted inference.
+
 The same analysis is emitted overall, by `optimal_length`, by `robots_moved`,
 and by their joint cell. Joint output contains the full Cartesian product of
 the suite's observed marginal values, so a missing sparse cell appears with
@@ -213,8 +265,18 @@ that puzzle's delta rather than presented as stable population uncertainty.
 baseline rate and separate maps for full reset-every-move, per-depth resets,
 `h`/`c` component ablations, and one-shot timing resets. Full stratified
 analyses and per-puzzle action audits remain under `core.interventions`.
+Timing localization entries also expose their overall eligibility/application
+coverage and overall eligible-puzzle descriptive effect directly; the full
+eligible-puzzle stratification remains under the corresponding core arm.
 
 ## Provenance, determinism, and output
+
+The result uses schema 2 and intervention protocol
+`drc-carry-causal-interventions-v2`. This version bump records the additive
+timing-coverage, eligible-subset, and inference-interpretation contract. It does
+not change intervention execution, suite selection, source-rollout selection,
+seed derivation, the patch protocol, or the paired-bootstrap algorithm, so no
+fixture, split, or suite fingerprint is intentionally changed by the bump.
 
 The result records schema and protocol versions; all suite, rollout, bootstrap,
 and patch seeds/settings; the complete environment config; checkpoint and bank
@@ -231,6 +293,12 @@ unchanged. JSON serialization uses `allow_nan=False`, contains no tensor blobs,
 and is published atomically. Existing output is rejected unless `--force` is
 explicit; the no-force publication path uses an atomic no-clobber link, so a
 race cannot silently overwrite another result.
+
+The default CLI reports phase changes and approximately ten puzzle-level
+milestones per long core/patch phase to stderr. Stdout remains one concise JSON
+completion record, so existing capture behavior is preserved. Pass
+`--quiet-progress` to suppress progress. Progress reporting does not enter the
+scientific result and does not alter atomic publication.
 
 Example core-only invocation (not run as part of this implementation task):
 

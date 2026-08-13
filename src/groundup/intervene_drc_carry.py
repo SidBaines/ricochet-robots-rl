@@ -22,13 +22,14 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Sequence
+from typing import Callable, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -40,12 +41,39 @@ from .probe_drc_carry import env_config_from_checkpoint, load_schema2_checkpoint
 from .puzzles import Puzzle, joint_stratified_subset, load_puzzles
 
 
-RESULT_SCHEMA_VERSION = 1
-INTERVENTION_PROTOCOL_VERSION = "drc-carry-causal-interventions-v1"
+RESULT_SCHEMA_VERSION = 2
+INTERVENTION_PROTOCOL_VERSION = "drc-carry-causal-interventions-v2"
 PATCH_PROTOCOL_VERSION = "drc-carry-exact-reconvergence-patching-v2"
 BOOTSTRAP_PROTOCOL_VERSION = "paired-puzzle-percentile-bootstrap-v1"
+INFERENCE_PROTOCOL_VERSION = "drc-carry-pointwise-inference-status-v1"
 DEFAULT_TIMING_MOVES = (1, 2, 4, 8)
 PATCH_COMPONENTS = ("hc", "h", "c")
+
+PRIMARY_OVERALL_INFERENCE_ROLE = "preregistered_primary_overall_contrast"
+LOCALIZATION_INFERENCE_ROLE = "descriptive_hypothesis_generating_localization"
+SUBGROUP_INFERENCE_ROLE = "descriptive_hypothesis_generating_subgroup"
+ELIGIBLE_SUBSET_INFERENCE_ROLE = "descriptive_principal_stratum_hypothesis_generating"
+ProgressCallback = Callable[[str], None]
+
+
+def _emit_progress(progress: Optional[ProgressCallback], message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
+def _emit_counted_progress(
+    progress: Optional[ProgressCallback],
+    phase: str,
+    completed: int,
+    total: int,
+) -> None:
+    """Report roughly ten puzzle-level milestones for a potentially long phase."""
+
+    if progress is None or total < 1:
+        return
+    stride = max(1, (total + 9) // 10)
+    if completed == 1 or completed == total or completed % stride == 0:
+        progress(f"{phase}: {completed}/{total} puzzle evaluations")
 
 
 def _canonical_json(value: object) -> str:
@@ -368,11 +396,45 @@ def _effect_record(
     }
 
 
+def _timing_coverage_summary(rows: Sequence[Mapping[str, object]]) -> Dict[str, object]:
+    """Summarize pre-intervention reach and actual application over one ITT group."""
+
+    for row in rows:
+        missing = sorted({"eligible_pre_intervention", "intervention_applied"} - set(row))
+        if missing:
+            raise ValueError(f"Timing effect row missing coverage fields: {missing}")
+        eligible = row["eligible_pre_intervention"]
+        applied = row["intervention_applied"]
+        if not isinstance(eligible, (bool, np.bool_)) or not isinstance(applied, (bool, np.bool_)):
+            raise ValueError("Timing eligibility/application fields must be booleans")
+        if bool(applied) and not bool(eligible):
+            raise ValueError("A timing intervention cannot be applied to an ineligible puzzle")
+
+    denominator_n = int(len(rows))
+    n_eligible = int(sum(bool(row["eligible_pre_intervention"]) for row in rows))
+    n_applied = int(sum(bool(row["intervention_applied"]) for row in rows))
+    return {
+        "eligibility_denominator": "all_puzzles_in_effect_summary",
+        "eligibility_denominator_n": denominator_n,
+        "n_eligible": n_eligible,
+        "eligibility_rate": float(n_eligible / denominator_n) if denominator_n else None,
+        "application_denominator": "all_puzzles_in_effect_summary",
+        "application_denominator_n": denominator_n,
+        "n_applied": n_applied,
+        "application_rate": float(n_applied / denominator_n) if denominator_n else None,
+        "application_among_eligible_denominator": "eligible_puzzles_in_effect_summary",
+        "application_among_eligible_denominator_n": n_eligible,
+        "application_rate_among_eligible": float(n_applied / n_eligible) if n_eligible else None,
+    }
+
+
 def _bootstrap_summary(
     rows: Sequence[Mapping[str, object]],
     *,
     seed: int,
     reps: int,
+    inference_role: str,
+    report_eligibility_application: bool = False,
 ) -> Dict[str, object]:
     if reps < 1:
         raise ValueError("bootstrap reps must be positive")
@@ -389,7 +451,14 @@ def _bootstrap_summary(
         "confidence_level": 0.95,
         "seed": int(seed),
         "reps": int(reps),
+        "coverage_scope": "pointwise_only",
+        "multiplicity_adjustment": "none",
+        "family_wise_coverage": False,
+        "simultaneous_coverage": False,
+        "inference_role": str(inference_role),
+        "zero_exclusion_claim_allowed": False,
     }
+    timing_coverage = _timing_coverage_summary(rows) if report_eligibility_application else {}
     if n == 0:
         return {
             "n": 0,
@@ -403,6 +472,7 @@ def _bootstrap_summary(
             "harmed": 0,
             "tied": 0,
             "bootstrap_ci": {**common_bootstrap, "status": "empty", "lower": None, "upper": None},
+            **timing_coverage,
         }
 
     mean_delta = float(deltas.mean())
@@ -429,6 +499,7 @@ def _bootstrap_summary(
         "harmed": int(np.count_nonzero(deltas < 0)),
         "tied": int(np.count_nonzero(deltas == 0)),
         "bootstrap_ci": {**common_bootstrap, "status": status, "lower": lower, "upper": upper},
+        **timing_coverage,
     }
 
 
@@ -439,6 +510,10 @@ def aggregate_paired_effects(
     bootstrap_reps: int,
     seed_namespace: str = "effect",
     reference_strata: Optional[Sequence[tuple[int, int]]] = None,
+    report_eligibility_application: bool = False,
+    estimand_role: str = "paired_puzzle_estimand",
+    overall_inference_role: str = PRIMARY_OVERALL_INFERENCE_ROLE,
+    subgroup_inference_role: str = SUBGROUP_INFERENCE_ROLE,
 ) -> Dict[str, object]:
     """Aggregate paired binary outcomes overall and across preregistered strata."""
 
@@ -461,13 +536,24 @@ def aggregate_paired_effects(
     lengths = sorted({length for length, _robots in strata})
     robot_counts = sorted({robots for _length, robots in strata})
 
-    def summarize(group: Sequence[Mapping[str, object]], *parts: object) -> Dict[str, object]:
+    def summarize(
+        group: Sequence[Mapping[str, object]],
+        inference_role: str,
+        *parts: object,
+    ) -> Dict[str, object]:
         seed = _stable_seed(bootstrap_seed, seed_namespace, *parts)
-        return _bootstrap_summary(group, seed=seed, reps=bootstrap_reps)
+        return _bootstrap_summary(
+            group,
+            seed=seed,
+            reps=bootstrap_reps,
+            inference_role=inference_role,
+            report_eligibility_application=report_eligibility_application,
+        )
 
     by_length = {
         str(length): summarize(
             [row for row in rows if int(row["optimal_length"]) == length],
+            subgroup_inference_role,
             "optimal_length",
             length,
         )
@@ -476,6 +562,7 @@ def aggregate_paired_effects(
     by_robots = {
         str(robots): summarize(
             [row for row in rows if int(row["robots_moved"]) == robots],
+            subgroup_inference_role,
             "robots_moved",
             robots,
         )
@@ -488,6 +575,7 @@ def aggregate_paired_effects(
         for robots in robot_counts:
             summary = summarize(
                 [row for row in rows if int(row["optimal_length"]) == length and int(row["robots_moved"]) == robots],
+                subgroup_inference_role,
                 "joint",
                 length,
                 robots,
@@ -497,16 +585,53 @@ def aggregate_paired_effects(
                 "robots_moved": int(robots),
                 **summary,
             }
-    return {
+    result = {
         "estimand": "mean(intervention_success - baseline_success)",
+        "estimand_role": str(estimand_role),
         "bootstrap_unit": "puzzle",
         "bootstrap_base_seed": int(bootstrap_seed),
         "bootstrap_reps": int(bootstrap_reps),
-        "overall": summarize(rows, "overall"),
+        "inference": {
+            "protocol_version": INFERENCE_PROTOCOL_VERSION,
+            "overall_inference_role": str(overall_inference_role),
+            "subgroup_inference_role": str(subgroup_inference_role),
+            "interval_coverage": "pointwise_only",
+            "multiplicity_adjustment": "none",
+            "family_wise_coverage": False,
+            "simultaneous_coverage": False,
+            "zero_exclusion_claim_allowed": False,
+        },
+        "overall": summarize(rows, overall_inference_role, "overall"),
         "by_optimal_length": by_length,
         "by_robots_moved": by_robots,
         "by_joint_cell": by_joint,
     }
+    if report_eligibility_application:
+        eligible_rows = [row for row in rows if bool(row["eligible_pre_intervention"])]
+        all_eligible_applied = bool(eligible_rows) and all(bool(row["intervention_applied"]) for row in eligible_rows)
+        eligible_effects = aggregate_paired_effects(
+            eligible_rows,
+            bootstrap_seed=bootstrap_seed,
+            bootstrap_reps=bootstrap_reps,
+            seed_namespace=f"{seed_namespace}:eligible_puzzles",
+            reference_strata=strata,
+            estimand_role="secondary_descriptive_principal_stratum_not_randomized_or_itt",
+            overall_inference_role=ELIGIBLE_SUBSET_INFERENCE_ROLE,
+            subgroup_inference_role=ELIGIBLE_SUBSET_INFERENCE_ROLE,
+        )
+        eligible_effects["estimand"] = "mean(intervention_success - baseline_success | eligible_pre_intervention)"
+        eligible_effects["subset"] = {
+            "name": "untreated_path_eligible_puzzles",
+            "selection_field": "eligible_pre_intervention",
+            "selection_value": True,
+            "definition": "untreated episode reaches a decision after the prespecified completed move",
+            "all_selected_rows_intervention_applied": all_eligible_applied if eligible_rows else None,
+            "is_primary_contrast": False,
+            "is_randomized_or_itt_estimand": False,
+            "interpretation": "descriptive_principal_stratum_only",
+        }
+        result["eligible_puzzles_descriptive_effects"] = eligible_effects
+    return result
 
 
 def _suite_strata(puzzles: Sequence[Puzzle]) -> list[tuple[int, int]]:
@@ -522,6 +647,7 @@ def evaluate_core_interventions(
     rollout_seed: int = 0,
     bootstrap_seed: int = 42_424,
     bootstrap_reps: int = 10_000,
+    progress: Optional[ProgressCallback] = None,
 ) -> Dict[str, object]:
     """Evaluate baseline and every prespecified reset intervention."""
 
@@ -530,18 +656,32 @@ def evaluate_core_interventions(
     specs = intervention_specs(net.depth, timing_moves)
     strata = _suite_strata(puzzles)
     was_training = net.training
-    net.eval()
+    total_evaluations = int(len(puzzles) * (1 + len(specs)))
+    completed_evaluations = 0
     try:
+        net.eval()
+        _emit_progress(
+            progress,
+            f"core phase started: {len(puzzles)} puzzles, {len(specs)} intervention arms",
+        )
         with torch.no_grad():
-            baselines = [
-                run_deterministic_episode(
-                    net,
-                    puzzle,
-                    env_config,
-                    env_seed=_stable_seed(rollout_seed, "core", index),
+            baselines = []
+            for index, puzzle in enumerate(puzzles):
+                baselines.append(
+                    run_deterministic_episode(
+                        net,
+                        puzzle,
+                        env_config,
+                        env_seed=_stable_seed(rollout_seed, "core", index),
+                    )
                 )
-                for index, puzzle in enumerate(puzzles)
-            ]
+                completed_evaluations += 1
+                _emit_counted_progress(
+                    progress,
+                    "core puzzle-arm evaluations",
+                    completed_evaluations,
+                    total_evaluations,
+                )
             baseline_records = [
                 {
                     **_puzzle_identity(puzzle, index),
@@ -586,13 +726,26 @@ def evaluate_core_interventions(
                     else:
                         record["eligible_pre_intervention"] = None
                     records.append(record)
+                    completed_evaluations += 1
+                    _emit_counted_progress(
+                        progress,
+                        "core puzzle-arm evaluations",
+                        completed_evaluations,
+                        total_evaluations,
+                    )
 
+                is_primary_overall = spec.intervention_id == "reset_all_every_move"
                 effects = aggregate_paired_effects(
                     records,
                     bootstrap_seed=bootstrap_seed,
                     bootstrap_reps=bootstrap_reps,
                     seed_namespace=spec.intervention_id,
                     reference_strata=strata,
+                    report_eligibility_application=spec.family == "reset_once",
+                    estimand_role="all_selected_puzzles_itt_estimand",
+                    overall_inference_role=(
+                        PRIMARY_OVERALL_INFERENCE_ROLE if is_primary_overall else LOCALIZATION_INFERENCE_ROLE
+                    ),
                 )
                 interventions[spec.intervention_id] = {
                     "spec": spec.as_dict(),
@@ -617,7 +770,7 @@ def evaluate_core_interventions(
         net.train(was_training)
 
     baseline_rate = sum(record["success"] for record in baseline_records) / len(baseline_records)
-    return {
+    result = {
         "baseline": {
             "definition": "deterministic_masked_full_start_carry_zero_only_at_episode_start",
             "n": int(len(baseline_records)),
@@ -626,6 +779,8 @@ def evaluate_core_interventions(
         },
         "interventions": interventions,
     }
+    _emit_progress(progress, "core phase complete")
+    return result
 
 
 @dataclass(frozen=True)
@@ -988,6 +1143,7 @@ def evaluate_matched_patches(
     patch_seed: int = 73_737,
     bootstrap_seed: int = 42_424,
     bootstrap_reps: int = 10_000,
+    progress: Optional[ProgressCallback] = None,
 ) -> Dict[str, object]:
     """Run exact within-puzzle carry patches with at most one context each."""
 
@@ -996,6 +1152,7 @@ def evaluate_matched_patches(
     if not puzzles:
         raise ValueError("Cannot evaluate patches on an empty puzzle suite")
     if patch_rollouts == 0:
+        _emit_progress(progress, "patch phase disabled (patch_rollouts=0)")
         return {
             "status": "disabled",
             "reason": "patch_rollouts=0",
@@ -1024,13 +1181,17 @@ def evaluate_matched_patches(
         }
 
     was_training = net.training
-    net.eval()
     strata = _suite_strata(puzzles)
     records: dict[str, list[Dict[str, object]]] = {component: [] for component in PATCH_COMPONENTS}
     source_manifests = []
     no_matches = []
     eligible = 0
     try:
+        net.eval()
+        _emit_progress(
+            progress,
+            f"patch phase started: {len(puzzles)} puzzles, {patch_rollouts} source rollouts per puzzle",
+        )
         with torch.no_grad():
             for puzzle_index, puzzle in enumerate(puzzles):
                 contexts, rollout_manifest = _collect_stochastic_contexts(
@@ -1051,6 +1212,12 @@ def evaluate_matched_patches(
                             "reason": "no_exact_same_move_positions_match_with_different_histories",
                             "source_rollout_ids": list(range(patch_rollouts)),
                         }
+                    )
+                    _emit_counted_progress(
+                        progress,
+                        "patch puzzles",
+                        puzzle_index + 1,
+                        len(puzzles),
                     )
                     continue
                 eligible += 1
@@ -1240,6 +1407,12 @@ def evaluate_matched_patches(
                         }
                     )
                     records[component].append(audit)
+                _emit_counted_progress(
+                    progress,
+                    "patch puzzles",
+                    puzzle_index + 1,
+                    len(puzzles),
+                )
     finally:
         net.train(was_training)
 
@@ -1252,6 +1425,10 @@ def evaluate_matched_patches(
             bootstrap_reps=bootstrap_reps,
             seed_namespace=f"patch_{component}",
             reference_strata=strata,
+            estimand_role="paired_recipient_suffix_estimand",
+            overall_inference_role=(
+                PRIMARY_OVERALL_INFERENCE_ROLE if component == "hc" else LOCALIZATION_INFERENCE_ROLE
+            ),
         )
         effects["estimand"] = "mean(recipient_patched_suffix_success - recipient_natural_suffix_success)"
         patch_results[component] = {
@@ -1263,7 +1440,7 @@ def evaluate_matched_patches(
                 "not_diverged": int(sum(not bool(row["action_divergence"]["diverged"]) for row in component_records)),
             },
         }
-    return {
+    result = {
         "status": "complete" if eligible else "enabled_no_matches",
         "protocol_version": PATCH_PROTOCOL_VERSION,
         "primary_estimand": "mean(recipient_patched_suffix_success - recipient_natural_suffix_success)",
@@ -1295,12 +1472,14 @@ def evaluate_matched_patches(
         "source_rollouts": source_manifests,
         "patches": patch_results,
     }
+    _emit_progress(progress, "patch phase complete")
+    return result
 
 
 def _localization_entry(intervention: Mapping[str, object]) -> Dict[str, object]:
     overall = intervention["effects"]["overall"]
     spec = intervention["spec"]
-    return {
+    entry = {
         "intervention_id": spec["intervention_id"],
         "family": spec["family"],
         "component": spec["component"],
@@ -1316,6 +1495,30 @@ def _localization_entry(intervention: Mapping[str, object]) -> Dict[str, object]
         "bootstrap_ci": overall["bootstrap_ci"],
         "application_counts": intervention["application_counts"],
     }
+    if spec["family"] == "reset_once":
+        for field in (
+            "eligibility_denominator",
+            "eligibility_denominator_n",
+            "n_eligible",
+            "eligibility_rate",
+            "application_denominator",
+            "application_denominator_n",
+            "n_applied",
+            "application_rate",
+            "application_among_eligible_denominator",
+            "application_among_eligible_denominator_n",
+            "application_rate_among_eligible",
+        ):
+            entry[field] = overall[field]
+        eligible = intervention["effects"]["eligible_puzzles_descriptive_effects"]
+        entry["eligible_puzzles_descriptive_effect"] = {
+            "estimand": eligible["estimand"],
+            "estimand_role": eligible["estimand_role"],
+            "subset": eligible["subset"],
+            "inference": eligible["inference"],
+            "overall": eligible["overall"],
+        }
+    return entry
 
 
 def build_localization_comparison(core: Mapping[str, object]) -> Dict[str, object]:
@@ -1379,6 +1582,57 @@ def _git_provenance() -> Dict[str, object]:
     }
 
 
+def _inference_metadata() -> Dict[str, object]:
+    """Stable interpretation contract for every interval emitted by schema 2."""
+
+    return {
+        "protocol_version": INFERENCE_PROTOCOL_VERSION,
+        "status": "estimation_only_with_unadjusted_pointwise_intervals",
+        "interval_contract": {
+            "method": "paired_puzzle_percentile_bootstrap",
+            "confidence_level": 0.95,
+            "coverage_scope": "pointwise_only",
+            "multiplicity_adjustment": "none",
+            "family_wise_coverage": False,
+            "simultaneous_coverage": False,
+        },
+        "role_definitions": {
+            PRIMARY_OVERALL_INFERENCE_ROLE: {
+                "status": "preregistered_primary_overall_pointwise_estimate",
+                "multiplicity_adjustment": "none",
+                "descriptive_only": False,
+                "hypothesis_generating": False,
+            },
+            LOCALIZATION_INFERENCE_ROLE: {
+                "status": "descriptive_hypothesis_generating_only",
+                "descriptive_only": True,
+                "hypothesis_generating": True,
+                "confirmatory": False,
+                "includes": ["depth", "component", "timing", "patch_component_localization"],
+            },
+            SUBGROUP_INFERENCE_ROLE: {
+                "status": "descriptive_hypothesis_generating_only",
+                "descriptive_only": True,
+                "hypothesis_generating": True,
+                "confirmatory": False,
+                "includes": ["optimal_length", "robots_moved", "joint_cell"],
+            },
+            ELIGIBLE_SUBSET_INFERENCE_ROLE: {
+                "status": "secondary_descriptive_principal_stratum_only",
+                "descriptive_only": True,
+                "hypothesis_generating": True,
+                "confirmatory": False,
+                "randomized_or_itt_estimand": False,
+            },
+        },
+        "claim_policy": {
+            "localization_or_subgroup_claim_from_interval_excluding_zero_allowed": False,
+            "eligible_subset_causal_population_claim_allowed": False,
+            "family_wise_or_simultaneous_coverage_claim_allowed": False,
+        },
+    }
+
+
 def _runtime_provenance(
     *,
     requested_device: str,
@@ -1413,6 +1667,7 @@ def intervene_checkpoint(
     patch_rollouts: int = 16,
     patch_seed: int = 73_737,
     device: str = "cpu",
+    progress: Optional[ProgressCallback] = None,
 ) -> Dict[str, object]:
     """Load one checkpoint/bank and execute the preregistered causal study."""
 
@@ -1428,6 +1683,7 @@ def intervene_checkpoint(
 
     started_at = dt.datetime.now(dt.timezone.utc)
     started_clock = time.perf_counter()
+    _emit_progress(progress, "loading frozen checkpoint and recording source provenance")
     starting_git = _git_provenance()
     model_path = Path(model_path).resolve()
     bank_path = Path(bank_path).resolve()
@@ -1450,6 +1706,7 @@ def intervene_checkpoint(
             "val_test_seed": int(config.val_test_seed),
         },
     }
+    _emit_progress(progress, f"loading puzzle bank split '{split_name}'")
     pool = load_puzzles(
         bank_path,
         split_name,
@@ -1464,6 +1721,10 @@ def intervene_checkpoint(
         raise ValueError("Joint-stratified suite selection returned no puzzles")
     suite = suite_provenance(puzzles, split=split_name, seed=suite_seed, per_stratum=per_stratum)
     env_config = env_config_from_checkpoint(config)
+    _emit_progress(
+        progress,
+        f"selected {len(puzzles)} puzzles across {len(_suite_strata(puzzles))} joint strata",
+    )
 
     core = evaluate_core_interventions(
         net,
@@ -1473,6 +1734,7 @@ def intervene_checkpoint(
         rollout_seed=rollout_seed,
         bootstrap_seed=bootstrap_seed,
         bootstrap_reps=bootstrap_reps,
+        progress=progress,
     )
     patches = evaluate_matched_patches(
         net,
@@ -1482,7 +1744,9 @@ def intervene_checkpoint(
         patch_seed=patch_seed,
         bootstrap_seed=bootstrap_seed,
         bootstrap_reps=bootstrap_reps,
+        progress=progress,
     )
+    _emit_progress(progress, "verifying immutable inputs and implementation provenance")
     if _file_sha256(model_path) != checkpoint["sha256"]:
         raise RuntimeError(f"Checkpoint changed during intervention study: {model_path}")
     if _file_sha256(bank_path) != bank_sha256:
@@ -1518,6 +1782,7 @@ def intervene_checkpoint(
             "resolved_model_device": resolved_device,
             "environment": dataclasses.asdict(env_config),
         },
+        "inference": _inference_metadata(),
         "core": core,
         "localization": build_localization_comparison(core),
         "patching": patches,
@@ -1531,6 +1796,7 @@ def intervene_checkpoint(
     }
     # Fail here rather than writing a partial or non-standard JSON document.
     json.dumps(result, sort_keys=True, allow_nan=False)
+    _emit_progress(progress, "scientific result assembled and JSON-validated")
     return result
 
 
@@ -1579,6 +1845,11 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patch-rollouts", type=int, default=16)
     parser.add_argument("--patch-seed", type=int, default=73_737)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="suppress phase and puzzle progress on stderr",
+    )
     parser.add_argument("--force", action="store_true")
     return parser
 
@@ -1604,8 +1875,21 @@ def main() -> None:
     arguments = vars(args).copy()
     arguments.pop("output")
     force = bool(arguments.pop("force"))
+    quiet_progress = bool(arguments.pop("quiet_progress"))
+    progress: Optional[ProgressCallback]
+    if quiet_progress:
+        progress = None
+    else:
+
+        def stderr_progress(message: str) -> None:
+            print(f"[drc-carry] {message}", file=sys.stderr, flush=True)
+
+        progress = stderr_progress
+    arguments["progress"] = progress
     result = intervene_checkpoint(**arguments)
+    _emit_progress(progress, f"publishing atomic result to {output}")
     write_json_atomic(output, result, force=force)
+    _emit_progress(progress, "run complete")
     print(
         json.dumps(
             {
@@ -1625,9 +1909,11 @@ if __name__ == "__main__":
 
 __all__ = [
     "DEFAULT_TIMING_MOVES",
+    "INFERENCE_PROTOCOL_VERSION",
     "INTERVENTION_PROTOCOL_VERSION",
     "InterventionSpec",
     "PATCH_PROTOCOL_VERSION",
+    "RESULT_SCHEMA_VERSION",
     "PatchContext",
     "PatchPair",
     "aggregate_paired_effects",
